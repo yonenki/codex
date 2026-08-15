@@ -2313,7 +2313,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         });
     })
     .await;
-    v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE, "gemini"]);
+    v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE, "acp"]);
     v2.assert_visible_lacks(&[
         "spawn_agent",
         "send_message",
@@ -2342,7 +2342,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         );
     }
     assert_eq!(
-        v2.namespace_function_names("gemini"),
+        v2.namespace_function_names("acp"),
         &[
             "followup_task".to_string(),
             "send_message".to_string(),
@@ -2666,6 +2666,7 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
             "wait",
             "request_user_input",
             "agents",
+            "acp",
             // Hosted Responses tool.
             "web_search",
         ]
@@ -2816,6 +2817,7 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
             "request_user_input",
             // Multi-agent v2 tools.
             MULTI_AGENT_V2_NAMESPACE,
+            "acp",
             // Hosted Responses tools.
             "web_search",
         ]

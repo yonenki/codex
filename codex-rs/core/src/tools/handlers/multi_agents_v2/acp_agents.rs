@@ -1,7 +1,8 @@
 use super::*;
 use crate::agent::next_thread_spawn_depth;
-use crate::agent::role::ANTIGRAVITY_ROLE_NAME;
-use crate::agent::role::antigravity_backend;
+use crate::agent::role::ACP_ROLE_NAME;
+use crate::agent::role::AcpHarness;
+use crate::agent::role::acp_backend;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::tools::context::FunctionToolOutput;
@@ -9,6 +10,7 @@ use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use serde_json::json;
 use std::collections::BTreeMap;
 
 pub(crate) struct SpawnHandler;
@@ -20,6 +22,8 @@ pub(crate) struct FollowupHandler;
 struct SpawnArgs {
     task_name: String,
     message: String,
+    harness: AcpHarness,
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,14 +57,28 @@ fn spawn_spec() -> ToolSpec {
         (
             "task_name".to_string(),
             JsonSchema::string(Some(
-                "Task name for the Gemini agent. Use lowercase letters, digits, and underscores."
+                "Task name for the ACP agent. Use lowercase letters, digits, and underscores."
+                    .to_string(),
+            )),
+        ),
+        (
+            "harness".to_string(),
+            JsonSchema::string_enum(
+                vec![json!("grok-build")],
+                Some("Registered ACP agent harness to launch.".to_string()),
+            ),
+        ),
+        (
+            "model".to_string(),
+            JsonSchema::string(Some(
+                "Optional model ID selected through the harness ACP session configuration. The harness default is used when omitted."
                     .to_string(),
             )),
         ),
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Complete plain-text task for Gemini. This text is passed to the local Antigravity CLI and no parent history is inherited."
+                "Complete plain-text task for the ACP agent. No parent conversation history is inherited."
                     .to_string(),
             )),
         ),
@@ -68,10 +86,10 @@ fn spawn_spec() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn".to_string(),
         description: concat!(
-            "Spawn a Gemini 3.7 Flash subagent owned by the Codex agent-control plane. ",
-            "The local Antigravity process shares the current working directory and runs ",
-            "non-interactively with permission checks bypassed, so it can modify the workspace ",
-            "outside Codex sandbox enforcement. Use only when that external execution is ",
+            "Spawn a registered Agent Client Protocol (ACP) harness as a subagent owned by ",
+            "the Codex agent-control plane. The external harness receives the current working ",
+            "directory and ACP permission requests are approved once, so it can modify the ",
+            "workspace outside Codex sandbox enforcement. Use only when that execution is ",
             "authorized. list_agents, wait_agent, and interrupt_agent use the normal ",
             "collaboration tools."
         )
@@ -80,7 +98,11 @@ fn spawn_spec() -> ToolSpec {
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["task_name".to_string(), "message".to_string()]),
+            Some(vec![
+                "task_name".to_string(),
+                "message".to_string(),
+                "harness".to_string(),
+            ]),
             Some(false.into()),
         ),
         output_schema: None,
@@ -92,13 +114,13 @@ fn message_spec(name: &str, description: &str) -> ToolSpec {
         (
             "target".to_string(),
             JsonSchema::string(Some(
-                "Canonical or relative task name returned by gemini.spawn.".to_string(),
+                "Canonical or relative task name returned by acp.spawn.".to_string(),
             )),
         ),
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Plain-text message passed to the local Antigravity CLI.".to_string(),
+                "Plain-text message passed to the target ACP session.".to_string(),
             )),
         ),
     ]);
@@ -144,7 +166,7 @@ impl ToolExecutor<ToolInvocation> for MessageHandler {
     fn spec(&self) -> ToolSpec {
         message_spec(
             "send_message",
-            "Queue a plain-text message for an existing Gemini agent without starting a turn.",
+            "Queue a plain-text message for an existing ACP agent without starting a turn.",
         )
     }
 
@@ -171,7 +193,7 @@ impl ToolExecutor<ToolInvocation> for FollowupHandler {
     fn spec(&self) -> ToolSpec {
         message_spec(
             "followup_task",
-            "Send a plain-text follow-up to an existing Gemini agent and start its next turn when idle.",
+            "Send a plain-text follow-up to an existing ACP agent and start its next turn when idle.",
         )
     }
 
@@ -201,6 +223,12 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
     let turn = &step_context.turn;
     let args: SpawnArgs = parse_arguments(&function_arguments(payload)?)?;
     let message = message_content(args.message)?;
+    let model = args.model.map(|model| model.trim().to_string());
+    if model.as_deref() == Some("") {
+        return Err(FunctionCallError::RespondToModel(
+            "model must not be empty when specified".to_string(),
+        ));
+    }
     let mut config = build_agent_spawn_config(
         &session.get_base_instructions().await,
         turn.as_ref(),
@@ -215,12 +243,12 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         session.thread_id,
         &turn.session_source,
         next_thread_spawn_depth(&turn.session_source),
-        Some(ANTIGRAVITY_ROLE_NAME),
+        Some(ACP_ROLE_NAME),
         Some(args.task_name),
     )?;
     let agent_path = spawn_source.get_agent_path().ok_or_else(|| {
         FunctionCallError::RespondToModel(
-            "spawned Gemini agent is missing a canonical task name".to_string(),
+            "spawned ACP agent is missing a canonical task name".to_string(),
         )
     })?;
     let communication = InterAgentCommunication::new(
@@ -232,7 +260,7 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         message,
         /*trigger_turn*/ true,
     );
-    let backend = antigravity_backend();
+    let backend = acp_backend(args.harness, model);
     let spawned = session
         .services
         .agent_control
@@ -279,7 +307,7 @@ async fn deliver(
     let agent_id = resolve_agent_target(&session, turn, &args.target).await?;
     if !session.services.agent_control.is_external_agent(agent_id) {
         return Err(FunctionCallError::RespondToModel(
-            "Gemini messaging tools require a target created by gemini.spawn".to_string(),
+            "ACP messaging tools require a target created by acp.spawn".to_string(),
         ));
     }
     let known = session

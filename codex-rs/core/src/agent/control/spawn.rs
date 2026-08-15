@@ -299,7 +299,8 @@ impl AgentControl {
         let resolved_command = which::which_in(&backend.command, search_path, &config.cwd)
             .map_err(|error| {
                 CodexErr::InvalidRequest(format!(
-                    "unable to resolve Antigravity CLI `{}`: {error}",
+                    "unable to resolve ACP harness `{}` command `{}`: {error}",
+                    backend.harness.name(),
                     backend.command
                 ))
             })?;

@@ -20,6 +20,7 @@ use codex_config::loader::resolve_relative_paths_in_config_toml;
 use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
 use codex_protocol::models::BaseInstructionsProvenance;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -28,19 +29,43 @@ use toml::Value as TomlValue;
 
 /// The role name used when a caller omits `agent_type`.
 pub const DEFAULT_ROLE_NAME: &str = "default";
-pub(crate) const ANTIGRAVITY_ROLE_NAME: &str = "gemini";
+pub(crate) const ACP_ROLE_NAME: &str = "acp";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AcpHarness {
+    GrokBuild,
+}
+
+impl AcpHarness {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::GrokBuild => "grok-build",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalAgentBackend {
+    pub(crate) harness: AcpHarness,
     pub(crate) command: String,
-    pub(crate) model: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) model: Option<String>,
 }
 
-pub(crate) fn antigravity_backend() -> ExternalAgentBackend {
-    ExternalAgentBackend {
-        command: "agy".to_string(),
-        model: "gemini-3.7-flash-high".to_string(),
+pub(crate) fn acp_backend(harness: AcpHarness, model: Option<String>) -> ExternalAgentBackend {
+    match harness {
+        AcpHarness::GrokBuild => ExternalAgentBackend {
+            harness,
+            command: "grok".to_string(),
+            args: vec![
+                "--no-auto-update".to_string(),
+                "agent".to_string(),
+                "stdio".to_string(),
+            ],
+            model,
+        },
     }
 }
 

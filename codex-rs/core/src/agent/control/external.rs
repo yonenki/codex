@@ -1,19 +1,39 @@
 use super::*;
 use crate::agent::role::ExternalAgentBackend;
+use agent_client_protocol::AcpAgent;
+use agent_client_protocol::AcpAgentConfig;
+use agent_client_protocol::Agent;
+use agent_client_protocol::ConnectionTo;
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::CancelNotification;
+use agent_client_protocol::schema::v1::ContentBlock;
+use agent_client_protocol::schema::v1::ContentChunk;
+use agent_client_protocol::schema::v1::InitializeRequest;
+use agent_client_protocol::schema::v1::NewSessionRequest;
+use agent_client_protocol::schema::v1::PermissionOptionKind;
+use agent_client_protocol::schema::v1::PromptRequest;
+use agent_client_protocol::schema::v1::RequestPermissionOutcome;
+use agent_client_protocol::schema::v1::RequestPermissionRequest;
+use agent_client_protocol::schema::v1::RequestPermissionResponse;
+use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
+use agent_client_protocol::schema::v1::SessionConfigOptionCategory;
+use agent_client_protocol::schema::v1::SessionNotification;
+use agent_client_protocol::schema::v1::SessionUpdate;
+use agent_client_protocol::schema::v1::SetSessionConfigOptionRequest;
+use agent_client_protocol::schema::v1::StopReason;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::process::Stdio;
 use std::sync::Mutex;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::BufReader;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
+use tokio::time::Duration;
+use tokio::time::timeout;
 
-const MAX_STDERR_BYTES: usize = 32 * 1024;
 const MAX_RESULT_TOKENS: usize = 8_000;
+const ACP_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(super) struct ExternalAgentManager {
@@ -21,10 +41,7 @@ pub(super) struct ExternalAgentManager {
 }
 
 struct ExternalAgent {
-    backend: ExternalAgentBackend,
-    cwd: std::path::PathBuf,
-    env: HashMap<String, String>,
-    conversation_id: Mutex<Option<String>>,
+    command_tx: async_channel::Sender<AcpCommand>,
     runtime: Mutex<ExternalAgentRuntime>,
     status_tx: watch::Sender<AgentStatus>,
 }
@@ -42,6 +59,15 @@ struct QueuedMessage {
     trigger_turn: bool,
 }
 
+enum AcpCommand {
+    Prompt {
+        prompt: String,
+        response: oneshot::Sender<AgentStatus>,
+    },
+    Cancel,
+    Shutdown,
+}
+
 impl ExternalAgentManager {
     pub(super) fn contains(&self, agent_id: ThreadId) -> bool {
         self.agent(agent_id).is_some()
@@ -55,31 +81,38 @@ impl ExternalAgentManager {
         env: HashMap<String, String>,
     ) -> CodexResult<()> {
         let (status_tx, _) = watch::channel(AgentStatus::PendingInit);
+        let (command_tx, command_rx) = async_channel::unbounded();
         let agent = Arc::new(ExternalAgent {
-            backend,
-            cwd,
-            env,
-            conversation_id: Mutex::new(None),
+            command_tx,
             runtime: Mutex::new(ExternalAgentRuntime::default()),
-            status_tx,
+            status_tx: status_tx.clone(),
         });
         let mut agents = self
             .agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if agents.insert(agent_id, agent).is_some() {
+        if agents.insert(agent_id, Arc::clone(&agent)).is_some() {
             return Err(CodexErr::Fatal(format!(
                 "external agent id {agent_id} was registered twice"
             )));
         }
+        tokio::spawn(async move {
+            if let Err(error) = run_acp_agent(backend, cwd, env, command_rx).await {
+                status_tx.send_replace(AgentStatus::Errored(error));
+            }
+        });
         Ok(())
     }
 
     pub(super) fn remove(&self, agent_id: ThreadId) {
-        self.agents
+        if let Some(agent) = self
+            .agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&agent_id);
+            .remove(&agent_id)
+        {
+            let _ = agent.command_tx.try_send(AcpCommand::Shutdown);
+        }
     }
 
     pub(super) fn status(&self, agent_id: ThreadId) -> Option<AgentStatus> {
@@ -143,6 +176,7 @@ impl ExternalAgentManager {
             runtime.queued_messages.clear();
             runtime.active_task.take()
         };
+        let _ = agent.command_tx.try_send(AcpCommand::Cancel);
         if let Some(task) = active_task {
             task.abort();
         }
@@ -170,11 +204,28 @@ fn prepend_queued_messages(queue: &mut VecDeque<QueuedMessage>, content: String)
 
 fn start_turn(agent: Arc<ExternalAgent>, prompt: String, generation: u64) {
     agent.status_tx.send_replace(AgentStatus::Running);
+    let (response_tx, response_rx) = oneshot::channel();
     let task_agent = Arc::clone(&agent);
-    let task = tokio::spawn(async move {
-        let status = run_antigravity_turn(&task_agent, prompt).await;
-        finish_turn(task_agent, generation, status);
-    });
+    let task = match agent.command_tx.try_send(AcpCommand::Prompt {
+        prompt,
+        response: response_tx,
+    }) {
+        Ok(()) => tokio::spawn(async move {
+            let status = response_rx.await.unwrap_or_else(|_| {
+                AgentStatus::Errored(
+                    "ACP harness stopped before completing the prompt turn".to_string(),
+                )
+            });
+            finish_turn(task_agent, generation, status);
+        }),
+        Err(error) => tokio::spawn(async move {
+            finish_turn(
+                task_agent,
+                generation,
+                AgentStatus::Errored(format!("ACP harness is not available: {error}")),
+            );
+        }),
+    };
     let mut runtime = agent
         .runtime
         .lock()
@@ -220,162 +271,228 @@ fn finish_turn(agent: Arc<ExternalAgent>, generation: u64, status: AgentStatus) 
     }
 }
 
-async fn run_antigravity_turn(agent: &ExternalAgent, prompt: String) -> AgentStatus {
-    let conversation_id = agent
-        .conversation_id
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let mut command = tokio::process::Command::new(&agent.backend.command);
-    command
-        .current_dir(&agent.cwd)
-        .env_clear()
-        .envs(&agent.env)
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args([
-            "--output-format",
-            "stream-json",
-            "--model",
-            agent.backend.model.as_str(),
-            "--disable-slash-commands",
-            "--dangerously-skip-permissions",
-            "--print-timeout",
-            "30m",
-        ]);
-    if let Some(conversation_id) = conversation_id {
-        command.args(["--conversation", conversation_id.as_str()]);
-    }
-    command.args(["--print", prompt.as_str()]);
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return AgentStatus::Errored(format!(
-                "failed to start Antigravity CLI `{}`: {error}",
-                agent.backend.command
-            ));
-        }
-    };
-    let Some(stdout) = child.stdout.take() else {
-        return AgentStatus::Errored("Antigravity CLI did not expose stdout".to_string());
-    };
-    let stderr_task = child
-        .stderr
-        .take()
-        .map(|stderr| tokio::spawn(read_bounded_stderr(stderr)));
-    let mut stdout = BufReader::new(stdout).lines();
-    let mut result = None;
-    loop {
-        match stdout.next_line().await {
-            Ok(Some(line)) => match parse_stream_event(&line) {
-                Ok(StreamEvent::Conversation(id)) => {
-                    *agent
-                        .conversation_id
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
-                }
-                Ok(StreamEvent::Result(status)) => result = Some(status),
-                Ok(StreamEvent::Ignore) => {}
-                Err(error) => return AgentStatus::Errored(error),
+async fn run_acp_agent(
+    backend: ExternalAgentBackend,
+    cwd: std::path::PathBuf,
+    env: HashMap<String, String>,
+    command_rx: async_channel::Receiver<AcpCommand>,
+) -> Result<(), String> {
+    let output = Arc::new(Mutex::new(String::new()));
+    let notification_output = Arc::clone(&output);
+    let harness_name = backend.harness.name();
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(&backend.command)
+            .args(backend.args.clone())
+            .envs(env),
+    );
+    agent_client_protocol::Client
+        .builder()
+        .name("Codex ACP subagent host")
+        .on_receive_notification(
+            async move |notification: SessionNotification, _connection| {
+                append_agent_text(&notification, &notification_output);
+                Ok(())
             },
-            Ok(None) => break,
-            Err(error) => {
-                return AgentStatus::Errored(format!(
-                    "failed to read Antigravity CLI output: {error}"
-                ));
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |request: RequestPermissionRequest, responder, _connection| {
+                let outcome = request
+                    .options
+                    .iter()
+                    .find(|option| option.kind == PermissionOptionKind::AllowOnce)
+                    .map(|option| {
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                            option.option_id.clone(),
+                        ))
+                    })
+                    .unwrap_or(RequestPermissionOutcome::Cancelled);
+                responder.respond(RequestPermissionResponse::new(outcome))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
+            connection
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let session = connection
+                .send_request(NewSessionRequest::new(&cwd))
+                .block_task()
+                .await?;
+            if let Some(model) = backend.model.as_deref() {
+                let model_config = session
+                    .config_options
+                    .as_deref()
+                    .and_then(|options| {
+                        options.iter().find(|option| {
+                            option.category == Some(SessionConfigOptionCategory::Model)
+                        })
+                    })
+                    .ok_or_else(|| {
+                        agent_client_protocol::Error::invalid_request().data(format!(
+                            "ACP harness `{harness_name}` does not expose a model configuration option"
+                        ))
+                    })?;
+                connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session.session_id.clone(),
+                        model_config.id.clone(),
+                        model,
+                    ))
+                    .block_task()
+                    .await?;
             }
-        }
-    }
-    let exit_status = child.wait().await;
-    let stderr = match stderr_task {
-        Some(task) => task.await.unwrap_or_default(),
-        None => String::new(),
-    };
-    match exit_status {
-        Ok(status) if status.success() => result.unwrap_or_else(|| {
-            AgentStatus::Errored(with_stderr(
-                "Antigravity CLI exited without a result event",
-                &stderr,
-            ))
-        }),
-        Ok(status) => AgentStatus::Errored(with_stderr(
-            &format!("Antigravity CLI exited with status {status}"),
-            &stderr,
-        )),
-        Err(error) => AgentStatus::Errored(with_stderr(
-            &format!("failed to wait for Antigravity CLI: {error}"),
-            &stderr,
-        )),
-    }
+            run_acp_command_loop(connection, session.session_id, command_rx, output).await
+        })
+        .await
+        .map_err(|error| format!("ACP harness `{harness_name}` failed: {error}"))
 }
 
-async fn read_bounded_stderr(stderr: tokio::process::ChildStderr) -> String {
-    let mut lines = BufReader::new(stderr).lines();
-    let mut retained = VecDeque::<String>::new();
-    let mut retained_bytes = 0usize;
-    while let Ok(Some(line)) = lines.next_line().await {
-        retained_bytes = retained_bytes.saturating_add(line.len() + 1);
-        retained.push_back(line);
-        while retained_bytes > MAX_STDERR_BYTES {
-            let Some(removed) = retained.pop_front() else {
-                break;
-            };
-            retained_bytes = retained_bytes.saturating_sub(removed.len() + 1);
-        }
-    }
-    retained.into_iter().collect::<Vec<_>>().join("\n")
-}
-
-fn with_stderr(message: &str, stderr: &str) -> String {
-    if stderr.trim().is_empty() {
-        message.to_string()
-    } else {
-        format!("{message}: {}", stderr.trim())
-    }
-}
-
-enum StreamEvent {
-    Conversation(String),
-    Result(AgentStatus),
-    Ignore,
-}
-
-fn parse_stream_event(line: &str) -> Result<StreamEvent, String> {
-    let event: Value = serde_json::from_str(line)
-        .map_err(|error| format!("invalid Antigravity stream event: {error}"))?;
-    match event.get("event").and_then(Value::as_str) {
-        Some("init") => event
-            .get("conversation_id")
-            .and_then(Value::as_str)
-            .map(|id| StreamEvent::Conversation(id.to_string()))
-            .ok_or_else(|| "Antigravity init event omitted conversation_id".to_string()),
-        Some("result") => {
-            let result = event
-                .get("result")
-                .ok_or_else(|| "Antigravity result event omitted result".to_string())?;
-            let status = result
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("ERROR");
-            let response = result
-                .get("response")
-                .and_then(Value::as_str)
-                .map(|response| {
-                    truncate_text(response, TruncationPolicy::Tokens(MAX_RESULT_TOKENS))
-                });
-            if status == "SUCCESS" {
-                Ok(StreamEvent::Result(AgentStatus::Completed(response)))
-            } else {
-                Ok(StreamEvent::Result(AgentStatus::Errored(
-                    response.unwrap_or_else(|| format!("Antigravity result status was {status}")),
-                )))
+async fn run_acp_command_loop(
+    connection: ConnectionTo<Agent>,
+    session_id: agent_client_protocol::schema::v1::SessionId,
+    command_rx: async_channel::Receiver<AcpCommand>,
+    output: Arc<Mutex<String>>,
+) -> Result<(), agent_client_protocol::Error> {
+    while let Ok(command) = command_rx.recv().await {
+        match command {
+            AcpCommand::Prompt { prompt, response } => {
+                output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                let mut prompt_request = std::pin::pin!(
+                    connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(
+                                agent_client_protocol::schema::v1::TextContent::new(prompt),
+                            )],
+                        ))
+                        .block_task()
+                );
+                loop {
+                    tokio::select! {
+                        result = &mut prompt_request => {
+                            let status = match result {
+                                Ok(prompt_response) => prompt_status(
+                                    prompt_response.stop_reason,
+                                    take_output(&output),
+                                ),
+                                Err(error) => AgentStatus::Errored(format!(
+                                    "ACP prompt failed: {error}"
+                                )),
+                            };
+                            let _ = response.send(status);
+                            break;
+                        }
+                        command = command_rx.recv() => {
+                            match command {
+                                Ok(AcpCommand::Cancel) => {
+                                    connection.send_notification(
+                                        CancelNotification::new(session_id.clone()),
+                                    )?;
+                                    let result = timeout(
+                                        ACP_CANCEL_GRACE_PERIOD,
+                                        &mut prompt_request,
+                                    )
+                                    .await;
+                                    let status = match result {
+                                        Ok(Ok(prompt_response)) => prompt_status(
+                                            prompt_response.stop_reason,
+                                            take_output(&output),
+                                        ),
+                                        Ok(Err(error)) => AgentStatus::Errored(format!(
+                                            "ACP prompt cancellation failed: {error}"
+                                        )),
+                                        Err(_) => {
+                                            let message =
+                                                "ACP harness did not stop after cancellation";
+                                            let _ = response.send(AgentStatus::Errored(
+                                                message.to_string(),
+                                            ));
+                                            return Err(
+                                                agent_client_protocol::Error::internal_error()
+                                                    .data(message),
+                                            );
+                                        }
+                                    };
+                                    let _ = response.send(status);
+                                    break;
+                                }
+                                Ok(AcpCommand::Shutdown) | Err(_) => {
+                                    connection.send_notification(
+                                        CancelNotification::new(session_id.clone()),
+                                    )?;
+                                    return Ok(());
+                                }
+                                Ok(AcpCommand::Prompt { response, .. }) => {
+                                    let _ = response.send(AgentStatus::Errored(
+                                        "ACP session received overlapping prompt turns".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
+            AcpCommand::Cancel => {}
+            AcpCommand::Shutdown => return Ok(()),
         }
-        Some(_) => Ok(StreamEvent::Ignore),
-        None => Err("Antigravity stream event omitted event kind".to_string()),
+    }
+    Ok(())
+}
+
+fn append_agent_text(notification: &SessionNotification, output: &Arc<Mutex<String>>) {
+    if let SessionUpdate::AgentMessageChunk(ContentChunk {
+        content: ContentBlock::Text(text),
+        ..
+    }) = &notification.update
+    {
+        output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_str(&text.text);
+    }
+}
+
+fn take_output(output: &Arc<Mutex<String>>) -> String {
+    let mut output = output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *output)
+}
+
+fn prompt_status(stop_reason: StopReason, output: String) -> AgentStatus {
+    let output = (!output.is_empty())
+        .then(|| truncate_text(&output, TruncationPolicy::Tokens(MAX_RESULT_TOKENS)));
+    match stop_reason {
+        StopReason::EndTurn => AgentStatus::Completed(output),
+        StopReason::Cancelled => AgentStatus::Interrupted,
+        StopReason::MaxTokens => AgentStatus::Errored(with_output(
+            "ACP agent reached its token limit",
+            output.as_deref(),
+        )),
+        StopReason::MaxTurnRequests => AgentStatus::Errored(with_output(
+            "ACP agent reached its turn request limit",
+            output.as_deref(),
+        )),
+        StopReason::Refusal => AgentStatus::Errored(with_output(
+            "ACP agent refused the prompt",
+            output.as_deref(),
+        )),
+        _ => AgentStatus::Errored(with_output(
+            "ACP agent returned an unsupported stop reason",
+            output.as_deref(),
+        )),
+    }
+}
+
+fn with_output(message: &str, output: Option<&str>) -> String {
+    match output {
+        Some(output) if !output.is_empty() => format!("{message}: {output}"),
+        _ => message.to_string(),
     }
 }
 

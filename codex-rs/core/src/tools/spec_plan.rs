@@ -43,14 +43,14 @@ use crate::tools::handlers::multi_agents_common::MAX_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_common::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
-use crate::tools::handlers::multi_agents_v2::FollowupGeminiAgentHandler;
+use crate::tools::handlers::multi_agents_v2::FollowupAcpAgentHandler;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
-use crate::tools::handlers::multi_agents_v2::MessageGeminiAgentHandler;
+use crate::tools::handlers::multi_agents_v2::MessageAcpAgentHandler;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
+use crate::tools::handlers::multi_agents_v2::SpawnAcpAgentHandler;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
-use crate::tools::handlers::multi_agents_v2::SpawnGeminiAgentHandler;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
@@ -106,7 +106,7 @@ use tracing::instrument;
 
 const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 const IMAGE_GEN_NAMESPACE: &str = "image_gen";
-const GEMINI_AGENT_NAMESPACE: &str = "gemini";
+const ACP_AGENT_NAMESPACE: &str = "acp";
 const IMAGEGEN_TOOL_NAME: &str = "imagegen";
 
 #[derive(Clone, Copy)]
@@ -1176,15 +1176,15 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 exposure,
             );
             registry.register_trusted_with_exposure(
-                multi_agent_v2_handler(SpawnGeminiAgentHandler, Some(GEMINI_AGENT_NAMESPACE)),
+                multi_agent_v2_handler(SpawnAcpAgentHandler, Some(ACP_AGENT_NAMESPACE)),
                 exposure,
             );
             registry.register_trusted_with_exposure(
-                multi_agent_v2_handler(MessageGeminiAgentHandler, Some(GEMINI_AGENT_NAMESPACE)),
+                multi_agent_v2_handler(MessageAcpAgentHandler, Some(ACP_AGENT_NAMESPACE)),
                 exposure,
             );
             registry.register_trusted_with_exposure(
-                multi_agent_v2_handler(FollowupGeminiAgentHandler, Some(GEMINI_AGENT_NAMESPACE)),
+                multi_agent_v2_handler(FollowupAcpAgentHandler, Some(ACP_AGENT_NAMESPACE)),
                 exposure,
             );
             if turn_context.config.multi_agent_v2.wait_agent_enabled {

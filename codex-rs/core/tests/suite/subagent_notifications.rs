@@ -1919,22 +1919,29 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gemini_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
+async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     let fixture_dir = tempfile::tempdir()?;
-    super::install_antigravity_fixture(fixture_dir.path())?;
+    super::install_acp_fixture(fixture_dir.path())?;
     let fixture_path = fixture_dir.path().to_string_lossy().into_owned();
+    let fixture_codex_home = fixture_dir
+        .path()
+        .join("codex-home")
+        .to_string_lossy()
+        .into_owned();
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
-        "message": "independent Gemini task",
-        "task_name": "gemini",
+        "message": "independent ACP task",
+        "task_name": "grok",
+        "harness": "grok-build",
+        "model": "grok-test",
     }))?;
     mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
         sse(vec![
-            ev_response_created("resp-parent-gemini-1"),
-            ev_function_call_with_namespace(SPAWN_CALL_ID, "gemini", "spawn", &spawn_args),
-            ev_completed("resp-parent-gemini-1"),
+            ev_response_created("resp-parent-acp-1"),
+            ev_function_call_with_namespace(SPAWN_CALL_ID, "acp", "spawn", &spawn_args),
+            ev_completed("resp-parent-acp-1"),
         ]),
     )
     .await;
@@ -1942,9 +1949,9 @@ async fn gemini_external_agent_completion_reaches_parent_mailbox() -> Result<()>
         &server,
         |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
         sse(vec![
-            ev_response_created("resp-parent-gemini-2"),
-            ev_assistant_message("msg-parent-gemini-2", "parent done"),
-            ev_completed("resp-parent-gemini-2"),
+            ev_response_created("resp-parent-acp-2"),
+            ev_assistant_message("msg-parent-acp-2", "parent done"),
+            ev_completed("resp-parent-acp-2"),
         ]),
     )
     .await;
@@ -1955,14 +1962,14 @@ async fn gemini_external_agent_completion_reaches_parent_mailbox() -> Result<()>
                 && !body_contains(req, "Message Type: FINAL_ANSWER")
         },
         sse(vec![
-            ev_response_created("resp-parent-gemini-3"),
+            ev_response_created("resp-parent-acp-3"),
             ev_function_call_with_namespace(
-                "wait-gemini-call",
+                "wait-acp-call",
                 MULTI_AGENT_V2_NAMESPACE,
                 "wait_agent",
                 "{}",
             ),
-            ev_completed("resp-parent-gemini-3"),
+            ev_completed("resp-parent-acp-3"),
         ]),
     )
     .await;
@@ -1971,12 +1978,12 @@ async fn gemini_external_agent_completion_reaches_parent_mailbox() -> Result<()>
         |req: &wiremock::Request| {
             body_contains(req, TURN_2_NO_WAIT_PROMPT)
                 && body_contains(req, "Message Type: FINAL_ANSWER")
-                && body_contains(req, "gemini done")
+                && body_contains(req, "acp done")
         },
         sse(vec![
-            ev_response_created("resp-parent-gemini-4"),
-            ev_assistant_message("msg-parent-gemini-4", "done"),
-            ev_completed("resp-parent-gemini-4"),
+            ev_response_created("resp-parent-acp-4"),
+            ev_assistant_message("msg-parent-acp-4", "done"),
+            ev_completed("resp-parent-acp-4"),
         ]),
     )
     .await;
@@ -1995,6 +2002,11 @@ async fn gemini_external_agent_completion_reaches_parent_mailbox() -> Result<()>
                 if cfg!(windows) { "Path" } else { "PATH" }.to_string(),
                 fixture_path,
             );
+            config
+                .permissions
+                .shell_environment_policy
+                .r#set
+                .insert("CODEX_HOME".to_string(), fixture_codex_home);
         })
         .build_with_auto_env(&server)
         .await?;
@@ -2004,7 +2016,7 @@ async fn gemini_external_agent_completion_reaches_parent_mailbox() -> Result<()>
         .single_request()
         .function_call_output(SPAWN_CALL_ID);
     assert!(
-        serde_json::to_string(&spawn_output)?.contains("/root/gemini"),
+        serde_json::to_string(&spawn_output)?.contains("/root/grok"),
         "external spawn failed: {spawn_output:#}"
     );
     test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
@@ -2012,20 +2024,94 @@ async fn gemini_external_agent_completion_reaches_parent_mailbox() -> Result<()>
     let request = wait_for_requests(&completion_request)
         .await?
         .pop()
-        .expect("Gemini completion request");
+        .expect("ACP completion request");
     assert_eq!(
         strip_response_item_ids_from_json(strip_metadata_from_json(Value::Array(
             request.inputs_of_type("agent_message"),
         ))),
         Value::Array(vec![json!({
             "type": "agent_message",
-            "author": "/root/gemini",
+            "author": "/root/grok",
             "recipient": "/root",
             "content": [{
                 "type": "input_text",
-                "text": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/gemini\nPayload:\ngemini done",
+                "text": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/grok\nPayload:\nacp done",
             }],
         })])
+    );
+
+    let followup_call_id = "followup-acp-call";
+    let followup_prompt = "continue the ACP session";
+    let followup_args = serde_json::to_string(&json!({
+        "target": "/root/grok",
+        "message": "second ACP task",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, followup_prompt),
+        sse(vec![
+            ev_response_created("resp-parent-acp-5"),
+            ev_function_call_with_namespace(
+                followup_call_id,
+                "acp",
+                "followup_task",
+                &followup_args,
+            ),
+            ev_completed("resp-parent-acp-5"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, followup_call_id),
+        sse(vec![
+            ev_response_created("resp-parent-acp-6"),
+            ev_assistant_message("msg-parent-acp-6", "follow-up sent"),
+            ev_completed("resp-parent-acp-6"),
+        ]),
+    )
+    .await;
+    let followup_wait_prompt = "wait for the ACP follow-up";
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, followup_wait_prompt) && !body_contains(req, "acp follow-up done")
+        },
+        sse(vec![
+            ev_response_created("resp-parent-acp-7"),
+            ev_function_call_with_namespace(
+                "wait-acp-followup-call",
+                MULTI_AGENT_V2_NAMESPACE,
+                "wait_agent",
+                "{}",
+            ),
+            ev_completed("resp-parent-acp-7"),
+        ]),
+    )
+    .await;
+    let followup_completion_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, followup_wait_prompt) && body_contains(req, "acp follow-up done")
+        },
+        sse(vec![
+            ev_response_created("resp-parent-acp-8"),
+            ev_assistant_message("msg-parent-acp-8", "follow-up done"),
+            ev_completed("resp-parent-acp-8"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn(followup_prompt).await?;
+    test.submit_turn(followup_wait_prompt).await?;
+    let request = wait_for_requests(&followup_completion_request)
+        .await?
+        .pop()
+        .expect("ACP follow-up completion request");
+    assert!(
+        serde_json::to_string(&request.inputs_of_type("agent_message"))?
+            .contains("acp follow-up done"),
+        "follow-up did not reuse the ACP session: {request:#?}"
     );
 
     Ok(())

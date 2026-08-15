@@ -8,13 +8,15 @@ use codex_test_binary_support::TestBinaryDispatchGuard;
 use codex_test_binary_support::TestBinaryDispatchMode;
 use codex_test_binary_support::configure_test_binary_dispatch;
 use ctor::ctor;
+use std::io::BufRead;
+use std::io::Write;
 use std::path::PathBuf;
 
-const ANTIGRAVITY_FIXTURE_EXECUTABLE: &str = "agy";
+const ACP_FIXTURE_EXECUTABLE: &str = "grok";
 
-fn install_antigravity_fixture(directory: &std::path::Path) -> std::io::Result<PathBuf> {
+fn install_acp_fixture(directory: &std::path::Path) -> std::io::Result<PathBuf> {
     let executable = directory.join(format!(
-        "{ANTIGRAVITY_FIXTURE_EXECUTABLE}{}",
+        "{ACP_FIXTURE_EXECUTABLE}{}",
         std::env::consts::EXE_SUFFIX
     ));
     std::fs::copy(std::env::current_exe()?, &executable)?;
@@ -27,18 +29,12 @@ fn install_antigravity_fixture(directory: &std::path::Path) -> std::io::Result<P
 // NOTE: this doesn't work on ARM
 #[ctor]
 pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
-    let is_antigravity_fixture = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.file_stem().map(std::borrow::ToOwned::to_owned))
-        .is_some_and(|stem| stem == ANTIGRAVITY_FIXTURE_EXECUTABLE);
-    if is_antigravity_fixture {
-        println!(
-            "{{\"event\":\"init\",\"conversation_id\":\"fixture-conversation\",\"init\":{{}}}}"
-        );
-        println!(
-            "{{\"event\":\"result\",\"result\":{{\"conversation_id\":\"fixture-conversation\",\"status\":\"SUCCESS\",\"response\":\"gemini done\"}}}}"
-        );
-        std::process::exit(0);
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let is_acp_fixture = args
+        .windows(2)
+        .any(|args| args[0] == "agent" && args[1] == "stdio");
+    if is_acp_fixture {
+        run_acp_fixture();
     }
     configure_test_binary_dispatch("codex-core-tests", |exe_name, argv1| {
         if argv1 == Some(CODEX_CORE_APPLY_PATCH_ARG1) {
@@ -57,6 +53,93 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
         TestBinaryDispatchMode::InstallAliases
     })
 };
+
+fn run_acp_fixture() -> ! {
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::BufWriter::new(std::io::stdout());
+    let mut prompt_count = 0_u64;
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let method = message
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let id = message.get("id").cloned();
+        let response = match (method, id) {
+            ("initialize", Some(id)) => Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {},
+                    "agentInfo": { "name": "ACP fixture", "version": "1" }
+                }
+            })),
+            ("session/new", Some(id)) => Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "sessionId": "fixture-session",
+                    "configOptions": [acp_fixture_model_option("fixture-default")]
+                }
+            })),
+            ("session/set_config_option", Some(id)) => Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "configOptions": [acp_fixture_model_option("grok-test")]
+                }
+            })),
+            ("session/prompt", Some(id)) => {
+                prompt_count += 1;
+                let text = match prompt_count {
+                    1 => "acp done",
+                    _ => "acp follow-up done",
+                };
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "fixture-session",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": text }
+                        }
+                    }
+                });
+                writeln!(stdout, "{notification}").expect("write ACP fixture notification");
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "stopReason": "end_turn" }
+                }))
+            }
+            _ => None,
+        };
+        if let Some(response) = response {
+            writeln!(stdout, "{response}").expect("write ACP fixture response");
+        }
+        stdout.flush().expect("flush ACP fixture response");
+    }
+    std::process::exit(0);
+}
+
+fn acp_fixture_model_option(current_value: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": current_value,
+        "options": [
+            { "value": "fixture-default", "name": "Fixture Default" },
+            { "value": "grok-test", "name": "Grok Test" }
+        ]
+    })
+}
 
 #[cfg(not(target_os = "windows"))]
 mod abort_tasks;
