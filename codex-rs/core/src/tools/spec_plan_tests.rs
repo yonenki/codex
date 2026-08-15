@@ -2349,6 +2349,27 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             "spawn".to_string(),
         ]
     );
+    let ToolSpec::Namespace(acp_namespace) = v2.visible_spec("acp") else {
+        panic!("expected acp namespace");
+    };
+    let Some(ResponsesApiNamespaceTool::Function(acp_spawn)) =
+        acp_namespace.tools.iter().find(|tool| {
+            matches!(
+                tool,
+                ResponsesApiNamespaceTool::Function(tool) if tool.name == "spawn"
+            )
+        })
+    else {
+        panic!("expected acp spawn function");
+    };
+    let acp_spawn_properties = acp_spawn
+        .parameters
+        .properties
+        .as_ref()
+        .expect("acp spawn should use object params");
+    for property in ["harness", "model", "effort"] {
+        assert!(acp_spawn_properties.contains_key(property));
+    }
     let ToolSpec::Namespace(namespace) = v2.visible_spec(MULTI_AGENT_V2_NAMESPACE) else {
         panic!("expected {MULTI_AGENT_V2_NAMESPACE} namespace");
     };

@@ -12,7 +12,7 @@ use std::io::BufRead;
 use std::io::Write;
 use std::path::PathBuf;
 
-const ACP_FIXTURE_EXECUTABLE: &str = "grok";
+const ACP_FIXTURE_EXECUTABLE: &str = "acp-harness-host";
 
 fn install_acp_fixture(directory: &std::path::Path) -> std::io::Result<PathBuf> {
     let executable = directory.join(format!(
@@ -32,8 +32,17 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
     let args = std::env::args_os().collect::<Vec<_>>();
     let is_acp_fixture = args
         .windows(2)
-        .any(|args| args[0] == "agent" && args[1] == "stdio");
+        .any(|args| args[0] == "--harness" && args[1] == "grok-build");
     if is_acp_fixture {
+        let has_model = args
+            .windows(2)
+            .any(|args| args[0] == "--model" && args[1] == "grok-test");
+        let has_effort = args
+            .windows(2)
+            .any(|args| args[0] == "--effort" && args[1] == "xhigh");
+        if !has_model || !has_effort {
+            std::process::exit(2);
+        }
         run_acp_fixture();
     }
     configure_test_binary_dispatch("codex-core-tests", |exe_name, argv1| {
@@ -82,15 +91,7 @@ fn run_acp_fixture() -> ! {
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "sessionId": "fixture-session",
-                    "configOptions": [acp_fixture_model_option("fixture-default")]
-                }
-            })),
-            ("session/set_config_option", Some(id)) => Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "configOptions": [acp_fixture_model_option("grok-test")]
+                    "sessionId": "fixture-session"
                 }
             })),
             ("session/prompt", Some(id)) => {
@@ -125,20 +126,6 @@ fn run_acp_fixture() -> ! {
         stdout.flush().expect("flush ACP fixture response");
     }
     std::process::exit(0);
-}
-
-fn acp_fixture_model_option(current_value: &str) -> serde_json::Value {
-    serde_json::json!({
-        "id": "model",
-        "name": "Model",
-        "category": "model",
-        "type": "select",
-        "currentValue": current_value,
-        "options": [
-            { "value": "fixture-default", "name": "Fixture Default" },
-            { "value": "grok-test", "name": "Grok Test" }
-        ]
-    })
 }
 
 #[cfg(not(target_os = "windows"))]

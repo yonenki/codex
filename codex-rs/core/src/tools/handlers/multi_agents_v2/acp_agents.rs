@@ -1,7 +1,6 @@
 use super::*;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::ACP_ROLE_NAME;
-use crate::agent::role::AcpHarness;
 use crate::agent::role::acp_backend;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
@@ -22,8 +21,9 @@ pub(crate) struct FollowupHandler;
 struct SpawnArgs {
     task_name: String,
     message: String,
-    harness: AcpHarness,
+    harness: String,
     model: Option<String>,
+    effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,10 +63,14 @@ fn spawn_spec() -> ToolSpec {
         ),
         (
             "harness".to_string(),
-            JsonSchema::string_enum(
-                vec![json!("grok-build")],
-                Some("Registered ACP agent harness to launch.".to_string()),
-            ),
+            harness_schema(),
+        ),
+        (
+            "effort".to_string(),
+            JsonSchema::string(Some(
+                "Optional reasoning effort selected through the harness ACP thought-level configuration. The harness default is used when omitted."
+                    .to_string(),
+            )),
         ),
         (
             "model".to_string(),
@@ -107,6 +111,24 @@ fn spawn_spec() -> ToolSpec {
         ),
         output_schema: None,
     })
+}
+
+fn harness_schema() -> JsonSchema {
+    let description =
+        Some("Harness ID resolved by the configured external ACP harness host.".to_string());
+    let harnesses = std::env::var("CODEX_ACP_HARNESS_IDS_JSON")
+        .ok()
+        .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|harness| is_valid_harness_id(harness))
+        .map(|harness| json!(harness))
+        .collect::<Vec<_>>();
+    if harnesses.is_empty() {
+        JsonSchema::string(description)
+    } else {
+        JsonSchema::string_enum(harnesses, description)
+    }
 }
 
 fn message_spec(name: &str, description: &str) -> ToolSpec {
@@ -223,10 +245,22 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
     let turn = &step_context.turn;
     let args: SpawnArgs = parse_arguments(&function_arguments(payload)?)?;
     let message = message_content(args.message)?;
+    let harness = args.harness.trim().to_string();
+    if !is_valid_harness_id(&harness) {
+        return Err(FunctionCallError::RespondToModel(
+            "harness must contain 1-64 lowercase ASCII letters, digits, or hyphens".to_string(),
+        ));
+    }
     let model = args.model.map(|model| model.trim().to_string());
     if model.as_deref() == Some("") {
         return Err(FunctionCallError::RespondToModel(
             "model must not be empty when specified".to_string(),
+        ));
+    }
+    let effort = args.effort.map(|effort| effort.trim().to_string());
+    if effort.as_deref() == Some("") {
+        return Err(FunctionCallError::RespondToModel(
+            "effort must not be empty when specified".to_string(),
         ));
     }
     let mut config = build_agent_spawn_config(
@@ -260,7 +294,7 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         message,
         /*trigger_turn*/ true,
     );
-    let backend = acp_backend(args.harness, model);
+    let backend = acp_backend(harness, model, effort);
     let spawned = session
         .services
         .agent_control
@@ -288,6 +322,14 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         serde_json::json!({"task_name": agent_path}).to_string(),
         Some(true),
     ))
+}
+
+fn is_valid_harness_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 async fn deliver(

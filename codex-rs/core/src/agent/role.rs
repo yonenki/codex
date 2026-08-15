@@ -20,7 +20,6 @@ use codex_config::loader::resolve_relative_paths_in_config_toml;
 use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
 use codex_protocol::models::BaseInstructionsProvenance;
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -32,40 +31,29 @@ pub const DEFAULT_ROLE_NAME: &str = "default";
 pub(crate) const ACP_ROLE_NAME: &str = "acp";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum AcpHarness {
-    GrokBuild,
-}
-
-impl AcpHarness {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::GrokBuild => "grok-build",
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalAgentBackend {
+    pub(crate) harness: String,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExternalAgentBackend {
-    pub(crate) harness: AcpHarness,
+pub(crate) struct ResolvedExternalAgentBackend {
+    pub(crate) harness: String,
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
-    pub(crate) model: Option<String>,
 }
 
-pub(crate) fn acp_backend(harness: AcpHarness, model: Option<String>) -> ExternalAgentBackend {
-    match harness {
-        AcpHarness::GrokBuild => ExternalAgentBackend {
-            harness,
-            command: "grok".to_string(),
-            args: vec![
-                "--no-auto-update".to_string(),
-                "agent".to_string(),
-                "stdio".to_string(),
-            ],
-            model,
-        },
+pub(crate) fn acp_backend(
+    harness: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> ExternalAgentBackend {
+    ExternalAgentBackend {
+        harness,
+        model,
+        effort,
     }
 }
 

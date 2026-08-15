@@ -1921,8 +1921,9 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     let fixture_dir = tempfile::tempdir()?;
-    super::install_acp_fixture(fixture_dir.path())?;
-    let fixture_path = fixture_dir.path().to_string_lossy().into_owned();
+    let fixture_executable = super::install_acp_fixture(fixture_dir.path())?
+        .to_string_lossy()
+        .into_owned();
     let fixture_codex_home = fixture_dir
         .path()
         .join("codex-home")
@@ -1934,6 +1935,7 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         "task_name": "grok",
         "harness": "grok-build",
         "model": "grok-test",
+        "effort": "xhigh",
     }))?;
     mount_sse_once_match(
         &server,
@@ -1999,8 +2001,8 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
                 .enable(Feature::MultiAgentV2)
                 .expect("test config should allow feature update");
             config.permissions.shell_environment_policy.r#set.insert(
-                if cfg!(windows) { "Path" } else { "PATH" }.to_string(),
-                fixture_path,
+                "CODEX_ACP_HARNESS_HOST_COMMAND".to_string(),
+                fixture_executable,
             );
             config
                 .permissions

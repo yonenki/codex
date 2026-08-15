@@ -1,6 +1,7 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
 use crate::agent::role::ExternalAgentBackend;
+use crate::agent::role::ResolvedExternalAgentBackend;
 use crate::agent::role::apply_role_to_config_for_multi_agent_v2;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
@@ -293,20 +294,41 @@ impl AgentControl {
         let agent_id = self.generate_thread_id();
         let mut env = create_env(&config.permissions.shell_environment_policy, Some(agent_id));
         inject_session_id_env(&mut env, self.session_id());
+        let host_command =
+            Self::env_value(&env, "CODEX_ACP_HARNESS_HOST_COMMAND").ok_or_else(|| {
+                CodexErr::InvalidRequest(
+                    "ACP harness host is not configured; set CODEX_ACP_HARNESS_HOST_COMMAND"
+                        .to_string(),
+                )
+            })?;
+        let mut host_args = match Self::env_value(&env, "CODEX_ACP_HARNESS_HOST_ARGS_JSON") {
+            Some(value) => serde_json::from_str::<Vec<String>>(value).map_err(|error| {
+                CodexErr::InvalidRequest(format!(
+                    "CODEX_ACP_HARNESS_HOST_ARGS_JSON must be a JSON string array: {error}"
+                ))
+            })?,
+            None => Vec::new(),
+        };
+        host_args.extend(["--harness".to_string(), backend.harness.clone()]);
+        if let Some(model) = backend.model.as_ref() {
+            host_args.extend(["--model".to_string(), model.clone()]);
+        }
+        if let Some(effort) = backend.effort.as_ref() {
+            host_args.extend(["--effort".to_string(), effort.clone()]);
+        }
         let search_path = env
             .iter()
             .find_map(|(name, value)| name.eq_ignore_ascii_case("PATH").then_some(value.as_str()));
-        let resolved_command = which::which_in(&backend.command, search_path, &config.cwd)
-            .map_err(|error| {
+        let resolved_command =
+            which::which_in(host_command, search_path, &config.cwd).map_err(|error| {
                 CodexErr::InvalidRequest(format!(
-                    "unable to resolve ACP harness `{}` command `{}`: {error}",
-                    backend.harness.name(),
-                    backend.command
+                    "unable to resolve ACP harness host command `{host_command}`: {error}"
                 ))
             })?;
-        let backend = ExternalAgentBackend {
+        let backend = ResolvedExternalAgentBackend {
+            harness: backend.harness,
             command: resolved_command.to_string_lossy().into_owned(),
-            ..backend
+            args: host_args,
         };
         self.external_agents
             .register(agent_id, backend, config.cwd.to_path_buf(), env)?;
@@ -343,6 +365,11 @@ impl AgentControl {
             metadata: agent_metadata,
             status: self.get_status(agent_id).await,
         })
+    }
+
+    fn env_value<'a>(env: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+        env.iter()
+            .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
     }
 
     pub(crate) async fn ensure_v2_agent_loaded(

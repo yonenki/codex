@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::role::ExternalAgentBackend;
+use crate::agent::role::ResolvedExternalAgentBackend;
 use agent_client_protocol::AcpAgent;
 use agent_client_protocol::AcpAgentConfig;
 use agent_client_protocol::Agent;
@@ -16,10 +16,8 @@ use agent_client_protocol::schema::v1::RequestPermissionOutcome;
 use agent_client_protocol::schema::v1::RequestPermissionRequest;
 use agent_client_protocol::schema::v1::RequestPermissionResponse;
 use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
-use agent_client_protocol::schema::v1::SessionConfigOptionCategory;
 use agent_client_protocol::schema::v1::SessionNotification;
 use agent_client_protocol::schema::v1::SessionUpdate;
-use agent_client_protocol::schema::v1::SetSessionConfigOptionRequest;
 use agent_client_protocol::schema::v1::StopReason;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -76,7 +74,7 @@ impl ExternalAgentManager {
     pub(super) fn register(
         &self,
         agent_id: ThreadId,
-        backend: ExternalAgentBackend,
+        backend: ResolvedExternalAgentBackend,
         cwd: std::path::PathBuf,
         env: HashMap<String, String>,
     ) -> CodexResult<()> {
@@ -272,14 +270,15 @@ fn finish_turn(agent: Arc<ExternalAgent>, generation: u64, status: AgentStatus) 
 }
 
 async fn run_acp_agent(
-    backend: ExternalAgentBackend,
+    backend: ResolvedExternalAgentBackend,
     cwd: std::path::PathBuf,
     env: HashMap<String, String>,
     command_rx: async_channel::Receiver<AcpCommand>,
 ) -> Result<(), String> {
     let output = Arc::new(Mutex::new(String::new()));
     let notification_output = Arc::clone(&output);
-    let harness_name = backend.harness.name();
+    let harness_name = backend.harness.clone();
+    let error_harness_name = harness_name.clone();
     let agent = AcpAgent::new(
         AcpAgentConfig::new(&backend.command)
             .args(backend.args.clone())
@@ -320,33 +319,10 @@ async fn run_acp_agent(
                 .send_request(NewSessionRequest::new(&cwd))
                 .block_task()
                 .await?;
-            if let Some(model) = backend.model.as_deref() {
-                let model_config = session
-                    .config_options
-                    .as_deref()
-                    .and_then(|options| {
-                        options.iter().find(|option| {
-                            option.category == Some(SessionConfigOptionCategory::Model)
-                        })
-                    })
-                    .ok_or_else(|| {
-                        agent_client_protocol::Error::invalid_request().data(format!(
-                            "ACP harness `{harness_name}` does not expose a model configuration option"
-                        ))
-                    })?;
-                connection
-                    .send_request(SetSessionConfigOptionRequest::new(
-                        session.session_id.clone(),
-                        model_config.id.clone(),
-                        model,
-                    ))
-                    .block_task()
-                    .await?;
-            }
             run_acp_command_loop(connection, session.session_id, command_rx, output).await
         })
         .await
-        .map_err(|error| format!("ACP harness `{harness_name}` failed: {error}"))
+        .map_err(|error| format!("ACP harness `{error_harness_name}` failed: {error}"))
 }
 
 async fn run_acp_command_loop(
