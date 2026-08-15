@@ -8,6 +8,18 @@ use codex_test_binary_support::TestBinaryDispatchGuard;
 use codex_test_binary_support::TestBinaryDispatchMode;
 use codex_test_binary_support::configure_test_binary_dispatch;
 use ctor::ctor;
+use std::path::PathBuf;
+
+const ANTIGRAVITY_FIXTURE_EXECUTABLE: &str = "agy";
+
+fn install_antigravity_fixture(directory: &std::path::Path) -> std::io::Result<PathBuf> {
+    let executable = directory.join(format!(
+        "{ANTIGRAVITY_FIXTURE_EXECUTABLE}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::copy(std::env::current_exe()?, &executable)?;
+    Ok(executable)
+}
 
 // This code runs before any other tests are run.
 // It allows the test binary to behave like codex and dispatch to apply_patch and codex-linux-sandbox
@@ -15,6 +27,19 @@ use ctor::ctor;
 // NOTE: this doesn't work on ARM
 #[ctor]
 pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
+    let is_antigravity_fixture = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(std::borrow::ToOwned::to_owned))
+        .is_some_and(|stem| stem == ANTIGRAVITY_FIXTURE_EXECUTABLE);
+    if is_antigravity_fixture {
+        println!(
+            "{{\"event\":\"init\",\"conversation_id\":\"fixture-conversation\",\"init\":{{}}}}"
+        );
+        println!(
+            "{{\"event\":\"result\",\"result\":{{\"conversation_id\":\"fixture-conversation\",\"status\":\"SUCCESS\",\"response\":\"gemini done\"}}}}"
+        );
+        std::process::exit(0);
+    }
     configure_test_binary_dispatch("codex-core-tests", |exe_name, argv1| {
         if argv1 == Some(CODEX_CORE_APPLY_PATCH_ARG1) {
             return TestBinaryDispatchMode::DispatchArg0Only;

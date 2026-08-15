@@ -1,11 +1,14 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
+use crate::agent::role::ExternalAgentBackend;
 use crate::agent::role::apply_role_to_config_for_multi_agent_v2;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
 use crate::context::MultiAgentRoleInstructions;
 use crate::session::multi_agents::resolve_usage_hints;
+use crate::exec_env::create_env;
+use crate::exec_env::inject_session_id_env;
 use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
@@ -252,6 +255,93 @@ impl AgentControl {
             options,
         ))
         .await
+    }
+
+    pub(crate) async fn spawn_external_agent_with_communication(
+        &self,
+        config: Config,
+        backend: ExternalAgentBackend,
+        communication: InterAgentCommunication,
+        context: AgentCommunicationContext,
+        session_source: SessionSource,
+    ) -> CodexResult<LiveAgent> {
+        self.ensure_execution_capacity(MultiAgentVersion::V2, &session_source)?;
+        let mut reservation = self
+            .state
+            .reserve_spawn_slot(config.effective_agent_max_threads(MultiAgentVersion::V2))?;
+        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth,
+            agent_path,
+            agent_role,
+            ..
+        }) = session_source
+        else {
+            return Err(CodexErr::InvalidRequest(
+                "external agents require a thread-spawn session source".to_string(),
+            ));
+        };
+        let (notification_source, mut agent_metadata) = self.prepare_thread_spawn(
+            &mut reservation,
+            &config,
+            parent_thread_id,
+            depth,
+            agent_path,
+            agent_role,
+            /*preferred_agent_nickname*/ None,
+        )?;
+        let agent_id = self.generate_thread_id();
+        let mut env = create_env(&config.permissions.shell_environment_policy, Some(agent_id));
+        inject_session_id_env(&mut env, self.session_id());
+        let search_path = env
+            .iter()
+            .find_map(|(name, value)| name.eq_ignore_ascii_case("PATH").then_some(value.as_str()));
+        let resolved_command = which::which_in(&backend.command, search_path, &config.cwd)
+            .map_err(|error| {
+                CodexErr::InvalidRequest(format!(
+                    "unable to resolve Antigravity CLI `{}`: {error}",
+                    backend.command
+                ))
+            })?;
+        let backend = ExternalAgentBackend {
+            command: resolved_command.to_string_lossy().into_owned(),
+            ..backend
+        };
+        self.external_agents
+            .register(agent_id, backend, config.cwd.to_path_buf(), env)?;
+        if let Err(error) = self
+            .send_inter_agent_communication(
+                agent_id,
+                communication,
+                context,
+                /*parent_turn_id*/ None,
+                /*root_turn_id*/ None,
+            )
+            .await
+        {
+            self.external_agents.remove(agent_id);
+            return Err(error);
+        }
+
+        agent_metadata.agent_id = Some(agent_id);
+        reservation.commit(agent_metadata.clone());
+        let child_reference = agent_metadata
+            .agent_path
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| agent_id.to_string());
+        self.maybe_start_completion_watcher(
+            agent_id,
+            Some(notification_source),
+            child_reference,
+            agent_metadata.agent_path.clone(),
+        );
+
+        Ok(LiveAgent {
+            thread_id: agent_id,
+            metadata: agent_metadata,
+            status: self.get_status(agent_id).await,
+        })
     }
 
     pub(crate) async fn ensure_v2_agent_loaded(

@@ -28,7 +28,21 @@ use toml::Value as TomlValue;
 
 /// The role name used when a caller omits `agent_type`.
 pub const DEFAULT_ROLE_NAME: &str = "default";
+pub(crate) const ANTIGRAVITY_ROLE_NAME: &str = "gemini";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalAgentBackend {
+    pub(crate) command: String,
+    pub(crate) model: String,
+}
+
+pub(crate) fn antigravity_backend() -> ExternalAgentBackend {
+    ExternalAgentBackend {
+        command: "agy".to_string(),
+        model: "gemini-3.7-flash-high".to_string(),
+    }
+}
 
 /// Applies a named role layer to `config` while preserving caller-owned provider settings.
 ///

@@ -30,6 +30,9 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 pub(crate) use followup_task::Handler as FollowupTaskHandler;
+pub(crate) use gemini_agents::FollowupHandler as FollowupGeminiAgentHandler;
+pub(crate) use gemini_agents::MessageHandler as MessageGeminiAgentHandler;
+pub(crate) use gemini_agents::SpawnHandler as SpawnGeminiAgentHandler;
 pub(crate) use interrupt_agent::Handler as InterruptAgentHandler;
 pub(crate) use list_agents::Handler as ListAgentsHandler;
 pub(crate) use send_message::Handler as SendMessageHandler;
@@ -37,6 +40,7 @@ pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
 mod followup_task;
+mod gemini_agents;
 mod interrupt_agent;
 mod list_agents;
 mod message_tool;

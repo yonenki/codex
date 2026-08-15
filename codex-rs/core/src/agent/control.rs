@@ -62,6 +62,7 @@ use self::execution::AgentExecutionLimiter;
 use self::residency::V2Residency;
 
 mod execution;
+mod external;
 mod legacy;
 mod residency;
 mod spawn;
@@ -114,6 +115,7 @@ pub(crate) struct AgentControl {
     /// Captured at construction so delegates retain their manager's allocation policy.
     thread_id_generator: ThreadIdGenerator,
     state: Arc<AgentRegistry>,
+    external_agents: Arc<external::ExternalAgentManager>,
     v2_residency: Arc<V2Residency>,
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
@@ -131,6 +133,10 @@ impl Default for AgentControl {
 }
 
 impl AgentControl {
+    pub(crate) fn is_external_agent(&self, agent_id: ThreadId) -> bool {
+        self.external_agents.contains(agent_id)
+    }
+
     /// Construct a new `AgentControl` that can spawn/message agents via the given manager state.
     pub(crate) fn new(
         manager: Weak<ThreadManagerState>,
@@ -142,6 +148,7 @@ impl AgentControl {
             manager,
             thread_id_generator,
             state: Arc::default(),
+            external_agents: Arc::default(),
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
@@ -215,6 +222,36 @@ impl AgentControl {
         parent_turn_id: Option<String>,
         root_turn_id: Option<String>,
     ) -> CodexResult<String> {
+        if self.external_agents.contains(agent_id) {
+            if communication.encrypted_content.is_some() {
+                return Err(CodexErr::UnsupportedOperation(
+                    "encrypted inter-agent messages are not supported by external agents"
+                        .to_string(),
+                ));
+            }
+            let communication_for_log =
+                crate::agent_communication::logging_enabled().then(|| communication.clone());
+            let result = self.external_agents.submit_message(
+                agent_id,
+                communication.content,
+                communication.trigger_turn,
+            );
+            if let (Some(communication), Ok((communication_id, _))) =
+                (communication_for_log, result.as_ref())
+            {
+                crate::agent_communication::emit_agent_communication_send(
+                    communication_id,
+                    &agent_communication_context,
+                    &communication,
+                    agent_id,
+                );
+            }
+            let (communication_id, started_turn) = result?;
+            if started_turn {
+                self.maybe_start_external_completion_watcher(agent_id);
+            }
+            return Ok(communication_id);
+        }
         let state = self.upgrade()?;
         if communication.trigger_turn {
             let thread = state.get_thread(agent_id).await?;
@@ -294,6 +331,9 @@ impl AgentControl {
 
     /// Interrupt the current task for an existing agent thread.
     pub(crate) async fn interrupt_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
+        if self.external_agents.contains(agent_id) {
+            return self.external_agents.interrupt(agent_id);
+        }
         let state = self.upgrade()?;
         self.handle_thread_request_result(
             agent_id,
@@ -329,6 +369,9 @@ impl AgentControl {
 
     /// Fetch the last known status for `agent_id`, returning `NotFound` when unavailable.
     pub(crate) async fn get_status(&self, agent_id: ThreadId) -> AgentStatus {
+        if let Some(status) = self.external_agents.status(agent_id) {
+            return status;
+        }
         let Ok(state) = self.upgrade() else {
             // No agent available if upgrade fails.
             return AgentStatus::NotFound;
@@ -372,6 +415,9 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
     ) -> Option<ThreadConfigSnapshot> {
+        if self.external_agents.contains(agent_id) {
+            return None;
+        }
         let Ok(state) = self.upgrade() else {
             return None;
         };
@@ -407,6 +453,9 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
     ) -> CodexResult<watch::Receiver<AgentStatus>> {
+        if let Some(status_rx) = self.external_agents.subscribe(agent_id) {
+            return Ok(status_rx);
+        }
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         Ok(thread.subscribe_status())
@@ -489,18 +538,22 @@ impl AgentControl {
                 continue;
             }
 
-            let Ok(thread) = state.get_thread(thread_id).await else {
-                continue;
-            };
             let agent_name = metadata
                 .agent_path
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| thread_id.to_string());
-            agents.push(ListedAgent {
-                agent_name,
-                agent_status: thread.agent_status().await,
-            });
+            if let Some(agent_status) = self.external_agents.status(thread_id) {
+                agents.push(ListedAgent {
+                    agent_name,
+                    agent_status,
+                });
+            } else if let Ok(thread) = state.get_thread(thread_id).await {
+                agents.push(ListedAgent {
+                    agent_name,
+                    agent_status: thread.agent_status().await,
+                });
+            }
         }
 
         Ok(agents)
@@ -523,6 +576,21 @@ impl AgentControl {
         else {
             return;
         };
+        self.start_completion_watcher(
+            child_thread_id,
+            parent_thread_id,
+            child_reference,
+            child_agent_path,
+        );
+    }
+
+    fn start_completion_watcher(
+        &self,
+        child_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        child_reference: String,
+        child_agent_path: Option<AgentPath>,
+    ) {
         let control = self.clone();
         tokio::spawn(async move {
             let status = match control.subscribe_status(child_thread_id).await {
@@ -599,6 +667,31 @@ impl AgentControl {
                 .inject_user_message_without_turn(message)
                 .await;
         });
+    }
+
+    fn maybe_start_external_completion_watcher(&self, child_thread_id: ThreadId) {
+        let Some(metadata) = self.state.agent_metadata_for_thread(child_thread_id) else {
+            return;
+        };
+        let Some(child_agent_path) = metadata.agent_path else {
+            return;
+        };
+        let Some(parent_agent_path) = child_agent_path
+            .as_str()
+            .rsplit_once('/')
+            .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
+        else {
+            return;
+        };
+        let Some(parent_thread_id) = self.state.agent_id_for_path(&parent_agent_path) else {
+            return;
+        };
+        self.start_completion_watcher(
+            child_thread_id,
+            parent_thread_id,
+            child_agent_path.to_string(),
+            Some(child_agent_path),
+        );
     }
 
     fn prepare_agent_metadata(
@@ -737,6 +830,30 @@ impl AgentControl {
                             ..Default::default()
                         }),
                 ));
+        }
+
+        for metadata in self.state.live_agents() {
+            let Some(child_thread_id) = metadata
+                .agent_id
+                .filter(|id| self.external_agents.contains(*id))
+            else {
+                continue;
+            };
+            let Some(parent_path) = metadata
+                .agent_path
+                .as_ref()
+                .and_then(|path| path.as_str().rsplit_once('/').map(|(parent, _)| parent))
+                .and_then(|parent| AgentPath::try_from(parent).ok())
+            else {
+                continue;
+            };
+            let Some(parent_thread_id) = self.state.agent_id_for_path(&parent_path) else {
+                continue;
+            };
+            children_by_parent
+                .entry(parent_thread_id)
+                .or_default()
+                .push((child_thread_id, metadata));
         }
 
         for children in children_by_parent.values_mut() {

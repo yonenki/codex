@@ -1919,6 +1919,119 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gemini_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
+    let fixture_dir = tempfile::tempdir()?;
+    super::install_antigravity_fixture(fixture_dir.path())?;
+    let fixture_path = fixture_dir.path().to_string_lossy().into_owned();
+    let server = start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": "independent Gemini task",
+        "task_name": "gemini",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
+        sse(vec![
+            ev_response_created("resp-parent-gemini-1"),
+            ev_function_call_with_namespace(SPAWN_CALL_ID, "gemini", "spawn", &spawn_args),
+            ev_completed("resp-parent-gemini-1"),
+        ]),
+    )
+    .await;
+    let spawn_result_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        sse(vec![
+            ev_response_created("resp-parent-gemini-2"),
+            ev_assistant_message("msg-parent-gemini-2", "parent done"),
+            ev_completed("resp-parent-gemini-2"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, TURN_2_NO_WAIT_PROMPT)
+                && !body_contains(req, "Message Type: FINAL_ANSWER")
+        },
+        sse(vec![
+            ev_response_created("resp-parent-gemini-3"),
+            ev_function_call_with_namespace(
+                "wait-gemini-call",
+                MULTI_AGENT_V2_NAMESPACE,
+                "wait_agent",
+                "{}",
+            ),
+            ev_completed("resp-parent-gemini-3"),
+        ]),
+    )
+    .await;
+    let completion_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, TURN_2_NO_WAIT_PROMPT)
+                && body_contains(req, "Message Type: FINAL_ANSWER")
+                && body_contains(req, "gemini done")
+        },
+        sse(vec![
+            ev_response_created("resp-parent-gemini-4"),
+            ev_assistant_message("msg-parent-gemini-4", "done"),
+            ev_completed("resp-parent-gemini-4"),
+        ]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model("koffing")
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config.permissions.shell_environment_policy.r#set.insert(
+                if cfg!(windows) { "Path" } else { "PATH" }.to_string(),
+                fixture_path,
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn(TURN_1_PROMPT).await?;
+    let spawn_output = spawn_result_request
+        .single_request()
+        .function_call_output(SPAWN_CALL_ID);
+    assert!(
+        serde_json::to_string(&spawn_output)?.contains("/root/gemini"),
+        "external spawn failed: {spawn_output:#}"
+    );
+    test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
+
+    let request = wait_for_requests(&completion_request)
+        .await?
+        .pop()
+        .expect("Gemini completion request");
+    assert_eq!(
+        strip_response_item_ids_from_json(strip_metadata_from_json(Value::Array(
+            request.inputs_of_type("agent_message"),
+        ))),
+        Value::Array(vec![json!({
+            "type": "agent_message",
+            "author": "/root/gemini",
+            "recipient": "/root",
+            "content": [{
+                "type": "input_text",
+                "text": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/gemini\nPayload:\ngemini done",
+            }],
+        })])
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

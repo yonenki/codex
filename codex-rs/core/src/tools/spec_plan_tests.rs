@@ -2313,7 +2313,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         });
     })
     .await;
-    v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
+    v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE, "gemini"]);
     v2.assert_visible_lacks(&[
         "spawn_agent",
         "send_message",
@@ -2341,6 +2341,14 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             "expected {tool_name} in {MULTI_AGENT_V2_NAMESPACE} namespace"
         );
     }
+    assert_eq!(
+        v2.namespace_function_names("gemini"),
+        &[
+            "followup_task".to_string(),
+            "send_message".to_string(),
+            "spawn".to_string(),
+        ]
+    );
     let ToolSpec::Namespace(namespace) = v2.visible_spec(MULTI_AGENT_V2_NAMESPACE) else {
         panic!("expected {MULTI_AGENT_V2_NAMESPACE} namespace");
     };
