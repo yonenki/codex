@@ -2883,10 +2883,10 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
+async fn multi_agent_v2_completion_resumes_idle_direct_parent() {
     let harness = AgentControlHarness::new().await;
     let (_root_thread_id, root_thread) = harness.start_thread().await;
-    let (worker_thread_id, _worker_thread) = harness.start_thread().await;
+    let (worker_thread_id, worker_thread) = harness.start_thread().await;
     let mut tester_config = harness.config.clone();
     let _ = tester_config.features.enable(Feature::MultiAgentV2);
     let tester_thread_id = harness
@@ -2914,6 +2914,22 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         tester_path.to_string(),
         Some(tester_path.clone()),
     );
+    assert!(
+        worker_thread.session.active_turn.lock().await.is_none(),
+        "direct parent should be idle before the child completes"
+    );
+
+    let parent_resumed = timeout(Duration::from_secs(5), async {
+        loop {
+            let event = worker_thread
+                .next_event()
+                .await
+                .expect("parent event stream should stay open");
+            if matches!(event.msg, EventMsg::TurnStarted(_)) {
+                return;
+            }
+        }
+    });
     let tester_turn = tester_thread.session.new_default_turn().await;
     tester_thread
         .session
@@ -2945,10 +2961,14 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
                 worker_path.clone(),
                 Vec::new(),
                 expected_message.clone(),
-                /*trigger_turn*/ false,
+                /*trigger_turn*/ true,
             ),
         },
     );
+
+    parent_resumed
+        .await
+        .expect("idle parent should start a turn after child completion");
 
     timeout(Duration::from_secs(5), async {
         loop {
@@ -2964,7 +2984,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         }
     })
     .await
-    .expect("completion watcher should queue a direct-parent message");
+    .expect("completion watcher should deliver a turn-triggering result to the direct parent");
 
     let root_history = root_thread.session.clone_history().await;
     assert!(!history_contains_assistant_inter_agent_communication(
@@ -2974,7 +2994,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
             AgentPath::root(),
             Vec::new(),
             expected_message,
-            /*trigger_turn*/ false,
+            /*trigger_turn*/ true,
         )
     ));
 }

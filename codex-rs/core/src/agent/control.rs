@@ -639,12 +639,14 @@ impl AgentControl {
                 ) else {
                     return;
                 };
+                // Terminal results request a parent turn so an idle parent
+                // resumes without wait_agent or new user input.
                 let communication = InterAgentCommunication::new(
                     child_agent_path,
                     parent_agent_path,
                     Vec::new(),
                     message,
-                    /*trigger_turn*/ false,
+                    /*trigger_turn*/ true,
                 );
                 let context =
                     AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);

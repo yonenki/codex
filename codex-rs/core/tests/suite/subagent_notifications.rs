@@ -57,6 +57,7 @@ use std::time::Duration;
 use test_case::test_case;
 use tokio::time::Instant;
 use tokio::time::sleep;
+use tokio::time::timeout;
 use tracing::Level;
 use tracing_test::internal::MockWriter;
 use wiremock::MockServer;
@@ -1776,6 +1777,8 @@ enum CompletionScenario {
     TerminalError,
 }
 
+// Child completion must start one regular parent turn without wait_agent or
+// another user prompt once the parent is idle.
 #[test_case(CompletionScenario::Completed ; "completed")]
 #[test_case(CompletionScenario::TerminalError ; "terminal_error")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1841,30 +1844,11 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     let notification = format!(
         "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}"
     );
-    // If the child is still running when the parent turn starts, wait_agent blocks
-    // until mailbox delivery. The follow-up request must then contain that delivery.
-    mount_sse_once_match(
-        &server,
-        |req: &wiremock::Request| {
-            body_contains(req, TURN_2_NO_WAIT_PROMPT)
-                && !body_contains(req, "Message Type: FINAL_ANSWER")
-        },
-        sse(vec![
-            ev_response_created("resp-parent-3"),
-            ev_function_call_with_namespace(
-                "wait-agent-call",
-                MULTI_AGENT_V2_NAMESPACE,
-                "wait_agent",
-                "{}",
-            ),
-            ev_completed("resp-parent-3"),
-        ]),
-    )
-    .await;
     let agent_request = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            body_contains(req, TURN_2_NO_WAIT_PROMPT)
+            !body_contains(req, TURN_1_PROMPT)
+                && !body_contains(req, SPAWN_CALL_ID)
                 && body_contains(req, "Message Type: FINAL_ANSWER")
                 && body_contains(req, expected_text)
         },
@@ -1895,12 +1879,18 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
 
     test.submit_turn(TURN_1_PROMPT).await?;
     let _ = wait_for_requests(&child_request).await?;
-    test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
 
-    let request = wait_for_requests(&agent_request)
-        .await?
-        .pop()
-        .expect("agent message request");
+    let request = timeout(Duration::from_secs(5), async {
+        loop {
+            let requests = agent_request.requests();
+            if let Some(request) = requests.into_iter().next() {
+                return request;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("idle parent should resume after child completion");
     assert_eq!(
         strip_response_item_ids_from_json(strip_metadata_from_json(Value::Array(
             request.inputs_of_type("agent_message"),
@@ -1959,28 +1949,10 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         ]),
     )
     .await;
-    mount_sse_once_match(
-        &server,
-        |req: &wiremock::Request| {
-            body_contains(req, TURN_2_NO_WAIT_PROMPT)
-                && !body_contains(req, "Message Type: FINAL_ANSWER")
-        },
-        sse(vec![
-            ev_response_created("resp-parent-acp-3"),
-            ev_function_call_with_namespace(
-                "wait-acp-call",
-                MULTI_AGENT_V2_NAMESPACE,
-                "wait_agent",
-                "{}",
-            ),
-            ev_completed("resp-parent-acp-3"),
-        ]),
-    )
-    .await;
     let completion_request = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            body_contains(req, TURN_2_NO_WAIT_PROMPT)
+            !body_contains(req, TURN_1_PROMPT)
                 && body_contains(req, "Message Type: FINAL_ANSWER")
                 && body_contains(req, "acp done")
         },
@@ -2031,18 +2003,31 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
 
     test.submit_turn(TURN_1_PROMPT).await?;
     let spawn_output = spawn_result_request
-        .single_request()
-        .function_call_output(SPAWN_CALL_ID);
+        .function_call_output_text(SPAWN_CALL_ID)
+        .expect("spawn result should include function output");
     assert!(
-        serde_json::to_string(&spawn_output)?.contains("/root/grok"),
-        "external spawn failed: {spawn_output:#}"
+        spawn_output.contains("/root/grok"),
+        "external spawn failed: {spawn_output}"
     );
-    test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
 
-    let request = wait_for_requests(&completion_request)
-        .await?
-        .pop()
-        .expect("ACP completion request");
+    let request = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(request) = spawn_result_request
+                .requests()
+                .into_iter()
+                .chain(completion_request.requests())
+                .find(|request| {
+                    request.body_contains_text("Message Type: FINAL_ANSWER")
+                        && request.body_contains_text("acp done")
+                })
+            {
+                return request;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("idle parent should resume after ACP completion");
     let completion = serde_json::to_string(&strip_response_item_ids_from_json(
         strip_metadata_from_json(Value::Array(request.inputs_of_type("agent_message"))),
     ))?;
@@ -2071,7 +2056,7 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         ]),
     )
     .await;
-    mount_sse_once_match(
+    let followup_result_request = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains(req, followup_call_id),
         sse(vec![
@@ -2081,28 +2066,12 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         ]),
     )
     .await;
-    let followup_wait_prompt = "wait for the ACP follow-up";
-    mount_sse_once_match(
-        &server,
-        |req: &wiremock::Request| {
-            body_contains(req, followup_wait_prompt) && !body_contains(req, "acp follow-up done")
-        },
-        sse(vec![
-            ev_response_created("resp-parent-acp-7"),
-            ev_function_call_with_namespace(
-                "wait-acp-followup-call",
-                MULTI_AGENT_V2_NAMESPACE,
-                "wait_agent",
-                "{}",
-            ),
-            ev_completed("resp-parent-acp-7"),
-        ]),
-    )
-    .await;
     let followup_completion_request = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            body_contains(req, followup_wait_prompt) && body_contains(req, "acp follow-up done")
+            !body_contains(req, followup_prompt)
+                && !body_contains(req, followup_call_id)
+                && body_contains(req, "acp follow-up done")
         },
         sse(vec![
             ev_response_created("resp-parent-acp-8"),
@@ -2113,11 +2082,21 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     .await;
 
     test.submit_turn(followup_prompt).await?;
-    test.submit_turn(followup_wait_prompt).await?;
-    let request = wait_for_requests(&followup_completion_request)
-        .await?
-        .pop()
-        .expect("ACP follow-up completion request");
+    let request = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(request) = followup_result_request
+                .requests()
+                .into_iter()
+                .chain(followup_completion_request.requests())
+                .find(|request| request.body_contains_text("acp follow-up done"))
+            {
+                return request;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("idle parent should resume after ACP follow-up completion");
     assert!(
         serde_json::to_string(&request.inputs_of_type("agent_message"))?
             .contains("acp follow-up done"),
