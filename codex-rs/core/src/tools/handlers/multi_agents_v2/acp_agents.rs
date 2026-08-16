@@ -1,8 +1,9 @@
 use super::*;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::ACP_ROLE_NAME;
+use crate::agent::role::AcpRoleSettings;
 use crate::agent::role::acp_backend;
-use crate::agent::role::role_developer_instructions;
+use crate::agent::role::acp_role_settings;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::tools::context::FunctionToolOutput;
@@ -22,10 +23,17 @@ pub(crate) struct FollowupHandler;
 struct SpawnArgs {
     task_name: String,
     message: String,
-    harness: String,
+    harness: Option<String>,
     model: Option<String>,
     effort: Option<String>,
     agent_type: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AcpBackendOverrides {
+    harness: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,7 +85,7 @@ fn spawn_spec() -> ToolSpec {
         (
             "agent_type".to_string(),
             JsonSchema::string(Some(
-                "Optional Codex agent role from the active .codex/agents definitions. Its developer instructions are prepended to the ACP task; harness, model, and effort remain controlled by this ACP spawn."
+                "Optional Codex agent role from the active .codex/agents definitions. A role may provide default ACP harness, model, and reasoning effort values; explicit spawn arguments override those defaults."
                     .to_string(),
             )),
         ),
@@ -111,11 +119,7 @@ fn spawn_spec() -> ToolSpec {
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec![
-                "task_name".to_string(),
-                "message".to_string(),
-                "harness".to_string(),
-            ]),
+            Some(vec!["task_name".to_string(), "message".to_string()]),
             Some(false.into()),
         ),
         output_schema: None,
@@ -254,24 +258,7 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
     let turn = &step_context.turn;
     let args: SpawnArgs = parse_arguments(&function_arguments(payload)?)?;
     let message = message_content(args.message)?;
-    let harness = args.harness.trim().to_string();
-    if !is_valid_harness_id(&harness) {
-        return Err(FunctionCallError::RespondToModel(
-            "harness must contain 1-64 lowercase ASCII letters, digits, or hyphens".to_string(),
-        ));
-    }
-    let model = args.model.map(|model| model.trim().to_string());
-    if model.as_deref() == Some("") {
-        return Err(FunctionCallError::RespondToModel(
-            "model must not be empty when specified".to_string(),
-        ));
-    }
-    let effort = args.effort.map(|effort| effort.trim().to_string());
-    if effort.as_deref() == Some("") {
-        return Err(FunctionCallError::RespondToModel(
-            "effort must not be empty when specified".to_string(),
-        ));
-    }
+    let explicit_backend = explicit_backend(args.harness, args.model, args.effort)?;
     let mut config = build_agent_spawn_config(
         &session.get_base_instructions().await,
         turn.as_ref(),
@@ -287,13 +274,24 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         .as_deref()
         .map(str::trim)
         .filter(|role_name| !role_name.is_empty());
-    let role_instructions = match role_name {
-        Some(role_name) => role_developer_instructions(&config, role_name)
+    let role_settings = match role_name {
+        Some(role_name) => acp_role_settings(&config, role_name)
             .await
             .map_err(FunctionCallError::RespondToModel)?,
-        None => None,
+        None => AcpRoleSettings {
+            developer_instructions: None,
+            backend: None,
+        },
     };
-    let message = with_role_developer_instructions(role_instructions.as_deref(), message);
+    let backend = resolve_backend(explicit_backend, role_settings.backend)?;
+    let harness = backend.harness.trim().to_string();
+    if !is_valid_harness_id(&harness) {
+        return Err(FunctionCallError::RespondToModel(
+            "harness must contain 1-64 lowercase ASCII letters, digits, or hyphens".to_string(),
+        ));
+    }
+    let message =
+        with_role_developer_instructions(role_settings.developer_instructions.as_deref(), message);
     let spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,
@@ -315,7 +313,7 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         message,
         /*trigger_turn*/ true,
     );
-    let backend = acp_backend(harness, model, effort);
+    let backend = acp_backend(harness, backend.model, backend.effort);
     let spawned = session
         .services
         .agent_control
@@ -342,6 +340,54 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
     Ok(FunctionToolOutput::from_text(
         serde_json::json!({"task_name": agent_path}).to_string(),
         Some(true),
+    ))
+}
+
+fn explicit_backend(
+    harness: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<AcpBackendOverrides, FunctionCallError> {
+    let harness = harness.map(|value| value.trim().to_string());
+    let model = model.map(|value| value.trim().to_string());
+    let effort = effort.map(|value| value.trim().to_string());
+    if harness.as_deref() == Some("") {
+        return Err(FunctionCallError::RespondToModel(
+            "harness must not be empty when specified".to_string(),
+        ));
+    }
+    if model.as_deref() == Some("") {
+        return Err(FunctionCallError::RespondToModel(
+            "model must not be empty when specified".to_string(),
+        ));
+    }
+    if effort.as_deref() == Some("") {
+        return Err(FunctionCallError::RespondToModel(
+            "effort must not be empty when specified".to_string(),
+        ));
+    }
+    Ok(AcpBackendOverrides {
+        harness,
+        model,
+        effort,
+    })
+}
+
+fn resolve_backend(
+    explicit: AcpBackendOverrides,
+    role: Option<crate::agent::role::ExternalAgentBackend>,
+) -> Result<crate::agent::role::ExternalAgentBackend, FunctionCallError> {
+    let role = role.unwrap_or_else(|| acp_backend(String::new(), None, None));
+    let harness = explicit.harness.unwrap_or(role.harness);
+    if harness.is_empty() {
+        return Err(FunctionCallError::RespondToModel(
+            "harness is required unless agent_type declares acp_harness".to_string(),
+        ));
+    }
+    Ok(acp_backend(
+        harness,
+        explicit.model.or(role.model),
+        explicit.effort.or(role.effort),
     ))
 }
 

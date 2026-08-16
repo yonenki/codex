@@ -45,6 +45,12 @@ pub(crate) struct ResolvedExternalAgentBackend {
     pub(crate) args: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AcpRoleSettings {
+    pub(crate) developer_instructions: Option<String>,
+    pub(crate) backend: Option<ExternalAgentBackend>,
+}
+
 pub(crate) fn acp_backend(
     harness: String,
     model: Option<String>,
@@ -191,31 +197,51 @@ pub(crate) fn resolve_role_config<'a>(
         .or_else(|| built_in::configs().get(role_name))
 }
 
-/// Loads developer instructions declared directly by a named agent role.
+/// Loads the behavioral contract and optional ACP backend defaults declared by a role.
 ///
-/// External ACP harnesses receive a single task prompt rather than a Codex
-/// config layer. Callers use this to carry the role's behavioral contract into
-/// that prompt without inheriting the parent session's instructions.
-pub(crate) async fn role_developer_instructions(
+/// A role becomes ACP-backed only when it declares `acp_harness`. In that case its
+/// `model` and `model_reasoning_effort` values supply defaults for the same backend.
+pub(crate) async fn acp_role_settings(
     config: &Config,
     role_name: &str,
-) -> Result<Option<String>, String> {
+) -> Result<AcpRoleSettings, String> {
     let role = resolve_role_config(config, role_name)
         .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
-        return Ok(None);
+        return Ok(AcpRoleSettings {
+            developer_instructions: None,
+            backend: None,
+        });
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name)
         .await
         .map_err(|err| {
-            tracing::warn!("failed to load role developer instructions: {err}");
+            tracing::warn!("failed to load ACP role settings: {err}");
             AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
         })?;
-    Ok(role_layer_toml
+    let developer_instructions = role_layer_toml
         .get("developer_instructions")
         .and_then(TomlValue::as_str)
-        .map(str::to_owned))
+        .map(str::to_owned);
+    let backend = role_layer_toml
+        .get("acp_harness")
+        .and_then(TomlValue::as_str)
+        .map(|harness| ExternalAgentBackend {
+            harness: harness.to_owned(),
+            model: role_layer_toml
+                .get("model")
+                .and_then(TomlValue::as_str)
+                .map(str::to_owned),
+            effort: role_layer_toml
+                .get("model_reasoning_effort")
+                .and_then(TomlValue::as_str)
+                .map(str::to_owned),
+        });
+    Ok(AcpRoleSettings {
+        developer_instructions,
+        backend,
+    })
 }
 
 mod reload {
@@ -397,8 +423,25 @@ pub(crate) mod spawn_tool_spec {
                     let service_tier = role_toml
                         .get("service_tier")
                         .and_then(TomlValue::as_str);
+                    let acp_harness = role_toml
+                        .get("acp_harness")
+                        .and_then(TomlValue::as_str);
 
-                    let model_and_reasoning_note = match (model, reasoning_effort) {
+                    let model_and_reasoning_note = if acp_harness.is_some() {
+                        match (model, reasoning_effort) {
+                            (Some(model), Some(reasoning_effort)) => format!(
+                                "\n- This role defaults to ACP model `{model}` with `{reasoning_effort}` reasoning effort."
+                            ),
+                            (Some(model), None) => {
+                                format!("\n- This role defaults to ACP model `{model}`.")
+                            }
+                            (None, Some(reasoning_effort)) => format!(
+                                "\n- This role defaults to `{reasoning_effort}` ACP reasoning effort."
+                            ),
+                            (None, None) => String::new(),
+                        }
+                    } else {
+                        match (model, reasoning_effort) {
                         (Some(model), Some(reasoning_effort)) => format!(
                             "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
                         ),
@@ -412,7 +455,8 @@ pub(crate) mod spawn_tool_spec {
                                 "\n- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
                             )
                         }
-                        (None, None) => String::new(),
+                            (None, None) => String::new(),
+                        }
                     };
                     let service_tier_note = service_tier
                         .map(|service_tier| {
@@ -421,7 +465,14 @@ pub(crate) mod spawn_tool_spec {
                             )
                         })
                         .unwrap_or_default();
-                    format!("{model_and_reasoning_note}{service_tier_note}")
+                    let acp_harness_note = acp_harness
+                        .map(|acp_harness| {
+                            format!(
+                                "\n- This role uses the `{acp_harness}` ACP harness by default and can be spawned with `acp.spawn`."
+                            )
+                        })
+                        .unwrap_or_default();
+                    format!("{model_and_reasoning_note}{service_tier_note}{acp_harness_note}")
                 })
                 .unwrap_or_default();
             format!("{name}: {{\n{description}{locked_settings_note}\n}}")

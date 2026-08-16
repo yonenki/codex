@@ -295,6 +295,45 @@ service_tier = "priority"
 }
 
 #[tokio::test]
+async fn acp_role_settings_load_backend_defaults_and_instructions() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path = write_role_config(
+        &home,
+        "acp-worker.toml",
+        r#"developer_instructions = "Implement the approved plan"
+acp_harness = "grok-build"
+model = "grok-4.6"
+model_reasoning_effort = "high"
+"#,
+    )
+    .await;
+    config.agent_roles.insert(
+        "acp-worker".to_string(),
+        AgentRoleConfig {
+            description: Some("Default ACP worker".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    let settings = acp_role_settings(&config, "acp-worker")
+        .await
+        .expect("load ACP role");
+
+    assert_eq!(
+        settings,
+        AcpRoleSettings {
+            developer_instructions: Some("Implement the approved plan".to_string()),
+            backend: Some(acp_backend(
+                "grok-build".to_string(),
+                Some("grok-4.6".to_string()),
+                Some("high".to_string()),
+            )),
+        }
+    );
+}
+
+#[tokio::test]
 async fn apply_role_preserves_existing_service_tier_without_override() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
@@ -553,6 +592,29 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
     assert!(spec.contains(
             "Research carefully.\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."
         ));
+}
+
+#[test]
+fn spawn_tool_spec_marks_acp_role_backend_default() {
+    let tempdir = TempDir::new().expect("create temp dir");
+    let role_path = tempdir.path().join("worker.toml");
+    fs::write(
+        &role_path,
+        "developer_instructions = \"Implement\"\nacp_harness = \"grok-build\"\nmodel = \"grok-4.6\"\nmodel_reasoning_effort = \"high\"\n",
+    )
+    .expect("write role config");
+    let roles = BTreeMap::from([(
+        "worker_default".to_string(),
+        AgentRoleConfig {
+            description: Some("Default worker.".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    )]);
+
+    let spec = spawn_tool_spec::build(&roles);
+
+    assert!(spec.contains("uses the `grok-build` ACP harness by default"));
 }
 
 #[test]
