@@ -81,6 +81,7 @@ const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 const SUBAGENT_START_CONTEXT: &str = "subagent start context reaches child";
 const SUBAGENT_STOP_CONTINUATION: &str = "continue only the child";
 const INTERNAL_SUBAGENT_PROMPT: &str = "internal subagent: review";
+const ACP_ROLE_INSTRUCTIONS: &str = "Complete only the assigned implementation scope.";
 
 fn body_contains(req: &wiremock::Request, text: &str) -> bool {
     decoded_body(req)
@@ -1936,6 +1937,7 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         "harness": "grok-build",
         "model": "grok-test",
         "effort": "xhigh",
+        "agent_type": "external_worker",
     }))?;
     mount_sse_once_match(
         &server,
@@ -2009,6 +2011,20 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
                 .shell_environment_policy
                 .r#set
                 .insert("CODEX_HOME".to_string(), fixture_codex_home);
+            let role_path = config.codex_home.join("external-worker.toml");
+            fs::write(
+                &role_path,
+                format!("developer_instructions = \"{ACP_ROLE_INSTRUCTIONS}\"\n"),
+            )
+            .expect("write external worker role");
+            config.agent_roles.insert(
+                "external_worker".to_string(),
+                AgentRoleConfig {
+                    description: Some("External worker".to_string()),
+                    config_file: Some(role_path.to_path_buf()),
+                    nickname_candidates: None,
+                },
+            );
         })
         .build_with_auto_env(&server)
         .await?;
@@ -2027,20 +2043,12 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         .await?
         .pop()
         .expect("ACP completion request");
-    assert_eq!(
-        strip_response_item_ids_from_json(strip_metadata_from_json(Value::Array(
-            request.inputs_of_type("agent_message"),
-        ))),
-        Value::Array(vec![json!({
-            "type": "agent_message",
-            "author": "/root/grok",
-            "recipient": "/root",
-            "content": [{
-                "type": "input_text",
-                "text": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/grok\nPayload:\nacp done",
-            }],
-        })])
-    );
+    let completion = serde_json::to_string(&strip_response_item_ids_from_json(
+        strip_metadata_from_json(Value::Array(request.inputs_of_type("agent_message"))),
+    ))?;
+    assert!(completion.contains("acp done"));
+    assert!(completion.contains(ACP_ROLE_INSTRUCTIONS));
+    assert!(completion.contains("independent ACP task"));
 
     let followup_call_id = "followup-acp-call";
     let followup_prompt = "continue the ACP session";

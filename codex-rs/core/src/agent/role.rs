@@ -191,6 +191,33 @@ pub(crate) fn resolve_role_config<'a>(
         .or_else(|| built_in::configs().get(role_name))
 }
 
+/// Loads developer instructions declared directly by a named agent role.
+///
+/// External ACP harnesses receive a single task prompt rather than a Codex
+/// config layer. Callers use this to carry the role's behavioral contract into
+/// that prompt without inheriting the parent session's instructions.
+pub(crate) async fn role_developer_instructions(
+    config: &Config,
+    role_name: &str,
+) -> Result<Option<String>, String> {
+    let role = resolve_role_config(config, role_name)
+        .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
+    let is_built_in = !config.agent_roles.contains_key(role_name);
+    let Some(config_file) = role.config_file.as_ref() else {
+        return Ok(None);
+    };
+    let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name)
+        .await
+        .map_err(|err| {
+            tracing::warn!("failed to load role developer instructions: {err}");
+            AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
+        })?;
+    Ok(role_layer_toml
+        .get("developer_instructions")
+        .and_then(TomlValue::as_str)
+        .map(str::to_owned))
+}
+
 mod reload {
     use super::*;
 

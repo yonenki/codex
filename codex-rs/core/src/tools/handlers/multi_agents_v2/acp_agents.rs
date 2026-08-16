@@ -2,6 +2,7 @@ use super::*;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::ACP_ROLE_NAME;
 use crate::agent::role::acp_backend;
+use crate::agent::role::role_developer_instructions;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::tools::context::FunctionToolOutput;
@@ -24,6 +25,7 @@ struct SpawnArgs {
     harness: String,
     model: Option<String>,
     effort: Option<String>,
+    agent_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +71,13 @@ fn spawn_spec() -> ToolSpec {
             "effort".to_string(),
             JsonSchema::string(Some(
                 "Optional reasoning effort selected through the harness ACP thought-level configuration. The harness default is used when omitted."
+                    .to_string(),
+            )),
+        ),
+        (
+            "agent_type".to_string(),
+            JsonSchema::string(Some(
+                "Optional Codex agent role from the active .codex/agents definitions. Its developer instructions are prepended to the ACP task; harness, model, and effort remain controlled by this ACP spawn."
                     .to_string(),
             )),
         ),
@@ -273,11 +282,23 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         turn.as_ref(),
         step_context.environments.primary(),
     )?;
+    let role_name = args
+        .agent_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|role_name| !role_name.is_empty());
+    let role_instructions = match role_name {
+        Some(role_name) => role_developer_instructions(&config, role_name)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?,
+        None => None,
+    };
+    let message = with_role_developer_instructions(role_instructions.as_deref(), message);
     let spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,
         next_thread_spawn_depth(&turn.session_source),
-        Some(ACP_ROLE_NAME),
+        Some(role_name.unwrap_or(ACP_ROLE_NAME)),
         Some(args.task_name),
     )?;
     let agent_path = spawn_source.get_agent_path().ok_or_else(|| {
@@ -323,6 +344,22 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         Some(true),
     ))
 }
+
+fn with_role_developer_instructions(
+    role_instructions: Option<&str>,
+    task_message: String,
+) -> String {
+    match role_instructions {
+        Some(role_instructions) => {
+            format!("Role instructions:\n{role_instructions}\n\nTask:\n{task_message}")
+        }
+        None => task_message,
+    }
+}
+
+#[cfg(test)]
+#[path = "acp_agents_tests.rs"]
+mod tests;
 
 fn is_valid_harness_id(value: &str) -> bool {
     !value.is_empty()

@@ -97,8 +97,20 @@ fn run_acp_fixture() -> ! {
             ("session/prompt", Some(id)) => {
                 prompt_count += 1;
                 let text = match prompt_count {
-                    1 => "acp done",
-                    _ => "acp follow-up done",
+                    1 => {
+                        let prompt = message
+                            .pointer("/params/prompt")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|block| {
+                                block.get("text").and_then(serde_json::Value::as_str)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        format!("acp done\n{prompt}")
+                    }
+                    _ => "acp follow-up done".to_string(),
                 };
                 let notification = serde_json::json!({
                     "jsonrpc": "2.0",
