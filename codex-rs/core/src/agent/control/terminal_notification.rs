@@ -123,6 +123,7 @@ mod tests {
         assert!(!tracker.should_notify(&AgentStatus::Running));
         assert!(tracker.should_notify(&AgentStatus::Completed(None)));
         assert!(!tracker.should_notify(&AgentStatus::Completed(None)));
+        assert!(tracker.should_notify(&AgentStatus::Errored("late".to_string())));
         assert!(!tracker.should_notify(&AgentStatus::Errored("late".to_string())));
 
         tracker.should_notify(&AgentStatus::Running);

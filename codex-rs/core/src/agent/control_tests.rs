@@ -3,6 +3,7 @@ use crate::CodexThread;
 use crate::StateDbHandle;
 use crate::ThreadManager;
 use crate::agent::agent_status_from_event;
+use crate::agent::registry::AgentMetadata;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::config::AgentRoleConfig;
@@ -42,8 +43,10 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::SubAgentTerminalStatus;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
@@ -225,6 +228,51 @@ impl AgentControlHarness {
             .expect("child spawn should succeed")
             .thread_id
     }
+}
+
+fn register_test_agent_metadata(
+    control: &AgentControl,
+    thread_id: ThreadId,
+    agent_path: AgentPath,
+    agent_nickname: &str,
+    agent_role: &str,
+) {
+    let mut reservation = control
+        .state
+        .reserve_spawn_slot(None)
+        .expect("reserve test agent slot");
+    reservation
+        .reserve_agent_path(&agent_path)
+        .expect("reserve test agent path");
+    reservation.commit(AgentMetadata {
+        agent_id: Some(thread_id),
+        agent_path: Some(agent_path),
+        agent_nickname: Some(agent_nickname.to_string()),
+        agent_role: Some(agent_role.to_string()),
+    });
+}
+
+async fn receive_terminal_events(
+    parent_thread: &Arc<CodexThread>,
+    child_thread_id: ThreadId,
+    expected_count: usize,
+) -> Vec<codex_protocol::protocol::SubAgentTerminalEvent> {
+    timeout(Duration::from_secs(5), async {
+        let mut events = Vec::with_capacity(expected_count);
+        while events.len() < expected_count {
+            let event = parent_thread
+                .next_event()
+                .await
+                .expect("parent event stream should stay open");
+            if let EventMsg::SubAgentTerminal(event) = event.msg {
+                assert_eq!(event.agent_thread_id, child_thread_id);
+                events.push(event);
+            }
+        }
+        events
+    })
+    .await
+    .expect("timed out waiting for typed terminal events")
 }
 
 async fn persisted_originator(thread: &CodexThread) -> String {
@@ -501,6 +549,221 @@ async fn on_event_updates_status_from_turn_aborted() {
 async fn on_event_updates_status_from_shutdown_complete() {
     let status = agent_status_from_event(&EventMsg::ShutdownComplete);
     assert_eq!(status, Some(AgentStatus::Shutdown));
+}
+
+#[tokio::test]
+async fn terminal_status_forwards_typed_event_without_child_result_body() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread = harness
+        .manager
+        .start_thread(StartThreadOptions::new(harness.config.clone()))
+        .await
+        .expect("child thread should start")
+        .thread;
+    let child_thread_id = child_thread.session.thread_id;
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "reviewer",
+    );
+
+    for status in [
+        AgentStatus::Completed(Some("child output".to_string())),
+        AgentStatus::Errored("child error".to_string()),
+        AgentStatus::Interrupted,
+    ] {
+        harness
+            .control
+            .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
+            .await;
+    }
+
+    let events = receive_terminal_events(&parent_thread, child_thread_id, 3).await;
+    assert_eq!(
+        events.iter().map(|event| event.status).collect::<Vec<_>>(),
+        vec![
+            SubAgentTerminalStatus::Completed,
+            SubAgentTerminalStatus::Errored,
+            SubAgentTerminalStatus::Interrupted,
+        ]
+    );
+    for event in events {
+        assert_eq!(event.agent_path, Some(child_agent_path.clone()));
+        assert_eq!(event.agent_nickname.as_deref(), Some("Luna"));
+        assert_eq!(event.agent_role.as_deref(), Some("reviewer"));
+        let payload = serde_json::to_value(&event).expect("terminal event should serialize");
+        assert_eq!(
+            payload.as_object().map(serde_json::Map::len),
+            Some(5),
+            "terminal payload should contain only typed metadata and status"
+        );
+        assert!(!payload.to_string().contains("child output"));
+        assert!(!payload.to_string().contains("child error"));
+    }
+
+    harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should succeed");
+}
+
+#[tokio::test]
+async fn native_v2_interrupted_notifies_parent_without_completion_communication() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let mut child_config = harness.config.clone();
+    let _ = child_config.features.enable(Feature::MultiAgentV2);
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            child_config,
+            Vec::new(),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(child_agent_path.clone()),
+                agent_nickname: Some("Luna".to_string()),
+                agent_role: Some("reviewer".to_string()),
+            })),
+        )
+        .await
+        .expect("native v2 child thread should start");
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("native v2 child thread should exist");
+    assert_eq!(
+        child_thread.multi_agent_version(),
+        Some(MultiAgentVersion::V2)
+    );
+
+    let turn = child_thread.session.new_default_turn().await;
+    child_thread
+        .session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some(turn.sub_id.clone()),
+                started_at: None,
+                reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+            }),
+        )
+        .await;
+
+    let events = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(events[0].status, SubAgentTerminalStatus::Interrupted);
+    assert!(
+        !harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|(thread_id, op)| {
+                thread_id == child_thread_id && matches!(op, Op::InterAgentCommunication { .. })
+            })
+    );
+
+    harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should succeed");
+}
+
+#[tokio::test]
+async fn legacy_completion_watcher_notifies_terminal_transitions_once() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    let child_thread = harness
+        .manager
+        .start_thread(StartThreadOptions {
+            session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(child_agent_path.clone()),
+                agent_nickname: Some("Luna".to_string()),
+                agent_role: Some("reviewer".to_string()),
+            })),
+            ..StartThreadOptions::new(harness.config.clone())
+        })
+        .await
+        .expect("legacy child thread should start")
+        .thread;
+    let child_thread_id = child_thread.session.thread_id;
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "reviewer",
+    );
+    harness.control.start_completion_watcher(
+        child_thread_id,
+        parent_thread_id,
+        child_agent_path.to_string(),
+        Some(child_agent_path),
+    );
+
+    child_thread.session.mark_interrupted();
+    let interrupted = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(interrupted[0].status, SubAgentTerminalStatus::Interrupted);
+
+    let turn = child_thread.session.new_default_turn().await;
+    child_thread
+        .session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn.sub_id.clone(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: ModeKind::Default,
+            }),
+        )
+        .await;
+    sleep(Duration::from_millis(25)).await;
+    child_thread
+        .session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("child output".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    let completed = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(completed[0].status, SubAgentTerminalStatus::Completed);
+
+    harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should succeed");
 }
 
 #[tokio::test]
