@@ -348,6 +348,11 @@ pub struct ConfigToml {
     /// ACP harness default declared by an agent role. This is consumed only when the role is
     /// spawned through the ACP subagent tool.
     pub acp_harness: Option<String>,
+    /// Shared ACP backend pool referenced by an agent role.
+    pub acp_backend_pool: Option<String>,
+    /// Ordered ACP backend pools available to agent roles.
+    #[serde(default)]
+    pub acp_backend_pools: BTreeMap<String, AcpBackendPoolToml>,
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
@@ -701,6 +706,22 @@ pub struct AgentsToml {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
+pub struct AcpBackendPoolToml {
+    /// Ordered candidates. The first candidate is the role default.
+    #[schemars(length(min = 1))]
+    pub candidates: Vec<AcpBackendCandidateToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AcpBackendCandidateToml {
+    pub harness: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct AgentRoleToml {
     /// Human-facing role documentation used in spawn tool guidance.
     /// Required unless supplied by the referenced agent role file.
@@ -973,6 +994,41 @@ mod tests {
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    #[test]
+    fn acp_backend_pool_deserializes_ordered_candidates() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+[acp_backend_pools.worker_default]
+candidates = [
+    { harness = "grok-build" },
+    { harness = "cursor", model = "cursor-grok-4.6-high", effort = "high" },
+]
+"#,
+        )
+        .expect("ACP backend pool should deserialize");
+
+        assert_eq!(
+            config.acp_backend_pools,
+            BTreeMap::from([(
+                "worker_default".to_string(),
+                AcpBackendPoolToml {
+                    candidates: vec![
+                        AcpBackendCandidateToml {
+                            harness: "grok-build".to_string(),
+                            model: None,
+                            effort: None,
+                        },
+                        AcpBackendCandidateToml {
+                            harness: "cursor".to_string(),
+                            model: Some("cursor-grok-4.6-high".to_string()),
+                            effort: Some("high".to_string()),
+                        },
+                    ],
+                },
+            )])
+        );
+    }
 
     #[test]
     fn forced_chatgpt_workspace_id_accepts_single_string() {

@@ -6,6 +6,41 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
+    "AcpBackendCandidateToml": {
+      "additionalProperties": false,
+      "properties": {
+        "effort": {
+          "type": "string"
+        },
+        "harness": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "harness"
+      ],
+      "type": "object"
+    },
+    "AcpBackendPoolToml": {
+      "additionalProperties": false,
+      "properties": {
+        "candidates": {
+          "description": "Ordered candidates. The first candidate is the role default.",
+          "items": {
+            "$ref": "#/definitions/AcpBackendCandidateToml"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "candidates"
+      ],
+      "type": "object"
+    },
     "AgentRoleToml": {
       "additionalProperties": false,
       "properties": {
@@ -5045,6 +5080,22 @@
   },
   "description": "Base config deserialized from ~/.codex/config.toml.",
   "properties": {
+    "acp_backend_pool": {
+      "description": "Shared ACP backend pool referenced by an agent role.",
+      "type": "string"
+    },
+    "acp_backend_pools": {
+      "additionalProperties": {
+        "$ref": "#/definitions/AcpBackendPoolToml"
+      },
+      "default": {},
+      "description": "Ordered ACP backend pools available to agent roles.",
+      "type": "object"
+    },
+    "acp_harness": {
+      "description": "ACP harness default declared by an agent role. This is consumed only when the role is spawned through the ACP subagent tool.",
+      "type": "string"
+    },
     "agents": {
       "allOf": [
         {

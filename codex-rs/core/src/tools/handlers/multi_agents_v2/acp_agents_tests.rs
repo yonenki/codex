@@ -33,7 +33,8 @@ fn role_backend_is_used_without_explicit_spawn_backend() {
     );
 
     assert_eq!(
-        resolve_backend(AcpBackendOverrides::default(), Some(role.clone())).expect("role backend"),
+        resolve_backend(AcpBackendOverrides::default(), std::slice::from_ref(&role))
+            .expect("role backend"),
         role
     );
 }
@@ -53,7 +54,7 @@ fn explicit_backend_overrides_role_defaults() {
     );
 
     assert_eq!(
-        resolve_backend(explicit, Some(role)).expect("explicit override"),
+        resolve_backend(explicit, &[role]).expect("explicit override"),
         acp_backend(
             "antigravity".to_string(),
             Some("gemini-3.7-flash".to_string()),
@@ -63,8 +64,43 @@ fn explicit_backend_overrides_role_defaults() {
 }
 
 #[test]
+fn explicit_harness_selects_matching_pool_candidate_defaults() {
+    let pool = vec![
+        acp_backend("grok-build".to_string(), None, None),
+        acp_backend(
+            "antigravity".to_string(),
+            Some("gemini-3.7-flash".to_string()),
+            Some("high".to_string()),
+        ),
+    ];
+    let explicit = explicit_backend(Some("antigravity".to_string()), None, None)
+        .expect("valid explicit backend");
+
+    assert_eq!(
+        resolve_backend(explicit, &pool).expect("pool candidate"),
+        pool[1]
+    );
+}
+
+#[test]
+fn unrelated_explicit_harness_does_not_inherit_pool_model() {
+    let pool = vec![acp_backend(
+        "grok-build".to_string(),
+        Some("grok-4.6".to_string()),
+        Some("high".to_string()),
+    )];
+    let explicit =
+        explicit_backend(Some("kimi".to_string()), None, None).expect("valid explicit backend");
+
+    assert_eq!(
+        resolve_backend(explicit, &pool).expect("explicit backend"),
+        acp_backend("kimi".to_string(), None, None)
+    );
+}
+
+#[test]
 fn backend_is_required_without_an_acp_backed_role() {
-    let error = resolve_backend(AcpBackendOverrides::default(), None)
+    let error = resolve_backend(AcpBackendOverrides::default(), &[])
         .expect_err("missing backend must fail");
     assert!(
         matches!(error, FunctionCallError::RespondToModel(message) if message.contains("harness is required"))

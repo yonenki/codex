@@ -1,4 +1,6 @@
 use anyhow::Result;
+use codex_config::config_toml::AcpBackendCandidateToml;
+use codex_config::config_toml::AcpBackendPoolToml;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
 use codex_core::TurnInputRequest;
@@ -1924,9 +1926,6 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     let spawn_args = serde_json::to_string(&json!({
         "message": "independent ACP task",
         "task_name": "grok",
-        "harness": "grok-build",
-        "model": "grok-test",
-        "effort": "xhigh",
         "agent_type": "external_worker",
     }))?;
     mount_sse_once_match(
@@ -1986,7 +1985,9 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
             let role_path = config.codex_home.join("external-worker.toml");
             fs::write(
                 &role_path,
-                format!("developer_instructions = \"{ACP_ROLE_INSTRUCTIONS}\"\n"),
+                format!(
+                    "developer_instructions = \"{ACP_ROLE_INSTRUCTIONS}\"\nacp_backend_pool = \"worker_default\"\n"
+                ),
             )
             .expect("write external worker role");
             config.agent_roles.insert(
@@ -1995,6 +1996,16 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
                     description: Some("External worker".to_string()),
                     config_file: Some(role_path.to_path_buf()),
                     nickname_candidates: None,
+                },
+            );
+            config.acp_backend_pools.insert(
+                "worker_default".to_string(),
+                AcpBackendPoolToml {
+                    candidates: vec![AcpBackendCandidateToml {
+                        harness: "grok-build".to_string(),
+                        model: Some("grok-test".to_string()),
+                        effort: Some("xhigh".to_string()),
+                    }],
                 },
             );
         })

@@ -280,10 +280,10 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
             .map_err(FunctionCallError::RespondToModel)?,
         None => AcpRoleSettings {
             developer_instructions: None,
-            backend: None,
+            backends: Vec::new(),
         },
     };
-    let backend = resolve_backend(explicit_backend, role_settings.backend)?;
+    let backend = resolve_backend(explicit_backend, &role_settings.backends)?;
     let harness = backend.harness.trim().to_string();
     if !is_valid_harness_id(&harness) {
         return Err(FunctionCallError::RespondToModel(
@@ -375,19 +375,35 @@ fn explicit_backend(
 
 fn resolve_backend(
     explicit: AcpBackendOverrides,
-    role: Option<crate::agent::role::ExternalAgentBackend>,
+    role_backends: &[crate::agent::role::ExternalAgentBackend],
 ) -> Result<crate::agent::role::ExternalAgentBackend, FunctionCallError> {
-    let role = role.unwrap_or_else(|| acp_backend(String::new(), None, None));
-    let harness = explicit.harness.unwrap_or(role.harness);
+    let selected = match explicit.harness.as_deref() {
+        Some(harness) => role_backends
+            .iter()
+            .find(|candidate| {
+                candidate.harness == harness
+                    && explicit
+                        .model
+                        .as_ref()
+                        .is_none_or(|model| candidate.model.as_ref() == Some(model))
+            })
+            .cloned()
+            .unwrap_or_else(|| acp_backend(harness.to_string(), None, None)),
+        None => role_backends
+            .first()
+            .cloned()
+            .unwrap_or_else(|| acp_backend(String::new(), None, None)),
+    };
+    let harness = explicit.harness.unwrap_or(selected.harness);
     if harness.is_empty() {
         return Err(FunctionCallError::RespondToModel(
-            "harness is required unless agent_type declares acp_harness".to_string(),
+            "harness is required unless agent_type declares an ACP backend".to_string(),
         ));
     }
     Ok(acp_backend(
         harness,
-        explicit.model.or(role.model),
-        explicit.effort.or(role.effort),
+        explicit.model.or(selected.model),
+        explicit.effort.or(selected.effort),
     ))
 }
 
