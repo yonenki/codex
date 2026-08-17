@@ -320,3 +320,20 @@ Tests and features must support Linux, macOS and Windows unless feature is expli
 
 Codex supports running connected app-server and exec-server on different operating systems. See the
 `$remote-tests` skill for details about integration testing these configurations.
+
+# Agent Collab runtime builds
+
+This fork is built as the agent-collab runtime. `sqlx::migrate!` embeds the raw bytes of
+`codex-rs/state/*_migrations/*.sql`, and the runtime refuses to start against a state DB whose
+stored checksums were produced with different bytes (`migration N was previously applied but has
+been modified`). Official Codex releases embed those files with the platform's line-ending
+convention: CRLF on Windows, LF on Linux/macOS. The migration SQL is identical either way.
+
+- Always build release binaries with `just agent-collab-runtime` (or
+  `python scripts/build_agent_collab_runtime.py`). It normalizes the migration files to the
+  platform line endings before compiling and restores LF afterwards.
+- Never commit CRLF-converted migration files, and never hand-edit line endings as a build step.
+- `codex-code-mode-host` does not touch the state DBs and is off by default; pass
+  `--with-code-mode-host` only when the v8 prebuilt archive for the target is available.
+- After publishing a runtime release, update `runtime/codex/runtime-lock.json` in the
+  agent-collab repo with the new asset sizes and SHA-256 digests.

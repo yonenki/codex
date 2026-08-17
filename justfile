@@ -160,6 +160,16 @@ bazel-clippy:
 bazel-argument-comment-lint:
     bazel build --config=argument-comment-lint -- $({{ justfile_directory() }}/tools/argument-comment-lint/list-bazel-targets.sh)
 
+# Build the agent-collab runtime binaries.
+#
+# sqlx embeds the raw bytes of codex-rs/state/*_migrations/*.sql and verifies
+# them against the user's state DBs. Official Windows releases embed CRLF, so
+# Windows runtime builds must compile with CRLF migration files (Linux/macOS
+# use LF). The script normalizes the line endings for the build and restores
+# LF afterwards; never hand-convert or commit the converted files.
+agent-collab-runtime *args:
+    {{ python }} {{ justfile_directory() }}/scripts/build_agent_collab_runtime.py {args}
+
 build-for-release:
     bazel build //codex-rs/cli:release_binaries
 
