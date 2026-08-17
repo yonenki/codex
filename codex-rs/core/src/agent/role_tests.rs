@@ -681,7 +681,7 @@ fn spawn_tool_spec_hides_acp_backend_pool_provider_details() {
     let role_path = tempdir.path().join("worker.toml");
     fs::write(
         &role_path,
-        "developer_instructions = \"Implement\"\nacp_backend_pool = \"worker_default\"\n",
+        "developer_instructions = \"Implement\"\nacp_backend_pool = \"worker_default\"\nmodel = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"high\"\n",
     )
     .expect("write role config");
     let roles = BTreeMap::from([(
@@ -716,6 +716,8 @@ fn spawn_tool_spec_hides_acp_backend_pool_provider_details() {
     assert!(spec.contains("pass its task name as `fallback_from`"));
     assert!(!spec.contains("grok-build"));
     assert!(!spec.contains("cursor-grok-4.6-high"));
+    assert!(!spec.contains("gpt-5.6-luna"));
+    assert!(!spec.contains("ACP reasoning effort"));
 }
 
 #[test]

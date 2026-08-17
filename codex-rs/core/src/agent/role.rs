@@ -469,9 +469,9 @@ pub(crate) mod spawn_tool_spec {
                         .get("acp_backend_pool")
                         .and_then(TomlValue::as_str);
 
-                    let model_and_reasoning_note = if acp_harness.is_some()
-                        || acp_backend_pool.is_some()
-                    {
+                    let model_and_reasoning_note = if acp_backend_pool.is_some() {
+                        String::new()
+                    } else if acp_harness.is_some() {
                         match (model, reasoning_effort) {
                             (Some(model), Some(reasoning_effort)) => format!(
                                 "\n- This role defaults to ACP model `{model}` with `{reasoning_effort}` reasoning effort."
