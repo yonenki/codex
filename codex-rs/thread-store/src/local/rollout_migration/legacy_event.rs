@@ -207,6 +207,8 @@ pub(super) fn completed_item(
             }),
             None,
         )),
+        // This event is transient and intentionally has no rollout migration.
+        EventMsg::SubAgentTerminal(_) => None,
         EventMsg::ExecCommandEnd(event) => Some((
             TurnItem::CommandExecution(CommandExecutionItem {
                 id: event.call_id.clone(),

@@ -1492,6 +1492,12 @@ pub enum EventMsg {
 
     /// Path-based v2 sub-agent activity.
     SubAgentActivity(SubAgentActivityEvent),
+
+    /// Transient terminal transition for a direct child sub-agent.
+    ///
+    /// This event is delivered live to the parent UI and is intentionally not
+    /// materialized as a rollout item or model input.
+    SubAgentTerminal(SubAgentTerminalEvent),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS, EnumIter)]
@@ -1727,6 +1733,12 @@ impl From<CollabResumeEndEvent> for EventMsg {
 impl From<SubAgentActivityEvent> for EventMsg {
     fn from(event: SubAgentActivityEvent) -> Self {
         EventMsg::SubAgentActivity(event)
+    }
+}
+
+impl From<SubAgentTerminalEvent> for EventMsg {
+    fn from(event: SubAgentTerminalEvent) -> Self {
+        EventMsg::SubAgentTerminal(event)
     }
 }
 
@@ -4101,6 +4113,28 @@ pub struct SubAgentActivityEvent {
     /// Canonical v2 path of the affected sub-agent.
     pub agent_path: AgentPath,
     pub kind: SubAgentActivityKind,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum SubAgentTerminalStatus {
+    Completed,
+    Errored,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct SubAgentTerminalEvent {
+    /// Thread ID of the child that reached this transition.
+    pub agent_thread_id: ThreadId,
+    /// Canonical path of the child, when available.
+    pub agent_path: Option<AgentPath>,
+    /// Optional display nickname assigned to the child.
+    pub agent_nickname: Option<String>,
+    /// Optional role assigned to the child.
+    pub agent_role: Option<String>,
+    pub status: SubAgentTerminalStatus,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

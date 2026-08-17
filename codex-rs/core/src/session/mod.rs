@@ -1974,6 +1974,10 @@ impl Session {
                 status
             }
         };
+        self.services
+            .agent_control
+            .maybe_notify_parent_of_terminal_status(self.thread_id, &status)
+            .await;
         if !is_final(&status) {
             return;
         }
@@ -2114,6 +2118,13 @@ impl Session {
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
         self.send_event_raw_with_persistence(event, /*persist*/ true)
+            .await;
+    }
+
+    /// Delivers a transient sub-agent terminal transition without materializing it in rollout
+    /// history or model context.
+    pub(crate) async fn send_subagent_terminal_event(&self, event: Event) {
+        self.send_event_raw_with_persistence(event, /*persist*/ false)
             .await;
     }
 

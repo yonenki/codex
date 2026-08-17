@@ -372,6 +372,8 @@ impl ThreadHistoryBuilder {
                 self.handle_collab_agent_interaction_end(payload)
             }
             EventMsg::SubAgentActivity(payload) => self.handle_sub_agent_activity(payload),
+            // Sub-agent terminal transitions are live-only and must never become thread items.
+            EventMsg::SubAgentTerminal(_) => {}
             EventMsg::CollabWaitingBegin(payload) => self.handle_collab_waiting_begin(payload),
             EventMsg::CollabWaitingEnd(payload) => self.handle_collab_waiting_end(payload),
             EventMsg::CollabCloseBegin(payload) => self.handle_collab_close_begin(payload),

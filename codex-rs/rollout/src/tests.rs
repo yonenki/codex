@@ -41,6 +41,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentTerminalEvent;
+use codex_protocol::protocol::SubAgentTerminalStatus;
 use codex_protocol::protocol::ThreadGoal;
 use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::ThreadGoalUpdatedEvent;
@@ -48,6 +50,27 @@ use codex_protocol::protocol::UserMessageEvent;
 
 const NO_SOURCE_FILTER: &[SessionSource] = &[];
 const TEST_PROVIDER: &str = "test-provider";
+
+#[test]
+fn subagent_terminal_events_are_transient_for_every_history_mode() {
+    let event = RolloutItem::EventMsg(EventMsg::SubAgentTerminal(SubAgentTerminalEvent {
+        agent_thread_id: ThreadId::new(),
+        agent_path: None,
+        agent_nickname: Some("Luna".to_string()),
+        agent_role: Some("reviewer".to_string()),
+        status: SubAgentTerminalStatus::Completed,
+    }));
+
+    for history_mode in [
+        codex_protocol::protocol::ThreadHistoryMode::Legacy,
+        codex_protocol::protocol::ThreadHistoryMode::Paginated,
+    ] {
+        assert!(!crate::is_persisted_rollout_item(&event, history_mode));
+        assert!(
+            crate::persisted_rollout_items(std::slice::from_ref(&event), history_mode).is_empty()
+        );
+    }
+}
 
 #[test]
 fn rollout_line_decoder_preserves_canonical_json_compatibility() -> Result<()> {

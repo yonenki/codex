@@ -960,6 +960,13 @@ impl App {
         if self.abandoned_side_threads.contains(&thread_id) {
             return Ok(());
         }
+        if matches!(notification, ServerNotification::SubAgentTerminal(_))
+            && self.active_thread_id != Some(thread_id)
+        {
+            // A terminal transition is a live-only parent UI update. Do not retain it while a
+            // different thread is active or while the parent is not yet selected.
+            return Ok(());
+        }
         if matches!(
             notification,
             ServerNotification::ThreadSettingsUpdated(_) | ServerNotification::ThreadArchived(_)
@@ -1331,6 +1338,9 @@ impl App {
             return self
                 .enqueue_thread_notification(thread_id, notification)
                 .await;
+        }
+        if matches!(notification, ServerNotification::SubAgentTerminal(_)) {
+            return Ok(());
         }
         self.pending_primary_events
             .push_back(ThreadBufferedEvent::Notification(Box::new(notification)));

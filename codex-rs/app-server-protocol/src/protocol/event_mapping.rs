@@ -16,6 +16,8 @@ use crate::protocol::v2::PlanDeltaNotification;
 use crate::protocol::v2::ReasoningSummaryPartAddedNotification;
 use crate::protocol::v2::ReasoningSummaryTextDeltaNotification;
 use crate::protocol::v2::ReasoningTextDeltaNotification;
+use crate::protocol::v2::SubAgentTerminalNotification;
+use crate::protocol::v2::SubAgentTerminalStatus;
 use crate::protocol::v2::TerminalInteractionNotification;
 use crate::protocol::v2::ThreadItem;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
@@ -193,6 +195,26 @@ pub fn item_event_to_server_notification(
                 turn_id,
                 item,
                 completed_at_ms: activity.occurred_at_ms,
+            })
+        }
+        EventMsg::SubAgentTerminal(event) => {
+            ServerNotification::SubAgentTerminal(SubAgentTerminalNotification {
+                thread_id,
+                agent_thread_id: event.agent_thread_id.to_string(),
+                agent_path: event.agent_path.map(|path| path.to_string()),
+                agent_nickname: event.agent_nickname,
+                agent_role: event.agent_role,
+                status: match event.status {
+                    codex_protocol::protocol::SubAgentTerminalStatus::Completed => {
+                        SubAgentTerminalStatus::Completed
+                    }
+                    codex_protocol::protocol::SubAgentTerminalStatus::Errored => {
+                        SubAgentTerminalStatus::Errored
+                    }
+                    codex_protocol::protocol::SubAgentTerminalStatus::Interrupted => {
+                        SubAgentTerminalStatus::Interrupted
+                    }
+                },
             })
         }
         EventMsg::CollabWaitingBegin(begin_event) => {
@@ -505,6 +527,37 @@ mod tests {
                 assert_eq!(payload, expected)
             }
             other => panic!("expected command execution output delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_terminal_maps_as_a_typed_live_notification_without_body() {
+        let agent_thread_id = ThreadId::new();
+        let agent_path = codex_protocol::AgentPath::root()
+            .join("worker")
+            .expect("agent path");
+        let notification = item_event_to_server_notification(
+            EventMsg::SubAgentTerminal(codex_protocol::protocol::SubAgentTerminalEvent {
+                agent_thread_id,
+                agent_path: Some(agent_path.clone()),
+                agent_nickname: Some("Luna".to_string()),
+                agent_role: Some("reviewer".to_string()),
+                status: codex_protocol::protocol::SubAgentTerminalStatus::Errored,
+            }),
+            "parent-thread",
+            "turn-ignored",
+        );
+
+        match notification {
+            ServerNotification::SubAgentTerminal(payload) => {
+                assert_eq!(payload.thread_id, "parent-thread");
+                assert_eq!(payload.agent_thread_id, agent_thread_id.to_string());
+                assert_eq!(payload.agent_path, Some(agent_path.to_string()));
+                assert_eq!(payload.agent_nickname.as_deref(), Some("Luna"));
+                assert_eq!(payload.agent_role.as_deref(), Some("reviewer"));
+                assert_eq!(payload.status, SubAgentTerminalStatus::Errored);
+            }
+            other => panic!("expected subagent terminal notification, got {other:?}"),
         }
     }
 

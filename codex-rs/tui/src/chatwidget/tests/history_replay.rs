@@ -11,6 +11,25 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn replayed_subagent_terminal_notification_does_not_render_history() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let notification = ServerNotification::SubAgentTerminal(
+        codex_app_server_protocol::SubAgentTerminalNotification {
+            thread_id: "parent".to_string(),
+            agent_thread_id: "child".to_string(),
+            agent_path: Some("/root/worker".to_string()),
+            agent_nickname: Some("Luna".to_string()),
+            agent_role: Some("reviewer".to_string()),
+            status: codex_app_server_protocol::SubAgentTerminalStatus::Completed,
+        },
+    );
+
+    chat.handle_server_notification(notification, Some(ReplayKind::ThreadSnapshot));
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
 async fn resumed_initial_messages_render_history() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 

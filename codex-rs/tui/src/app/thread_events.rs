@@ -118,6 +118,14 @@ impl ThreadEventStore {
     }
 
     fn push_notification_inner(&mut self, notification: Cow<'_, ServerNotification>) {
+        // Terminal transitions are live-only UI cells. They must not enter the per-thread
+        // history buffer or participate in replay/model reconstruction.
+        if matches!(
+            notification.as_ref(),
+            ServerNotification::SubAgentTerminal(_)
+        ) {
+            return;
+        }
         self.pending_interactive_replay
             .note_server_notification(notification.as_ref());
         match notification.as_ref() {
@@ -634,6 +642,26 @@ mod tests {
         assert_eq!(store.buffer.len(), 2);
         assert!(store.has_pending_thread_approvals());
         assert_eq!(store.active_turn_id(), Some("turn-1"));
+    }
+
+    #[test]
+    fn thread_event_store_does_not_buffer_subagent_terminal_notifications() {
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        let notification = ServerNotification::SubAgentTerminal(
+            codex_app_server_protocol::SubAgentTerminalNotification {
+                thread_id: "parent".to_string(),
+                agent_thread_id: "child".to_string(),
+                agent_path: Some("/root/worker".to_string()),
+                agent_nickname: Some("Luna".to_string()),
+                agent_role: Some("reviewer".to_string()),
+                status: codex_app_server_protocol::SubAgentTerminalStatus::Completed,
+            },
+        );
+
+        store.push_notification_ref(&notification);
+
+        assert!(store.buffer.is_empty());
+        assert!(store.snapshot().events.is_empty());
     }
 
     #[test]

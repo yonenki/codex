@@ -31,6 +31,13 @@ impl ChatWidget {
             self.restore_retry_status_header_if_present();
         }
         match notification {
+            ServerNotification::SubAgentTerminal(notification) => {
+                if replay_kind.is_none() {
+                    self.add_to_history(
+                        crate::subagent_terminal::SubAgentTerminalHistoryCell::new(notification),
+                    );
+                }
+            }
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
                 self.set_token_info(Some(token_usage_info_from_app_server(
                     notification.token_usage,

@@ -53,6 +53,8 @@ use codex_app_server_protocol::RawResponseItemCompletedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
+use codex_app_server_protocol::SubAgentTerminalNotification;
+use codex_app_server_protocol::SubAgentTerminalStatus as V2SubAgentTerminalStatus;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadRealtimeClosedNotification;
@@ -102,6 +104,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SubAgentActivityKind;
+use codex_protocol::protocol::SubAgentTerminalStatus;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -858,6 +861,25 @@ pub(crate) async fn apply_bespoke_event_handling(
             tokio::spawn(async move {
                 on_request_permissions_response(pending_response, conversation, thread_state).await;
             });
+        }
+        EventMsg::SubAgentTerminal(event) => {
+            let status = match event.status {
+                SubAgentTerminalStatus::Completed => V2SubAgentTerminalStatus::Completed,
+                SubAgentTerminalStatus::Errored => V2SubAgentTerminalStatus::Errored,
+                SubAgentTerminalStatus::Interrupted => V2SubAgentTerminalStatus::Interrupted,
+            };
+            outgoing
+                .send_server_notification(ServerNotification::SubAgentTerminal(
+                    SubAgentTerminalNotification {
+                        thread_id: conversation_id.to_string(),
+                        agent_thread_id: event.agent_thread_id.to_string(),
+                        agent_path: event.agent_path.map(|path| path.to_string()),
+                        agent_nickname: event.agent_nickname,
+                        agent_role: event.agent_role,
+                        status,
+                    },
+                ))
+                .await;
         }
         EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_)

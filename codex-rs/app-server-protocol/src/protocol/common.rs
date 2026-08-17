@@ -1790,6 +1790,8 @@ pub struct FuzzyFileSearchSessionCompletedNotification {
 server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
+    #[experimental("thread/subagent/terminal")]
+    SubAgentTerminal => "thread/subagent/terminal" (v2::SubAgentTerminalNotification),
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),
     ThreadStatusChanged => "thread/status/changed" (v2::ThreadStatusChangedNotification),
     ThreadArchived => "thread/archived" (v2::ThreadArchivedNotification),
@@ -4068,6 +4070,36 @@ mod tests {
             }),
             serde_json::to_value(&notification)?,
         );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_subagent_terminal_notification_without_completion_body() -> Result<()> {
+        let notification = ServerNotification::SubAgentTerminal(v2::SubAgentTerminalNotification {
+            thread_id: "parent".to_string(),
+            agent_thread_id: "child".to_string(),
+            agent_path: Some("/root/worker".to_string()),
+            agent_nickname: Some("Luna".to_string()),
+            agent_role: Some("reviewer".to_string()),
+            status: v2::SubAgentTerminalStatus::Errored,
+        });
+        let serialized = serde_json::to_value(&notification)?;
+        assert_eq!(
+            serialized,
+            json!({
+                "method": "thread/subagent/terminal",
+                "params": {
+                    "threadId": "parent",
+                    "agentThreadId": "child",
+                    "agentPath": "/root/worker",
+                    "agentNickname": "Luna",
+                    "agentRole": "reviewer",
+                    "status": "errored",
+                }
+            })
+        );
+        assert!(!serialized.to_string().contains("completion"));
+        assert!(!serialized.to_string().contains("error body"));
         Ok(())
     }
 

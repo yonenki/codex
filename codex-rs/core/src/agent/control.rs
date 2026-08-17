@@ -66,6 +66,7 @@ mod external;
 mod legacy;
 mod residency;
 mod spawn;
+mod terminal_notification;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnAgentForkMode {
@@ -461,6 +462,23 @@ impl AgentControl {
         Ok(thread.subscribe_status())
     }
 
+    /// Best-effort live notification for the direct parent of a child agent.
+    ///
+    /// The notification is deliberately separate from completion communication: it is a
+    /// transient UI transition and must not affect parent turn scheduling or model context.
+    pub(crate) async fn maybe_notify_parent_of_terminal_status(
+        &self,
+        child_thread_id: ThreadId,
+        status: &AgentStatus,
+    ) {
+        terminal_notification::maybe_notify_parent_of_terminal_status(
+            self,
+            child_thread_id,
+            status,
+        )
+        .await;
+    }
+
     pub(crate) async fn format_environment_context_subagents(
         &self,
         parent_thread_id: ThreadId,
@@ -593,23 +611,87 @@ impl AgentControl {
     ) {
         let control = self.clone();
         tokio::spawn(async move {
+            let is_external = control.is_external_agent(child_thread_id);
+            // Native V2 turns emit the live terminal transition from Session so it is adjacent
+            // to the typed terminal turn event. Legacy native agents and ACP agents use this
+            // watcher as their transition source instead. A missing native child is treated as
+            // V2 here, matching the completion path below, so teardown cannot duplicate a
+            // notification that was already emitted before the thread disappeared.
+            let native_v2 = if is_external {
+                false
+            } else {
+                match control.upgrade() {
+                    Ok(state) => match state.get_thread(child_thread_id).await {
+                        Ok(child_thread) => {
+                            child_thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+                        }
+                        Err(_) => true,
+                    },
+                    Err(_) => true,
+                }
+            };
+            let mut terminal_status_tracker =
+                terminal_notification::TerminalStatusTracker::default();
             let status = match control.subscribe_status(child_thread_id).await {
                 Ok(mut status_rx) => {
                     let mut status = status_rx.borrow().clone();
-                    while !is_final(&status) {
+                    loop {
+                        if matches!(status, AgentStatus::Interrupted) {
+                            if terminal_status_tracker.should_notify(&status) && !native_v2 {
+                                control
+                                    .maybe_notify_parent_of_terminal_status(
+                                        child_thread_id,
+                                        &status,
+                                    )
+                                    .await;
+                            }
+                            // ACP agents finish their current lifecycle at interruption. Legacy
+                            // native agents remain watchable and may transition back to Running.
+                            if is_external {
+                                return;
+                            }
+                        } else {
+                            let should_notify = terminal_status_tracker.should_notify(&status);
+                            if should_notify && !native_v2 {
+                                control
+                                    .maybe_notify_parent_of_terminal_status(
+                                        child_thread_id,
+                                        &status,
+                                    )
+                                    .await;
+                            }
+                        }
+
+                        if is_final(&status) {
+                            break status;
+                        }
+
                         if status_rx.changed().await.is_err() {
                             status = control.get_status(child_thread_id).await;
-                            break;
+                            if !is_final(&status) {
+                                return;
+                            }
+                        } else {
+                            status = status_rx.borrow().clone();
                         }
-                        status = status_rx.borrow().clone();
+                    }
+                }
+                Err(_) => {
+                    let status = control.get_status(child_thread_id).await;
+                    if terminal_status_tracker.should_notify(&status) && !native_v2 {
+                        control
+                            .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
+                            .await;
+                        if matches!(status, AgentStatus::Interrupted) && is_external {
+                            return;
+                        }
+                    }
+                    if !is_final(&status) {
+                        return;
                     }
                     status
                 }
-                Err(_) => control.get_status(child_thread_id).await,
             };
-            if !is_final(&status) {
-                return;
-            }
 
             let Ok(state) = control.upgrade() else {
                 return;
