@@ -553,7 +553,10 @@ async fn on_event_updates_status_from_shutdown_complete() {
 
 #[tokio::test]
 async fn terminal_status_forwards_typed_event_without_child_result_body() {
-    let harness = AgentControlHarness::new().await;
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
     harness
         .control
@@ -617,7 +620,10 @@ async fn terminal_status_forwards_typed_event_without_child_result_body() {
 
 #[tokio::test]
 async fn native_v2_interrupted_notifies_parent_without_completion_communication() {
-    let harness = AgentControlHarness::new().await;
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
     harness
         .control
@@ -686,7 +692,10 @@ async fn native_v2_interrupted_notifies_parent_without_completion_communication(
 
 #[tokio::test]
 async fn legacy_completion_watcher_notifies_terminal_transitions_once() {
-    let harness = AgentControlHarness::new().await;
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
     harness
         .control
