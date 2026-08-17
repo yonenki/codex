@@ -676,7 +676,7 @@ fn spawn_tool_spec_marks_acp_role_backend_default() {
 }
 
 #[test]
-fn spawn_tool_spec_exposes_ordered_acp_backend_pool_candidates() {
+fn spawn_tool_spec_hides_acp_backend_pool_provider_details() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("worker.toml");
     fs::write(
@@ -712,9 +712,10 @@ fn spawn_tool_spec_exposes_ordered_acp_backend_pool_candidates() {
 
     let spec = spawn_tool_spec::build(&roles, &pools);
 
-    assert!(spec.contains(
-        "ACP backend pool `worker_default`. Ordered candidates: grok-build, cursor/cursor-grok-4.6-high"
-    ));
+    assert!(spec.contains("2 ordered ACP backend candidate(s), selected internally"));
+    assert!(spec.contains("pass its task name as `fallback_from`"));
+    assert!(!spec.contains("grok-build"));
+    assert!(!spec.contains("cursor-grok-4.6-high"));
 }
 
 #[test]

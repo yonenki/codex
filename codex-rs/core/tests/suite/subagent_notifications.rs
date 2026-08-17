@@ -2001,11 +2001,18 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
             config.acp_backend_pools.insert(
                 "worker_default".to_string(),
                 AcpBackendPoolToml {
-                    candidates: vec![AcpBackendCandidateToml {
-                        harness: "grok-build".to_string(),
-                        model: Some("grok-test".to_string()),
-                        effort: Some("xhigh".to_string()),
-                    }],
+                    candidates: vec![
+                        AcpBackendCandidateToml {
+                            harness: "grok-build".to_string(),
+                            model: Some("grok-test".to_string()),
+                            effort: Some("xhigh".to_string()),
+                        },
+                        AcpBackendCandidateToml {
+                            harness: "grok-build".to_string(),
+                            model: Some("grok-fallback-test".to_string()),
+                            effort: Some("xhigh".to_string()),
+                        },
+                    ],
                 },
             );
         })
@@ -2113,6 +2120,66 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
             .contains("acp follow-up done"),
         "follow-up did not reuse the ACP session: {request:#?}"
     );
+
+    let fallback_call_id = "fallback-acp-call";
+    let fallback_prompt = "retry the ACP role without backend names";
+    let fallback_args = serde_json::to_string(&json!({
+        "fallback_from": "/root/grok",
+        "message": "same role task",
+        "task_name": "worker_retry",
+        "agent_type": "external_worker",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, fallback_prompt),
+        sse(vec![
+            ev_response_created("resp-parent-acp-fallback-1"),
+            ev_function_call_with_namespace(fallback_call_id, "acp", "spawn", &fallback_args),
+            ev_completed("resp-parent-acp-fallback-1"),
+        ]),
+    )
+    .await;
+    let fallback_result_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, fallback_call_id),
+        sse(vec![
+            ev_response_created("resp-parent-acp-fallback-2"),
+            ev_assistant_message("msg-parent-acp-fallback-2", "fallback spawned"),
+            ev_completed("resp-parent-acp-fallback-2"),
+        ]),
+    )
+    .await;
+    let fallback_completion_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            !body_contains(req, fallback_prompt)
+                && !body_contains(req, fallback_call_id)
+                && body_contains(req, "same role task")
+        },
+        sse(vec![
+            ev_response_created("resp-parent-acp-fallback-3"),
+            ev_assistant_message("msg-parent-acp-fallback-3", "fallback done"),
+            ev_completed("resp-parent-acp-fallback-3"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn(fallback_prompt).await?;
+    let fallback_output = fallback_result_request
+        .function_call_output_text(fallback_call_id)
+        .expect("fallback spawn result should include function output");
+    assert!(fallback_output.contains("/root/worker_retry"));
+    let fallback_request = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(request) = fallback_completion_request.requests().into_iter().next() {
+                return request;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fallback ACP completion should reach parent");
+    assert!(fallback_request.body_contains_text("backend=grok-fallback-test"));
 
     Ok(())
 }

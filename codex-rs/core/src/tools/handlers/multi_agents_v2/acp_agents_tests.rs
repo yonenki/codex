@@ -1,8 +1,10 @@
 use super::AcpBackendOverrides;
 use super::FunctionCallError;
+use super::ensure_fallback_source_terminal;
 use super::explicit_backend;
-use super::resolve_backend;
+use super::resolve_backend_candidate;
 use super::with_role_developer_instructions;
+use crate::agent::AgentStatus;
 use crate::agent::role::acp_backend;
 
 #[test]
@@ -33,8 +35,13 @@ fn role_backend_is_used_without_explicit_spawn_backend() {
     );
 
     assert_eq!(
-        resolve_backend(AcpBackendOverrides::default(), std::slice::from_ref(&role))
-            .expect("role backend"),
+        resolve_backend_candidate(
+            AcpBackendOverrides::default(),
+            std::slice::from_ref(&role),
+            None,
+        )
+        .expect("role backend")
+        .backend,
         role
     );
 }
@@ -54,7 +61,9 @@ fn explicit_backend_overrides_role_defaults() {
     );
 
     assert_eq!(
-        resolve_backend(explicit, &[role]).expect("explicit override"),
+        resolve_backend_candidate(explicit, &[role], None)
+            .expect("explicit override")
+            .backend,
         acp_backend(
             "antigravity".to_string(),
             Some("gemini-3.7-flash".to_string()),
@@ -77,7 +86,9 @@ fn explicit_harness_selects_matching_pool_candidate_defaults() {
         .expect("valid explicit backend");
 
     assert_eq!(
-        resolve_backend(explicit, &pool).expect("pool candidate"),
+        resolve_backend_candidate(explicit, &pool, None)
+            .expect("pool candidate")
+            .backend,
         pool[1]
     );
 }
@@ -93,16 +104,59 @@ fn unrelated_explicit_harness_does_not_inherit_pool_model() {
         explicit_backend(Some("kimi".to_string()), None, None).expect("valid explicit backend");
 
     assert_eq!(
-        resolve_backend(explicit, &pool).expect("explicit backend"),
+        resolve_backend_candidate(explicit, &pool, None)
+            .expect("explicit backend")
+            .backend,
         acp_backend("kimi".to_string(), None, None)
     );
 }
 
 #[test]
 fn backend_is_required_without_an_acp_backed_role() {
-    let error = resolve_backend(AcpBackendOverrides::default(), &[])
+    let error = resolve_backend_candidate(AcpBackendOverrides::default(), &[], None)
         .expect_err("missing backend must fail");
     assert!(
         matches!(error, FunctionCallError::RespondToModel(message) if message.contains("harness is required"))
     );
+}
+
+#[test]
+fn fallback_selects_next_pool_candidate_without_backend_names() {
+    let pool = vec![
+        acp_backend(
+            "grok-build".to_string(),
+            Some("grok-4.6".to_string()),
+            Some("high".to_string()),
+        ),
+        acp_backend("kimi".to_string(), Some("kimi-code/k3".to_string()), None),
+    ];
+
+    let selection = resolve_backend_candidate(AcpBackendOverrides::default(), &pool, Some(1))
+        .expect("next pool candidate");
+
+    assert_eq!(selection.backend, pool[1]);
+    assert_eq!(selection.candidate_index, Some(1));
+}
+
+#[test]
+fn fallback_fails_after_last_pool_candidate() {
+    let pool = vec![acp_backend("grok-build".to_string(), None, None)];
+
+    let error = resolve_backend_candidate(AcpBackendOverrides::default(), &pool, Some(1))
+        .expect_err("exhausted pool must fail");
+
+    assert!(
+        matches!(error, FunctionCallError::RespondToModel(message) if message.contains("no remaining ACP backend candidate"))
+    );
+}
+
+#[test]
+fn fallback_requires_prior_candidate_to_reach_terminal_status() {
+    let error = ensure_fallback_source_terminal(AgentStatus::Running)
+        .expect_err("active source must not overlap with fallback");
+    assert!(
+        matches!(error, FunctionCallError::RespondToModel(message) if message.contains("still active"))
+    );
+    ensure_fallback_source_terminal(AgentStatus::Completed(Some("done".to_string())))
+        .expect("completed source may fall back");
 }

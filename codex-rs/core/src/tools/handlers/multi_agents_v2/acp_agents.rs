@@ -13,6 +13,7 @@ use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub(crate) struct SpawnHandler;
 pub(crate) struct MessageHandler;
@@ -23,6 +24,7 @@ pub(crate) struct FollowupHandler;
 struct SpawnArgs {
     task_name: String,
     message: String,
+    fallback_from: Option<String>,
     harness: Option<String>,
     model: Option<String>,
     effort: Option<String>,
@@ -34,6 +36,12 @@ struct AcpBackendOverrides {
     harness: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AcpBackendSelection {
+    backend: crate::agent::role::ExternalAgentBackend,
+    candidate_index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +84,13 @@ fn spawn_spec() -> ToolSpec {
             harness_schema(),
         ),
         (
+            "fallback_from".to_string(),
+            JsonSchema::string(Some(
+                "Optional prior ACP task name whose terminal result should be retried with the next backend candidate from the same agent role. Do not combine with harness, model, or effort overrides."
+                    .to_string(),
+            )),
+        ),
+        (
             "effort".to_string(),
             JsonSchema::string(Some(
                 "Optional reasoning effort selected through the harness ACP thought-level configuration. The harness default is used when omitted."
@@ -85,7 +100,7 @@ fn spawn_spec() -> ToolSpec {
         (
             "agent_type".to_string(),
             JsonSchema::string(Some(
-                "Optional Codex agent role from the active .codex/agents definitions. A role may provide default ACP harness, model, and reasoning effort values; explicit spawn arguments override those defaults."
+                "Optional Codex agent role from the active .codex/agents definitions. A role may select an ACP backend pool internally; normally omit harness, model, and effort when using a role."
                     .to_string(),
             )),
         ),
@@ -283,8 +298,20 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
             backends: Vec::new(),
         },
     };
-    let backend = resolve_backend(explicit_backend, &role_settings.backends)?;
-    let harness = backend.harness.trim().to_string();
+    let fallback_candidate_index = fallback_candidate_index(
+        &session,
+        turn,
+        args.fallback_from.as_deref(),
+        role_name,
+        &explicit_backend,
+    )
+    .await?;
+    let selection = resolve_backend_candidate(
+        explicit_backend,
+        &role_settings.backends,
+        fallback_candidate_index,
+    )?;
+    let harness = selection.backend.harness.trim().to_string();
     if !is_valid_harness_id(&harness) {
         return Err(FunctionCallError::RespondToModel(
             "harness must contain 1-64 lowercase ASCII letters, digits, or hyphens".to_string(),
@@ -313,7 +340,7 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         message,
         /*trigger_turn*/ true,
     );
-    let backend = acp_backend(harness, backend.model, backend.effort);
+    let backend = acp_backend(harness, selection.backend.model, selection.backend.effort);
     let spawned = session
         .services
         .agent_control
@@ -326,6 +353,16 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         )
         .await
         .map_err(collab_spawn_error)?;
+    if let (Some(role_name), Some(candidate_index)) = (role_name, selection.candidate_index) {
+        session
+            .services
+            .agent_control
+            .record_external_backend_route(
+                spawned.thread_id,
+                role_name.to_string(),
+                candidate_index,
+            );
+    }
     emit_sub_agent_activity(
         &session,
         turn,
@@ -373,26 +410,42 @@ fn explicit_backend(
     })
 }
 
-fn resolve_backend(
+fn resolve_backend_candidate(
     explicit: AcpBackendOverrides,
     role_backends: &[crate::agent::role::ExternalAgentBackend],
-) -> Result<crate::agent::role::ExternalAgentBackend, FunctionCallError> {
-    let selected = match explicit.harness.as_deref() {
+    fallback_candidate_index: Option<usize>,
+) -> Result<AcpBackendSelection, FunctionCallError> {
+    if let Some(candidate_index) = fallback_candidate_index {
+        let backend = role_backends.get(candidate_index).cloned().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "agent_type has no remaining ACP backend candidate".to_string(),
+            )
+        })?;
+        return Ok(AcpBackendSelection {
+            backend,
+            candidate_index: Some(candidate_index),
+        });
+    }
+    let (selected, candidate_index) = match explicit.harness.as_deref() {
         Some(harness) => role_backends
             .iter()
+            .enumerate()
             .find(|candidate| {
-                candidate.harness == harness
+                candidate.1.harness == harness
                     && explicit
                         .model
                         .as_ref()
-                        .is_none_or(|model| candidate.model.as_ref() == Some(model))
+                        .is_none_or(|model| candidate.1.model.as_ref() == Some(model))
             })
-            .cloned()
-            .unwrap_or_else(|| acp_backend(harness.to_string(), None, None)),
-        None => role_backends
-            .first()
-            .cloned()
-            .unwrap_or_else(|| acp_backend(String::new(), None, None)),
+            .map(|(index, candidate)| (candidate.clone(), Some(index)))
+            .unwrap_or_else(|| (acp_backend(harness.to_string(), None, None), None)),
+        None => (
+            role_backends
+                .first()
+                .cloned()
+                .unwrap_or_else(|| acp_backend(String::new(), None, None)),
+            (!role_backends.is_empty()).then_some(0),
+        ),
     };
     let harness = explicit.harness.unwrap_or(selected.harness);
     if harness.is_empty() {
@@ -400,11 +453,54 @@ fn resolve_backend(
             "harness is required unless agent_type declares an ACP backend".to_string(),
         ));
     }
-    Ok(acp_backend(
-        harness,
-        explicit.model.or(selected.model),
-        explicit.effort.or(selected.effort),
-    ))
+    Ok(AcpBackendSelection {
+        backend: acp_backend(
+            harness,
+            explicit.model.or(selected.model),
+            explicit.effort.or(selected.effort),
+        ),
+        candidate_index,
+    })
+}
+
+async fn fallback_candidate_index(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<crate::session::turn_context::TurnContext>,
+    fallback_from: Option<&str>,
+    role_name: Option<&str>,
+    explicit_backend: &AcpBackendOverrides,
+) -> Result<Option<usize>, FunctionCallError> {
+    let Some(fallback_from) = fallback_from else {
+        return Ok(None);
+    };
+    if explicit_backend != &AcpBackendOverrides::default() {
+        return Err(FunctionCallError::RespondToModel(
+            "fallback_from cannot be combined with harness, model, or effort".to_string(),
+        ));
+    }
+    let role_name = role_name.ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "fallback_from requires the same agent_type as the prior ACP task".to_string(),
+        )
+    })?;
+    let agent_id = resolve_agent_target(session, turn, fallback_from).await?;
+    ensure_fallback_source_terminal(session.services.agent_control.get_status(agent_id).await)?;
+    session
+        .services
+        .agent_control
+        .next_external_backend_candidate(agent_id, role_name)
+        .map(Some)
+        .map_err(collab_spawn_error)
+}
+
+fn ensure_fallback_source_terminal(status: AgentStatus) -> Result<(), FunctionCallError> {
+    match status {
+        AgentStatus::PendingInit | AgentStatus::Running => Err(FunctionCallError::RespondToModel(
+            "fallback source is still active; wait for a terminal result before retrying"
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn with_role_developer_instructions(

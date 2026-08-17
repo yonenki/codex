@@ -518,20 +518,10 @@ pub(crate) mod spawn_tool_spec {
                         .unwrap_or_default();
                     let acp_backend_pool_note = acp_backend_pool
                         .map(|pool_name| match acp_backend_pools.get(pool_name) {
-                            Some(pool) => {
-                                let candidates = pool
-                                    .candidates
-                                    .iter()
-                                    .map(|candidate| match candidate.model.as_deref() {
-                                        Some(model) => format!("{}/{}", candidate.harness, model),
-                                        None => candidate.harness.clone(),
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                format!(
-                                    "\n- This role uses ACP backend pool `{pool_name}`. Ordered candidates: {candidates}. `acp.spawn` uses the first by default; pass a candidate's harness/model to select another."
-                                )
-                            }
+                            Some(pool) => format!(
+                                "\n- This role has {} ordered ACP backend candidate(s), selected internally. Call `acp.spawn` with the role and omit harness/model/effort. After a prior candidate reaches a terminal result, pass its task name as `fallback_from` to use the next candidate.",
+                                pool.candidates.len()
+                            ),
                             None => format!("\n- This role refers to unknown ACP backend pool `{pool_name}`."),
                         })
                         .unwrap_or_default();

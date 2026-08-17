@@ -34,9 +34,9 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
         .windows(2)
         .any(|args| args[0] == "--harness" && args[1] == "grok-build");
     if is_acp_fixture {
-        let has_model = args
-            .windows(2)
-            .any(|args| args[0] == "--model" && args[1] == "grok-test");
+        let has_model = args.windows(2).any(|args| {
+            args[0] == "--model" && (args[1] == "grok-test" || args[1] == "grok-fallback-test")
+        });
         let has_effort = args
             .windows(2)
             .any(|args| args[0] == "--effort" && args[1] == "xhigh");
@@ -64,6 +64,11 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
 };
 
 fn run_acp_fixture() -> ! {
+    let selected_model = std::env::args_os()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|args| (args[0] == "--model").then(|| args[1].to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "default".to_string());
     let stdin = std::io::stdin();
     let mut stdout = std::io::BufWriter::new(std::io::stdout());
     let mut prompt_count = 0_u64;
@@ -108,7 +113,7 @@ fn run_acp_fixture() -> ! {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
-                        format!("acp done\n{prompt}")
+                        format!("acp done\nbackend={selected_model}\n{prompt}")
                     }
                     _ => "acp follow-up done".to_string(),
                 };

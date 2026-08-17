@@ -52,6 +52,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 use tokio::sync::watch;
 use tracing::warn;
@@ -98,6 +99,12 @@ pub(crate) struct ListedAgent {
     pub(crate) agent_status: AgentStatus,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalBackendRoute {
+    role_name: String,
+    candidate_index: usize,
+}
+
 /// Control-plane handle for multi-agent operations.
 /// `AgentControl` is held by each session (via `SessionServices`). It provides capability to
 /// spawn new agents and the inter-agent communication layer.
@@ -117,6 +124,7 @@ pub(crate) struct AgentControl {
     thread_id_generator: ThreadIdGenerator,
     state: Arc<AgentRegistry>,
     external_agents: Arc<external::ExternalAgentManager>,
+    external_backend_routes: Arc<Mutex<HashMap<ThreadId, ExternalBackendRoute>>>,
     v2_residency: Arc<V2Residency>,
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
@@ -150,6 +158,7 @@ impl AgentControl {
             thread_id_generator,
             state: Arc::default(),
             external_agents: Arc::default(),
+            external_backend_routes: Arc::default(),
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
@@ -172,6 +181,47 @@ impl AgentControl {
 
     pub(crate) fn generate_thread_id(&self) -> ThreadId {
         (self.thread_id_generator)()
+    }
+
+    pub(crate) fn record_external_backend_route(
+        &self,
+        agent_id: ThreadId,
+        role_name: String,
+        candidate_index: usize,
+    ) {
+        self.external_backend_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                agent_id,
+                ExternalBackendRoute {
+                    role_name,
+                    candidate_index,
+                },
+            );
+    }
+
+    pub(crate) fn next_external_backend_candidate(
+        &self,
+        agent_id: ThreadId,
+        role_name: &str,
+    ) -> CodexResult<usize> {
+        let routes = self
+            .external_backend_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let route = routes.get(&agent_id).ok_or_else(|| {
+            CodexErr::UnsupportedOperation(
+                "fallback source was not spawned from an ACP backend pool".to_string(),
+            )
+        })?;
+        if route.role_name != role_name {
+            return Err(CodexErr::UnsupportedOperation(format!(
+                "fallback source uses agent_type '{}', not '{role_name}'",
+                route.role_name
+            )));
+        }
+        Ok(route.candidate_index.saturating_add(1))
     }
 
     pub(crate) fn rollout_budget(&self) -> &RolloutBudget {

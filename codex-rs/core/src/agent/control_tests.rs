@@ -69,6 +69,28 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 use toml::Value as TomlValue;
 
+#[test]
+fn external_backend_route_advances_without_exposing_backend_identity() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.record_external_backend_route(agent_id, "worker".to_string(), 0);
+
+    assert_eq!(
+        control
+            .next_external_backend_candidate(agent_id, "worker")
+            .expect("next candidate"),
+        1
+    );
+    let error = control
+        .next_external_backend_candidate(agent_id, "reviewer")
+        .expect_err("role mismatch must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("uses agent_type 'worker', not 'reviewer'")
+    );
+}
+
 async fn test_config_with_cli_overrides(
     mut cli_overrides: Vec<(String, TomlValue)>,
 ) -> (TempDir, Config) {
