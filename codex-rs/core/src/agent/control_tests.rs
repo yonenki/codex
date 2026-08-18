@@ -841,7 +841,7 @@ async fn external_followup_emits_second_terminal_with_backend_identity() {
         child_thread_id,
         parent_thread_id,
         child_agent_path.to_string(),
-        Some(child_agent_path.clone()),
+        /*child_agent_path*/ None,
     );
 
     harness
