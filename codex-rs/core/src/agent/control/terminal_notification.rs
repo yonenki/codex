@@ -22,12 +22,25 @@ fn terminal_status(status: &AgentStatus) -> Option<SubAgentTerminalStatus> {
 #[derive(Default)]
 pub(super) struct TerminalStatusTracker {
     last_notified: Option<SubAgentTerminalStatus>,
+    last_external_generation: Option<u64>,
 }
 
 impl TerminalStatusTracker {
-    pub(super) fn should_notify(&mut self, status: &AgentStatus) -> bool {
+    pub(super) fn should_notify(
+        &mut self,
+        status: &AgentStatus,
+        external_generation: Option<u64>,
+    ) -> bool {
         match terminal_status(status) {
             Some(status) => {
+                if let Some(generation) = external_generation {
+                    if self.last_external_generation == Some(generation) {
+                        return false;
+                    }
+                    self.last_external_generation = Some(generation);
+                    self.last_notified = Some(status);
+                    return true;
+                }
                 if self.last_notified == Some(status) {
                     false
                 } else {
@@ -123,16 +136,25 @@ mod tests {
     #[test]
     fn interrupted_running_terminal_transitions_notify_once() {
         let mut tracker = TerminalStatusTracker::default();
-        assert!(tracker.should_notify(&AgentStatus::Interrupted));
-        assert!(!tracker.should_notify(&AgentStatus::Interrupted));
-        assert!(!tracker.should_notify(&AgentStatus::Running));
-        assert!(tracker.should_notify(&AgentStatus::Completed(None)));
-        assert!(!tracker.should_notify(&AgentStatus::Completed(None)));
-        assert!(tracker.should_notify(&AgentStatus::Errored("late".to_string())));
-        assert!(!tracker.should_notify(&AgentStatus::Errored("late".to_string())));
+        assert!(tracker.should_notify(&AgentStatus::Interrupted, None));
+        assert!(!tracker.should_notify(&AgentStatus::Interrupted, None));
+        assert!(!tracker.should_notify(&AgentStatus::Running, None));
+        assert!(tracker.should_notify(&AgentStatus::Completed(None), None));
+        assert!(!tracker.should_notify(&AgentStatus::Completed(None), None));
+        assert!(tracker.should_notify(&AgentStatus::Errored("late".to_string()), None));
+        assert!(!tracker.should_notify(&AgentStatus::Errored("late".to_string()), None));
 
-        tracker.should_notify(&AgentStatus::Running);
-        assert!(tracker.should_notify(&AgentStatus::Errored("late".to_string())));
-        assert!(!tracker.should_notify(&AgentStatus::Errored("late".to_string())));
+        tracker.should_notify(&AgentStatus::Running, None);
+        assert!(tracker.should_notify(&AgentStatus::Errored("late".to_string()), None));
+        assert!(!tracker.should_notify(&AgentStatus::Errored("late".to_string()), None));
+    }
+
+    #[test]
+    fn external_generation_distinguishes_terminal_lifecycles_without_running_observation() {
+        let mut tracker = TerminalStatusTracker::default();
+        assert!(tracker.should_notify(&AgentStatus::Completed(None), Some(1)));
+        assert!(!tracker.should_notify(&AgentStatus::Completed(None), Some(1)));
+        assert!(tracker.should_notify(&AgentStatus::Completed(None), Some(2)));
+        assert!(!tracker.should_notify(&AgentStatus::Completed(None), Some(2)));
     }
 }

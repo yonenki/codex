@@ -861,9 +861,6 @@ async fn external_followup_emits_second_terminal_with_backend_identity() {
         .control
         .external_agents
         .set_status_for_tests(child_thread_id, AgentStatus::Running);
-    // Let the completion watcher observe Running and clear the duplicate-terminal
-    // guard before the second Completed arrives.
-    sleep(Duration::from_millis(25)).await;
     harness.control.external_agents.set_status_for_tests(
         child_thread_id,
         AgentStatus::Completed(Some("second done".to_string())),
@@ -873,6 +870,87 @@ async fn external_followup_emits_second_terminal_with_backend_identity() {
     assert_eq!(second[0].harness.as_deref(), Some("cursor"));
     assert_eq!(second[0].model.as_deref(), Some("cursor-grok-4.6-high"));
     assert_eq!(second[0].agent_path, Some(child_agent_path));
+}
+
+#[tokio::test]
+async fn external_turn_start_hook_precedes_running_status() {
+    let control = AgentControl::default();
+    let child_thread_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        },
+    );
+    let hook_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_observed_for_callback = Arc::clone(&hook_observed);
+    let control_for_callback = control.clone();
+
+    let (_, started_turn) = control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "follow up".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            move || async move {
+                assert_eq!(
+                    control_for_callback.get_status(child_thread_id).await,
+                    AgentStatus::PendingInit
+                );
+                hook_observed_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("external follow-up should start");
+
+    assert!(started_turn);
+    assert!(hook_observed.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn external_queue_only_message_does_not_invoke_start_hook() {
+    let control = AgentControl::default();
+    let child_thread_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+    let hook_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_observed_for_callback = Arc::clone(&hook_observed);
+
+    let (_, started_turn) = control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "queued message".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
+            move || async move {
+                hook_observed_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("external message should queue");
+
+    assert!(!started_turn);
+    assert!(!hook_observed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        control.get_status(child_thread_id).await,
+        AgentStatus::PendingInit
+    );
 }
 
 #[tokio::test]

@@ -305,33 +305,14 @@ impl AgentControl {
         root_turn_id: Option<String>,
     ) -> CodexResult<String> {
         if self.external_agents.contains(agent_id) {
-            if communication.encrypted_content.is_some() {
-                return Err(CodexErr::UnsupportedOperation(
-                    "encrypted inter-agent messages are not supported by external agents"
-                        .to_string(),
-                ));
-            }
-            let communication_for_log =
-                crate::agent_communication::logging_enabled().then(|| communication.clone());
-            let result = self.external_agents.submit_message(
-                agent_id,
-                communication.content,
-                communication.trigger_turn,
-            );
-            if let (Some(communication), Ok((communication_id, _))) =
-                (communication_for_log, result.as_ref())
-            {
-                crate::agent_communication::emit_agent_communication_send(
-                    communication_id,
-                    &agent_communication_context,
-                    &communication,
+            let (communication_id, _) = self
+                .send_external_inter_agent_communication_with_start_hook(
                     agent_id,
-                );
-            }
-            let (communication_id, started_turn) = result?;
-            if started_turn {
-                self.maybe_start_external_completion_watcher(agent_id);
-            }
+                    communication,
+                    agent_communication_context,
+                    || std::future::ready(()),
+                )
+                .await?;
             return Ok(communication_id);
         }
         let state = self.upgrade()?;
@@ -349,6 +330,52 @@ impl AgentControl {
             root_turn_id,
         )
         .await
+    }
+
+    pub(crate) async fn send_external_inter_agent_communication_with_start_hook<F, Fut>(
+        &self,
+        agent_id: ThreadId,
+        communication: InterAgentCommunication,
+        agent_communication_context: AgentCommunicationContext,
+        on_started: F,
+    ) -> CodexResult<(String, bool)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        if !self.external_agents.contains(agent_id) {
+            return Err(CodexErr::ThreadNotFound(agent_id));
+        }
+        if communication.encrypted_content.is_some() {
+            return Err(CodexErr::UnsupportedOperation(
+                "encrypted inter-agent messages are not supported by external agents".to_string(),
+            ));
+        }
+        let communication_for_log =
+            crate::agent_communication::logging_enabled().then(|| communication.clone());
+        let submission = self.external_agents.submit_message(
+            agent_id,
+            communication.content,
+            communication.trigger_turn,
+        )?;
+        if let Some(communication) = communication_for_log {
+            crate::agent_communication::emit_agent_communication_send(
+                submission.submission_id(),
+                &agent_communication_context,
+                &communication,
+                agent_id,
+            );
+        }
+        let communication_id = submission.submission_id().to_string();
+        let requests_turn = submission.requests_turn();
+        if requests_turn {
+            on_started().await;
+        }
+        submission.start();
+        if requests_turn {
+            self.maybe_start_external_completion_watcher(agent_id);
+        }
+        Ok((communication_id, requests_turn))
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -747,7 +774,16 @@ impl AgentControl {
                 Ok(mut status_rx) => {
                     let mut status = status_rx.borrow().clone();
                     loop {
-                        let should_notify = terminal_status_tracker.should_notify(&status);
+                        let external_lifecycle = is_external
+                            .then(|| control.external_agents.lifecycle_status(child_thread_id))
+                            .flatten();
+                        if let Some((external_status, _)) = &external_lifecycle {
+                            status = external_status.clone();
+                        }
+                        let external_generation =
+                            external_lifecycle.map(|(_, generation)| generation);
+                        let should_notify =
+                            terminal_status_tracker.should_notify(&status, external_generation);
                         if should_notify && !native_v2 {
                             control
                                 .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
@@ -763,17 +799,18 @@ impl AgentControl {
                             let keep_watching_external = is_external
                                 && is_final(&status)
                                 && !matches!(status, AgentStatus::Shutdown);
-                            if should_notify && keep_watching_external {
-                                if let Some(child_agent_path) = child_agent_path.clone() {
-                                    control
-                                        .forward_v2_child_completion_to_parent(
-                                            child_thread_id,
-                                            parent_thread_id,
-                                            child_agent_path,
-                                            &status,
-                                        )
-                                        .await;
-                                }
+                            if should_notify
+                                && keep_watching_external
+                                && let Some(child_agent_path) = child_agent_path.clone()
+                            {
+                                control
+                                    .forward_v2_child_completion_to_parent(
+                                        child_thread_id,
+                                        parent_thread_id,
+                                        child_agent_path,
+                                        &status,
+                                    )
+                                    .await;
                             }
                             if keep_watching_external {
                                 if status_rx.changed().await.is_err() {
@@ -799,8 +836,17 @@ impl AgentControl {
                     }
                 }
                 Err(_) => {
-                    let status = control.get_status(child_thread_id).await;
-                    if terminal_status_tracker.should_notify(&status) && !native_v2 {
+                    let mut status = control.get_status(child_thread_id).await;
+                    let external_lifecycle = is_external
+                        .then(|| control.external_agents.lifecycle_status(child_thread_id))
+                        .flatten();
+                    if let Some((external_status, _)) = &external_lifecycle {
+                        status = external_status.clone();
+                    }
+                    let external_generation = external_lifecycle.map(|(_, generation)| generation);
+                    if terminal_status_tracker.should_notify(&status, external_generation)
+                        && !native_v2
+                    {
                         control
                             .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
                             .await;
