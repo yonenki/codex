@@ -70,19 +70,33 @@ use tokio::time::timeout;
 use toml::Value as TomlValue;
 
 #[test]
-fn external_backend_route_advances_without_exposing_backend_identity() {
+fn external_backend_route_claims_fallback_once_and_releases_failed_spawn() {
     let control = AgentControl::default();
     let agent_id = ThreadId::new();
     control.record_external_backend_route(agent_id, "worker".to_string(), 0);
 
     assert_eq!(
         control
-            .next_external_backend_candidate(agent_id, "worker")
+            .claim_next_external_backend_candidate(agent_id, "worker")
             .expect("next candidate"),
         1
     );
     let error = control
-        .next_external_backend_candidate(agent_id, "reviewer")
+        .claim_next_external_backend_candidate(agent_id, "worker")
+        .expect_err("duplicate fallback must fail");
+    assert!(error.to_string().contains("already been consumed"));
+
+    control.release_external_backend_fallback(agent_id);
+    assert_eq!(
+        control
+            .claim_next_external_backend_candidate(agent_id, "worker")
+            .expect("failed spawn releases the claim"),
+        1
+    );
+    control.release_external_backend_fallback(agent_id);
+
+    let error = control
+        .claim_next_external_backend_candidate(agent_id, "reviewer")
         .expect_err("role mismatch must fail");
     assert!(
         error

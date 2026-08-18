@@ -44,6 +44,38 @@ struct AcpBackendSelection {
     candidate_index: Option<usize>,
 }
 
+struct ExternalBackendFallbackClaim {
+    agent_control: crate::agent::control::AgentControl,
+    source_agent_id: codex_protocol::ThreadId,
+    committed: bool,
+}
+
+impl ExternalBackendFallbackClaim {
+    fn new(
+        agent_control: crate::agent::control::AgentControl,
+        source_agent_id: codex_protocol::ThreadId,
+    ) -> Self {
+        Self {
+            agent_control,
+            source_agent_id,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ExternalBackendFallbackClaim {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.agent_control
+                .release_external_backend_fallback(self.source_agent_id);
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MessageArgs {
@@ -298,7 +330,7 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
             backends: Vec::new(),
         },
     };
-    let fallback_candidate_index = fallback_candidate_index(
+    let (fallback_candidate_index, fallback_claim) = fallback_candidate_index(
         &session,
         turn,
         args.fallback_from.as_deref(),
@@ -353,6 +385,9 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         )
         .await
         .map_err(collab_spawn_error)?;
+    if let Some(fallback_claim) = fallback_claim {
+        fallback_claim.commit();
+    }
     if let (Some(role_name), Some(candidate_index)) = (role_name, selection.candidate_index) {
         session
             .services
@@ -469,9 +504,9 @@ async fn fallback_candidate_index(
     fallback_from: Option<&str>,
     role_name: Option<&str>,
     explicit_backend: &AcpBackendOverrides,
-) -> Result<Option<usize>, FunctionCallError> {
+) -> Result<(Option<usize>, Option<ExternalBackendFallbackClaim>), FunctionCallError> {
     let Some(fallback_from) = fallback_from else {
-        return Ok(None);
+        return Ok((None, None));
     };
     if explicit_backend != &AcpBackendOverrides::default() {
         return Err(FunctionCallError::RespondToModel(
@@ -485,12 +520,18 @@ async fn fallback_candidate_index(
     })?;
     let agent_id = resolve_agent_target(session, turn, fallback_from).await?;
     ensure_fallback_source_terminal(session.services.agent_control.get_status(agent_id).await)?;
-    session
+    let candidate_index = session
         .services
         .agent_control
-        .next_external_backend_candidate(agent_id, role_name)
-        .map(Some)
-        .map_err(collab_spawn_error)
+        .claim_next_external_backend_candidate(agent_id, role_name)
+        .map_err(collab_spawn_error)?;
+    Ok((
+        Some(candidate_index),
+        Some(ExternalBackendFallbackClaim::new(
+            session.services.agent_control.clone(),
+            agent_id,
+        )),
+    ))
 }
 
 fn ensure_fallback_source_terminal(status: AgentStatus) -> Result<(), FunctionCallError> {

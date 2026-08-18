@@ -103,6 +103,7 @@ pub(crate) struct ListedAgent {
 struct ExternalBackendRoute {
     role_name: String,
     candidate_index: usize,
+    fallback_claimed: bool,
 }
 
 /// Control-plane handle for multi-agent operations.
@@ -197,20 +198,21 @@ impl AgentControl {
                 ExternalBackendRoute {
                     role_name,
                     candidate_index,
+                    fallback_claimed: false,
                 },
             );
     }
 
-    pub(crate) fn next_external_backend_candidate(
+    pub(crate) fn claim_next_external_backend_candidate(
         &self,
         agent_id: ThreadId,
         role_name: &str,
     ) -> CodexResult<usize> {
-        let routes = self
+        let mut routes = self
             .external_backend_routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let route = routes.get(&agent_id).ok_or_else(|| {
+        let route = routes.get_mut(&agent_id).ok_or_else(|| {
             CodexErr::UnsupportedOperation(
                 "fallback source was not spawned from an ACP backend pool".to_string(),
             )
@@ -221,7 +223,24 @@ impl AgentControl {
                 route.role_name
             )));
         }
+        if route.fallback_claimed {
+            return Err(CodexErr::UnsupportedOperation(
+                "fallback source has already been consumed".to_string(),
+            ));
+        }
+        route.fallback_claimed = true;
         Ok(route.candidate_index.saturating_add(1))
+    }
+
+    pub(crate) fn release_external_backend_fallback(&self, agent_id: ThreadId) {
+        if let Some(route) = self
+            .external_backend_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&agent_id)
+        {
+            route.fallback_claimed = false;
+        }
     }
 
     pub(crate) fn rollout_budget(&self) -> &RolloutBudget {
