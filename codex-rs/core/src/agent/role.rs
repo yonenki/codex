@@ -41,6 +41,7 @@ pub(crate) struct ExternalAgentBackend {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedExternalAgentBackend {
     pub(crate) harness: String,
+    pub(crate) model: Option<String>,
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
 }

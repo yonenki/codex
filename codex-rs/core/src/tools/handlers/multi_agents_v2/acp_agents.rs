@@ -372,7 +372,8 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         message,
         /*trigger_turn*/ true,
     );
-    let backend = acp_backend(harness, selection.backend.model, selection.backend.effort);
+    let model = selection.backend.model;
+    let backend = acp_backend(harness.clone(), model.clone(), selection.backend.effort);
     let spawned = session
         .services
         .agent_control
@@ -406,13 +407,24 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
             agent_thread_id: spawned.thread_id,
             agent_path: agent_path.clone(),
             kind: SubAgentActivityKind::Started,
+            harness: Some(harness.clone()),
+            model: model.clone(),
         },
     )
     .await;
     Ok(FunctionToolOutput::from_text(
-        serde_json::json!({"task_name": agent_path}).to_string(),
+        acp_spawn_output(&agent_path, &harness, model.as_deref()),
         Some(true),
     ))
+}
+
+fn acp_spawn_output(agent_path: &AgentPath, harness: &str, model: Option<&str>) -> String {
+    serde_json::json!({
+        "task_name": agent_path,
+        "harness": harness,
+        "model": model,
+    })
+    .to_string()
 }
 
 fn explicit_backend(
@@ -606,28 +618,47 @@ async fn deliver(
         message,
         mode.trigger_turn(),
     );
-    session
+    let identity = session
         .services
         .agent_control
-        .send_inter_agent_communication(
+        .external_backend_identity(agent_id);
+    let (harness, model) = match identity {
+        Some((harness, model)) => (Some(harness), model),
+        None => (None, None),
+    };
+    let started_activity = SubAgentActivityItem {
+        id: call_id.clone(),
+        agent_thread_id: agent_id,
+        agent_path: agent_path.clone(),
+        kind: SubAgentActivityKind::Started,
+        harness,
+        model,
+    };
+    let (_, requests_turn) = session
+        .services
+        .agent_control
+        .send_external_inter_agent_communication_with_start_hook(
             agent_id,
             communication,
             AgentCommunicationContext::new(mode.communication_kind(), session.thread_id),
-            mode.trigger_turn().then(|| turn.sub_id.clone()),
-            turn.turn_metadata_state.root_turn_id(),
+            || emit_sub_agent_activity(&session, turn, started_activity),
         )
         .await
         .map_err(|error| collab_agent_error(agent_id, error))?;
-    emit_sub_agent_activity(
-        &session,
-        turn,
-        SubAgentActivityItem {
-            id: call_id,
-            agent_thread_id: agent_id,
-            agent_path,
-            kind: SubAgentActivityKind::Interacted,
-        },
-    )
-    .await;
+    if !requests_turn {
+        emit_sub_agent_activity(
+            &session,
+            turn,
+            SubAgentActivityItem {
+                id: call_id,
+                agent_thread_id: agent_id,
+                agent_path,
+                kind: SubAgentActivityKind::Interacted,
+                harness: None,
+                model: None,
+            },
+        )
+        .await;
+    }
     Ok(FunctionToolOutput::from_text(String::new(), Some(true)))
 }

@@ -76,5 +76,9 @@ pub struct SubAgentTerminalNotification {
     pub agent_path: Option<String>,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     pub status: SubAgentTerminalStatus,
 }

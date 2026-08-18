@@ -302,13 +302,17 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
 
 pub(crate) fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
     let ThreadItem::SubAgentActivity {
-        kind, agent_path, ..
+        kind,
+        agent_path,
+        harness,
+        model,
+        ..
     } = item
     else {
         return None;
     };
     Some(collab_event(
-        sub_agent_activity_title(*kind, agent_path),
+        sub_agent_activity_title(*kind, agent_path, harness.as_deref(), model.as_deref()),
         Vec::new(),
     ))
 }
@@ -321,16 +325,30 @@ pub(crate) fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path:
     }
 }
 
-fn sub_agent_activity_title(kind: SubAgentActivityKind, agent_path: &str) -> Line<'static> {
+fn sub_agent_activity_title(
+    kind: SubAgentActivityKind,
+    agent_path: &str,
+    harness: Option<&str>,
+    model: Option<&str>,
+) -> Line<'static> {
     let (prefix, path) = match kind {
         SubAgentActivityKind::Started => ("Started ", agent_path),
         SubAgentActivityKind::Interacted => ("Interacted with ", agent_path),
         SubAgentActivityKind::Interrupted => ("Interrupted ", agent_path),
     };
-    title_spans_line(vec![
+    let mut spans = vec![
         Span::from(prefix).bold(),
         Span::from(format!("`{path}`")).cyan(),
-    ])
+    ];
+    if let Some(harness) = harness {
+        spans.push(" · ".dim());
+        spans.push(format_external_backend(harness, model).dim());
+    }
+    title_spans_line(spans)
+}
+
+pub(crate) fn format_external_backend(harness: &str, model: Option<&str>) -> String {
+    format!("{harness} / {}", model.unwrap_or("default model"))
 }
 
 fn spawn_end(
@@ -686,9 +704,28 @@ mod tests {
             kind: SubAgentActivityKind::Interacted,
             agent_thread_id: ThreadId::new().to_string(),
             agent_path: "/root/child".to_string(),
+            harness: None,
+            model: None,
         };
 
         assert_eq!(sub_agent_activity_display(&item), None);
+    }
+
+    #[test]
+    fn snapshots_external_sub_agent_start_identity() {
+        let item = ThreadItem::SubAgentActivity {
+            id: "activity-1".to_string(),
+            kind: SubAgentActivityKind::Started,
+            agent_thread_id: ThreadId::new().to_string(),
+            agent_path: "/root/worker".to_string(),
+            harness: Some("cursor".to_string()),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        };
+        let cell = sub_agent_activity_history_cell(&item).expect("activity cell");
+        assert_snapshot!(
+            cell.display_lines(100)[0].to_string(),
+            @"• Started `/root/worker` · cursor / cursor-grok-4.6-high"
+        );
     }
 
     #[test]

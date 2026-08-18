@@ -20,6 +20,8 @@ async fn replayed_subagent_terminal_notification_does_not_render_history() {
             agent_path: Some("/root/worker".to_string()),
             agent_nickname: Some("Luna".to_string()),
             agent_role: Some("reviewer".to_string()),
+            harness: None,
+            model: None,
             status: codex_app_server_protocol::SubAgentTerminalStatus::Completed,
         },
     );

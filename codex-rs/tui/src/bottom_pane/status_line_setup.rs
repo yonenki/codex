@@ -148,6 +148,9 @@ pub(crate) enum StatusLineItem {
 
     /// Latest checklist task progress from `update_plan` (if available).
     TaskProgress,
+
+    /// Number of currently running sub-agents in this session tree.
+    SubagentCount,
 }
 
 impl StatusLineItem {
@@ -206,6 +209,7 @@ impl StatusLineItem {
             StatusLineItem::TaskProgress => {
                 "Latest task progress from update_plan (omitted until available)"
             }
+            StatusLineItem::SubagentCount => "Currently running sub-agent count",
         }
     }
 
@@ -239,6 +243,7 @@ impl StatusLineItem {
             StatusLineItem::ThreadTitle => StatusSurfacePreviewItem::ThreadTitle,
             StatusLineItem::WorkspaceHeadline => StatusSurfacePreviewItem::WorkspaceHeadline,
             StatusLineItem::TaskProgress => StatusSurfacePreviewItem::TaskProgress,
+            StatusLineItem::SubagentCount => StatusSurfacePreviewItem::SubagentCount,
         }
     }
 }
@@ -449,6 +454,22 @@ mod tests {
             StatusLineItem::ContextRemaining.to_string(),
             "context-remaining"
         );
+    }
+
+    #[test]
+    fn subagent_count_is_selectable_and_has_a_preview() {
+        assert_eq!(
+            "subagent-count".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::SubagentCount)
+        );
+        assert_eq!(StatusLineItem::SubagentCount.to_string(), "subagent-count");
+        let preview = StatusSurfacePreviewData::default()
+            .status_line_for_items(
+                [StatusLineItem::SubagentCount],
+                /*use_theme_colors*/ false,
+            )
+            .expect("preview");
+        insta::assert_snapshot!(preview.to_string(), @"Agents 0");
     }
 
     #[test]

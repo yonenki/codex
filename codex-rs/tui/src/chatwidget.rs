@@ -760,6 +760,8 @@ pub(crate) struct ChatWidget {
     status_line_git_summary_lookup_complete: bool,
     // Cached workspace notification headline for the status line.
     status_line_workspace_headline: Option<String>,
+    // Current running sub-agent count for the optional status-line item.
+    status_line_subagent_count: usize,
     // Request ID for the async workspace headline fetch currently in flight.
     status_line_workspace_headline_pending_request_id: Option<u64>,
     // Request ID to assign to the next workspace headline fetch.

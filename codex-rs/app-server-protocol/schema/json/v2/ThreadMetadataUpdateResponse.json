@@ -1621,11 +1621,25 @@
             "agentThreadId": {
               "type": "string"
             },
+            "harness": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "id": {
               "type": "string"
             },
             "kind": {
               "$ref": "#/definitions/SubAgentActivityKind"
+            },
+            "model": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "enum": [

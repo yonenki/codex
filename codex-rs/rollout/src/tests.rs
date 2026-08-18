@@ -58,6 +58,8 @@ fn subagent_terminal_events_are_transient_for_every_history_mode() {
         agent_path: None,
         agent_nickname: Some("Luna".to_string()),
         agent_role: Some("reviewer".to_string()),
+        harness: None,
+        model: None,
         status: SubAgentTerminalStatus::Completed,
     }));
 

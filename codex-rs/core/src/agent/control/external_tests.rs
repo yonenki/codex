@@ -11,10 +11,14 @@ fn combines_queued_messages_in_delivery_order() {
         QueuedMessage {
             content: "first".to_string(),
             trigger_turn: false,
+            submission_id: None,
+            ready_to_start: true,
         },
         QueuedMessage {
             content: "second".to_string(),
             trigger_turn: true,
+            submission_id: Some("second".to_string()),
+            ready_to_start: true,
         },
     ]);
 
@@ -23,6 +27,50 @@ fn combines_queued_messages_in_delivery_order() {
         "first\n\nsecond\n\nthird"
     );
     assert!(queue.is_empty());
+}
+
+#[tokio::test]
+async fn queued_trigger_waits_for_release_before_starting_its_generation() {
+    let manager = ExternalAgentManager::default();
+    let agent_id = ThreadId::new();
+    manager.register_for_tests(
+        agent_id,
+        ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+    let agent = manager.agent(agent_id).expect("registered agent");
+    {
+        let mut runtime = agent
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.running = true;
+        runtime.generation = 1;
+        agent.status_tx.send_replace(AgentStatus::Running);
+    }
+
+    let submission = manager
+        .submit_message(agent_id, "follow up".to_string(), true)
+        .expect("queue trigger");
+    assert!(submission.requests_turn());
+
+    finish_turn(
+        Arc::clone(&agent),
+        1,
+        AgentStatus::Completed(Some("first done".to_string())),
+    );
+    assert_eq!(
+        manager.lifecycle_status(agent_id),
+        Some((AgentStatus::Completed(Some("first done".to_string())), 1))
+    );
+
+    submission.start();
+    assert_eq!(
+        manager.lifecycle_status(agent_id),
+        Some((AgentStatus::Running, 2))
+    );
 }
 
 #[test]
@@ -69,4 +117,31 @@ fn bounds_acp_result_for_parent_context() {
         status,
         AgentStatus::Completed(Some(output)) if output.len() < response.len()
     ));
+}
+
+#[tokio::test]
+async fn registration_publishes_immutable_backend_identity_before_harness_startup() {
+    let manager = ExternalAgentManager::default();
+    let agent_id = ThreadId::new();
+    manager
+        .register(
+            agent_id,
+            ResolvedExternalAgentBackend {
+                harness: "cursor".to_string(),
+                model: Some("cursor-grok-4.6-high".to_string()),
+                command: "missing-acp-host-for-identity-test".to_string(),
+                args: Vec::new(),
+            },
+            std::env::current_dir().expect("current dir"),
+            HashMap::new(),
+        )
+        .expect("register external agent");
+
+    assert_eq!(
+        manager.identity(agent_id),
+        Some(ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        })
+    );
 }

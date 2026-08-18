@@ -7,9 +7,9 @@ use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
 use crate::context::MultiAgentRoleInstructions;
-use crate::session::multi_agents::resolve_usage_hints;
 use crate::exec_env::create_env;
 use crate::exec_env::inject_session_id_env;
+use crate::session::multi_agents::resolve_usage_hints;
 use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
@@ -327,6 +327,7 @@ impl AgentControl {
             })?;
         let backend = ResolvedExternalAgentBackend {
             harness: backend.harness,
+            model: backend.model,
             command: resolved_command.to_string_lossy().into_owned(),
             args: host_args,
         };

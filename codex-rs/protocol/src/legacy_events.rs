@@ -406,6 +406,8 @@ impl SubAgentActivityItem {
             occurred_at_ms,
             agent_thread_id: self.agent_thread_id,
             agent_path: self.agent_path.clone(),
+            harness: self.harness.clone(),
+            model: self.model.clone(),
             kind: self.kind,
         })
     }
