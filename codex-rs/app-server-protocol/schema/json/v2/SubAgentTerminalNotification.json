@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "SubAgentTerminalStatus": {
+      "enum": [
+        "completed",
+        "errored",
+        "interrupted"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "Live terminal transition for a direct child sub-agent. This notification is intentionally not represented as a thread item and is not replayed from thread history.",
+  "properties": {
+    "agentNickname": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agentPath": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agentRole": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agentThreadId": {
+      "type": "string"
+    },
+    "harness": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "$ref": "#/definitions/SubAgentTerminalStatus"
+    },
+    "threadId": {
+      "description": "Parent thread receiving this live notification.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "agentThreadId",
+    "status",
+    "threadId"
+  ],
+  "title": "SubAgentTerminalNotification",
+  "type": "object"
+}

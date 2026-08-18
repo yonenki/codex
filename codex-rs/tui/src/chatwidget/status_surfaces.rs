@@ -779,6 +779,9 @@ impl ChatWidget {
             ),
             StatusLineItem::WorkspaceHeadline => self.status_line_workspace_headline.clone(),
             StatusLineItem::TaskProgress => self.terminal_title_task_progress(),
+            StatusLineItem::SubagentCount => {
+                Some(format!("Agents {}", self.status_line_subagent_count))
+            }
         }
     }
 
@@ -799,6 +802,7 @@ impl ChatWidget {
             StatusSurfacePreviewItem::ProjectRoot => StatusLineItem::ProjectRoot,
             StatusSurfacePreviewItem::Status => return Some(self.run_state_status_text()),
             StatusSurfacePreviewItem::TaskProgress => return self.terminal_title_task_progress(),
+            StatusSurfacePreviewItem::SubagentCount => StatusLineItem::SubagentCount,
             StatusSurfacePreviewItem::CurrentDir => StatusLineItem::CurrentDir,
             StatusSurfacePreviewItem::ThreadTitle => StatusLineItem::ThreadTitle,
             StatusSurfacePreviewItem::GitBranch => StatusLineItem::GitBranch,
@@ -826,6 +830,10 @@ impl ChatWidget {
             StatusSurfacePreviewItem::Reasoning => StatusLineItem::Reasoning,
         };
         self.status_line_value_for_item(status_line_item)
+    }
+
+    pub(crate) fn set_status_line_subagent_count(&mut self, count: usize) {
+        self.status_line_subagent_count = count;
     }
     /// Resolves one configured terminal-title item into a displayable segment.
     ///

@@ -4361,6 +4361,26 @@
           "properties": {
             "method": {
               "enum": [
+                "thread/subagent/terminal"
+              ],
+              "title": "Thread/subagent/terminalNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/SubAgentTerminalNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/subagent/terminalNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "thread/started"
               ],
               "title": "Thread/startedNotificationMethod",
@@ -18824,6 +18844,69 @@
           }
         ]
       },
+      "SubAgentTerminalNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Live terminal transition for a direct child sub-agent. This notification is intentionally not represented as a thread item and is not replayed from thread history.",
+        "properties": {
+          "agentNickname": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agentPath": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agentRole": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agentThreadId": {
+            "type": "string"
+          },
+          "harness": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/definitions/v2/SubAgentTerminalStatus"
+          },
+          "threadId": {
+            "description": "Parent thread receiving this live notification.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agentThreadId",
+          "status",
+          "threadId"
+        ],
+        "title": "SubAgentTerminalNotification",
+        "type": "object"
+      },
+      "SubAgentTerminalStatus": {
+        "enum": [
+          "completed",
+          "errored",
+          "interrupted"
+        ],
+        "type": "string"
+      },
       "SubagentMigration": {
         "properties": {
           "name": {
@@ -20188,11 +20271,25 @@
               "agentThreadId": {
                 "type": "string"
               },
+              "harness": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "id": {
                 "type": "string"
               },
               "kind": {
                 "$ref": "#/definitions/v2/SubAgentActivityKind"
+              },
+              "model": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "type": {
                 "enum": [

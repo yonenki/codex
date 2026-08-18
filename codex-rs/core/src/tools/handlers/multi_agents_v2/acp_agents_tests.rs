@@ -1,11 +1,8 @@
-use super::AcpBackendOverrides;
-use super::FunctionCallError;
-use super::ensure_fallback_source_terminal;
-use super::explicit_backend;
-use super::resolve_backend_candidate;
-use super::with_role_developer_instructions;
+use super::*;
 use crate::agent::AgentStatus;
 use crate::agent::role::acp_backend;
+use pretty_assertions::assert_eq;
+use serde_json::json;
 
 #[test]
 fn role_instructions_are_prepended_without_changing_the_task() {
@@ -33,7 +30,6 @@ fn role_backend_is_used_without_explicit_spawn_backend() {
         Some("grok-4.6".to_string()),
         Some("high".to_string()),
     );
-
     assert_eq!(
         resolve_backend_candidate(
             AcpBackendOverrides::default(),
@@ -59,7 +55,6 @@ fn explicit_backend_overrides_role_defaults() {
         Some("grok-4.6".to_string()),
         Some("high".to_string()),
     );
-
     assert_eq!(
         resolve_backend_candidate(explicit, &[role], None)
             .expect("explicit override")
@@ -84,7 +79,6 @@ fn explicit_harness_selects_matching_pool_candidate_defaults() {
     ];
     let explicit = explicit_backend(Some("antigravity".to_string()), None, None)
         .expect("valid explicit backend");
-
     assert_eq!(
         resolve_backend_candidate(explicit, &pool, None)
             .expect("pool candidate")
@@ -102,7 +96,6 @@ fn unrelated_explicit_harness_does_not_inherit_pool_model() {
     )];
     let explicit =
         explicit_backend(Some("kimi".to_string()), None, None).expect("valid explicit backend");
-
     assert_eq!(
         resolve_backend_candidate(explicit, &pool, None)
             .expect("explicit backend")
@@ -130,10 +123,8 @@ fn fallback_selects_next_pool_candidate_without_backend_names() {
         ),
         acp_backend("kimi".to_string(), Some("kimi-code/k3".to_string()), None),
     ];
-
     let selection = resolve_backend_candidate(AcpBackendOverrides::default(), &pool, Some(1))
         .expect("next pool candidate");
-
     assert_eq!(selection.backend, pool[1]);
     assert_eq!(selection.candidate_index, Some(1));
 }
@@ -141,10 +132,8 @@ fn fallback_selects_next_pool_candidate_without_backend_names() {
 #[test]
 fn fallback_fails_after_last_pool_candidate() {
     let pool = vec![acp_backend("grok-build".to_string(), None, None)];
-
     let error = resolve_backend_candidate(AcpBackendOverrides::default(), &pool, Some(1))
         .expect_err("exhausted pool must fail");
-
     assert!(
         matches!(error, FunctionCallError::RespondToModel(message) if message.contains("no remaining ACP backend candidate"))
     );
@@ -165,4 +154,49 @@ fn fallback_requires_prior_candidate_to_reach_terminal_status() {
     }
     ensure_fallback_source_terminal(AgentStatus::Completed(Some("done".to_string())))
         .expect("completed source may fall back");
+}
+
+#[test]
+fn spawn_output_reports_first_fallback_explicit_and_default_model() {
+    let path = AgentPath::try_from("/root/worker").expect("agent path");
+    let pool = [
+        acp_backend("grok-build".to_string(), Some("grok-4.6".to_string()), None),
+        acp_backend(
+            "cursor".to_string(),
+            Some("cursor-grok-4.6-high".to_string()),
+            None,
+        ),
+    ];
+    let cases = [(None, &pool[0]), (Some(1), &pool[1])];
+    for (fallback_index, expected) in cases {
+        let selected =
+            resolve_backend_candidate(AcpBackendOverrides::default(), &pool, fallback_index)
+                .expect("pool candidate");
+        assert_eq!(selected.backend, *expected);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&acp_spawn_output(
+                &path,
+                &selected.backend.harness,
+                selected.backend.model.as_deref(),
+            ))
+            .expect("output json"),
+            json!({
+                "task_name": "/root/worker",
+                "harness": expected.harness,
+                "model": expected.model,
+            })
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&acp_spawn_output(&path, "kimi", Some("k3"),))
+            .expect("output json"),
+        json!({"task_name": "/root/worker", "harness": "kimi", "model": "k3"})
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&acp_spawn_output(
+            &path, "cursor", /*model*/ None,
+        ))
+        .expect("output json"),
+        json!({"task_name": "/root/worker", "harness": "cursor", "model": null})
+    );
 }

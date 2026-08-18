@@ -3101,6 +3101,8 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         agent_path: codex_protocol::AgentPath::root()
             .join("worker")
             .expect("worker path"),
+        harness: None,
+        model: None,
     });
 
     assert_eq!(
@@ -3110,6 +3112,8 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             kind: SubAgentActivityKind::Interrupted,
             agent_thread_id: receiver_thread_id.to_string(),
             agent_path: "/root/worker".to_string(),
+            harness: None,
+            model: None,
         }
     );
 

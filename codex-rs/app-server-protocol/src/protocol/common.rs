@@ -4081,6 +4081,8 @@ mod tests {
             agent_path: Some("/root/worker".to_string()),
             agent_nickname: Some("Luna".to_string()),
             agent_role: Some("reviewer".to_string()),
+            harness: None,
+            model: None,
             status: v2::SubAgentTerminalStatus::Errored,
         });
         let serialized = serde_json::to_value(&notification)?;
@@ -4094,6 +4096,8 @@ mod tests {
                     "agentPath": "/root/worker",
                     "agentNickname": "Luna",
                     "agentRole": "reviewer",
+                    "harness": null,
+                    "model": null,
                     "status": "errored",
                 }
             })

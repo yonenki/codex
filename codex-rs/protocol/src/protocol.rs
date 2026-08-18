@@ -4112,6 +4112,12 @@ pub struct SubAgentActivityEvent {
     pub agent_thread_id: ThreadId,
     /// Canonical v2 path of the affected sub-agent.
     pub agent_path: AgentPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model: Option<String>,
     pub kind: SubAgentActivityKind,
 }
 
@@ -4134,6 +4140,14 @@ pub struct SubAgentTerminalEvent {
     pub agent_nickname: Option<String>,
     /// Optional role assigned to the child.
     pub agent_role: Option<String>,
+    /// ACP harness selected for this child, when externally hosted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub harness: Option<String>,
+    /// Model ID passed to the ACP harness. `None` means the harness default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model: Option<String>,
     pub status: SubAgentTerminalStatus,
 }
 

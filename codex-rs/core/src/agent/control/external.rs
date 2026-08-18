@@ -39,9 +39,16 @@ pub(super) struct ExternalAgentManager {
 }
 
 struct ExternalAgent {
+    identity: ExternalAgentIdentity,
     command_tx: async_channel::Sender<AcpCommand>,
     runtime: Mutex<ExternalAgentRuntime>,
     status_tx: watch::Sender<AgentStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ExternalAgentIdentity {
+    pub(super) harness: String,
+    pub(super) model: Option<String>,
 }
 
 #[derive(Default)]
@@ -81,6 +88,10 @@ impl ExternalAgentManager {
         let (status_tx, _) = watch::channel(AgentStatus::PendingInit);
         let (command_tx, command_rx) = async_channel::unbounded();
         let agent = Arc::new(ExternalAgent {
+            identity: ExternalAgentIdentity {
+                harness: backend.harness.clone(),
+                model: backend.model.clone(),
+            },
             command_tx,
             runtime: Mutex::new(ExternalAgentRuntime::default()),
             status_tx: status_tx.clone(),
@@ -116,6 +127,10 @@ impl ExternalAgentManager {
     pub(super) fn status(&self, agent_id: ThreadId) -> Option<AgentStatus> {
         self.agent(agent_id)
             .map(|agent| agent.status_tx.borrow().clone())
+    }
+
+    pub(super) fn identity(&self, agent_id: ThreadId) -> Option<ExternalAgentIdentity> {
+        self.agent(agent_id).map(|agent| agent.identity.clone())
     }
 
     pub(super) fn subscribe(&self, agent_id: ThreadId) -> Option<watch::Receiver<AgentStatus>> {

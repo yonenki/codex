@@ -177,6 +177,12 @@ impl AgentNavigationState {
         self.set_running(thread_id, /*is_running*/ true);
     }
 
+    pub(crate) fn mark_running_hint(&mut self, thread_id: ThreadId) {
+        if !self.stopped_threads.contains(&thread_id) {
+            self.set_running(thread_id, /*is_running*/ true);
+        }
+    }
+
     pub(crate) fn mark_stopped(&mut self, thread_id: ThreadId) {
         self.stopped_threads.insert(thread_id);
         self.set_running(thread_id, /*is_running*/ false);
@@ -247,6 +253,15 @@ impl AgentNavigationState {
         self.threads
             .keys()
             .any(|thread_id| Some(*thread_id) != primary_thread_id)
+    }
+
+    pub(crate) fn running_subagent_count(&self, primary_thread_id: Option<ThreadId>) -> usize {
+        self.threads
+            .iter()
+            .filter(|(thread_id, entry)| {
+                Some(**thread_id) != primary_thread_id && entry.is_running && !entry.is_closed
+            })
+            .count()
     }
 
     /// Returns live picker rows in the same order users cycle through them.
@@ -421,6 +436,28 @@ mod tests {
         );
 
         (state, main_thread_id, first_agent_id, second_agent_id)
+    }
+
+    #[test]
+    fn running_subagent_count_ignores_primary_and_rejects_delayed_revival() {
+        let primary = ThreadId::new();
+        let child = ThreadId::new();
+        let mut state = AgentNavigationState::default();
+        state.upsert(primary, None, None, /*is_closed*/ false);
+        state.upsert(child, None, None, /*is_closed*/ false);
+        state.mark_running(primary);
+        state.mark_running_hint(child);
+        assert_eq!(state.running_subagent_count(Some(primary)), 1);
+
+        state.mark_stopped(child);
+        assert_eq!(state.running_subagent_count(Some(primary)), 0);
+        state.mark_running_hint(child);
+        assert_eq!(state.running_subagent_count(Some(primary)), 0);
+
+        state.mark_running(child);
+        assert_eq!(state.running_subagent_count(Some(primary)), 1);
+        state.mark_closed(child);
+        assert_eq!(state.running_subagent_count(Some(primary)), 0);
     }
 
     #[test]

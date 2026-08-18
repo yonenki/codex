@@ -70,3 +70,30 @@ fn bounds_acp_result_for_parent_context() {
         AgentStatus::Completed(Some(output)) if output.len() < response.len()
     ));
 }
+
+#[tokio::test]
+async fn registration_publishes_immutable_backend_identity_before_harness_startup() {
+    let manager = ExternalAgentManager::default();
+    let agent_id = ThreadId::new();
+    manager
+        .register(
+            agent_id,
+            ResolvedExternalAgentBackend {
+                harness: "cursor".to_string(),
+                model: Some("cursor-grok-4.6-high".to_string()),
+                command: "missing-acp-host-for-identity-test".to_string(),
+                args: Vec::new(),
+            },
+            std::env::current_dir().expect("current dir"),
+            HashMap::new(),
+        )
+        .expect("register external agent");
+
+    assert_eq!(
+        manager.identity(agent_id),
+        Some(ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        })
+    );
+}

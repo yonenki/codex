@@ -456,6 +456,10 @@ impl App {
     }
 
     pub(super) fn refresh_status_line(&mut self) {
+        self.chat_widget.set_status_line_subagent_count(
+            self.agent_navigation
+                .running_subagent_count(self.primary_thread_id),
+        );
         self.chat_widget.refresh_status_line();
     }
 }

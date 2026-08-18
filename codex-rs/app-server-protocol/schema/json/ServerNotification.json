@@ -3695,6 +3695,67 @@
         }
       ]
     },
+    "SubAgentTerminalNotification": {
+      "description": "Live terminal transition for a direct child sub-agent. This notification is intentionally not represented as a thread item and is not replayed from thread history.",
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentThreadId": {
+          "type": "string"
+        },
+        "harness": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/SubAgentTerminalStatus"
+        },
+        "threadId": {
+          "description": "Parent thread receiving this live notification.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agentThreadId",
+        "status",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "SubAgentTerminalStatus": {
+      "enum": [
+        "completed",
+        "errored",
+        "interrupted"
+      ],
+      "type": "string"
+    },
     "TerminalInteractionNotification": {
       "properties": {
         "itemId": {
@@ -4650,11 +4711,25 @@
             "agentThreadId": {
               "type": "string"
             },
+            "harness": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "id": {
               "type": "string"
             },
             "kind": {
               "$ref": "#/definitions/SubAgentActivityKind"
+            },
+            "model": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "enum": [
@@ -6100,6 +6175,26 @@
         "params"
       ],
       "title": "ErrorNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "thread/subagent/terminal"
+          ],
+          "title": "Thread/subagent/terminalNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/SubAgentTerminalNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/subagent/terminalNotification",
       "type": "object"
     },
     {

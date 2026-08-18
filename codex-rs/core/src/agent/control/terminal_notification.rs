@@ -77,6 +77,7 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
     let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
         return;
     };
+    let external_identity = control.external_agents.identity(child_thread_id);
 
     let event = Event {
         id: child_thread_id.to_string(),
@@ -85,6 +86,10 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
             agent_path: Some(agent_path),
             agent_nickname: metadata.agent_nickname,
             agent_role: metadata.agent_role,
+            harness: external_identity
+                .as_ref()
+                .map(|identity| identity.harness.clone()),
+            model: external_identity.and_then(|identity| identity.model),
             status,
         }),
     };
