@@ -953,6 +953,123 @@ async fn external_queue_only_message_does_not_invoke_start_hook() {
     );
 }
 
+async fn cancel_external_submission_before_start(control: &AgentControl, agent_id: ThreadId) {
+    let (hook_entered_tx, hook_entered_rx) = tokio::sync::oneshot::channel();
+    let task_control = control.clone();
+    let task = tokio::spawn(async move {
+        task_control
+            .send_external_inter_agent_communication_with_start_hook(
+                agent_id,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::root().join("worker").expect("worker path"),
+                    Vec::new(),
+                    "cancelled follow-up".to_string(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+                move || async move {
+                    let _ = hook_entered_tx.send(());
+                    std::future::pending::<()>().await;
+                },
+            )
+            .await
+    });
+    hook_entered_rx.await.expect("start hook should be entered");
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("cancelled submission task should not complete")
+            .is_cancelled()
+    );
+}
+
+async fn start_followup_and_wait_for_test_harness_terminal(
+    control: &AgentControl,
+    agent_id: ThreadId,
+) -> AgentStatus {
+    let mut status_rx = control
+        .subscribe_status(agent_id)
+        .await
+        .expect("external status subscription");
+    let (_, requests_turn) = control
+        .send_external_inter_agent_communication_with_start_hook(
+            agent_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "next follow-up".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            || std::future::ready(()),
+        )
+        .await
+        .expect("next follow-up should start");
+    assert!(requests_turn);
+    loop {
+        let status = status_rx.borrow().clone();
+        if is_final(&status) {
+            return status;
+        }
+        status_rx
+            .changed()
+            .await
+            .expect("test harness terminal status");
+    }
+}
+
+#[tokio::test]
+async fn external_immediate_reservation_rolls_back_when_start_hook_is_cancelled() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+
+    cancel_external_submission_before_start(&control, agent_id).await;
+    assert_eq!(control.get_status(agent_id).await, AgentStatus::PendingInit);
+
+    assert_matches!(
+        start_followup_and_wait_for_test_harness_terminal(&control, agent_id).await,
+        AgentStatus::Errored(_)
+    );
+}
+
+#[tokio::test]
+async fn external_queued_reservation_rolls_back_when_start_hook_is_cancelled() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+    control.external_agents.begin_turn_for_tests(agent_id);
+
+    cancel_external_submission_before_start(&control, agent_id).await;
+    control.external_agents.finish_turn_for_tests(
+        agent_id,
+        AgentStatus::Completed(Some("current turn done".to_string())),
+    );
+    assert_matches!(
+        control.get_status(agent_id).await,
+        AgentStatus::Completed(_)
+    );
+
+    assert_matches!(
+        start_followup_and_wait_for_test_harness_terminal(&control, agent_id).await,
+        AgentStatus::Errored(_)
+    );
+}
+
 #[tokio::test]
 async fn spawn_agent_errors_when_manager_dropped() {
     let control = AgentControl::default();

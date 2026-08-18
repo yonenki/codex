@@ -69,13 +69,19 @@ struct QueuedMessage {
 pub(super) struct ExternalMessageSubmission {
     submission_id: String,
     agent: Arc<ExternalAgent>,
-    action: ExternalMessageSubmissionAction,
+    action: Option<ExternalMessageSubmissionAction>,
 }
 
 enum ExternalMessageSubmissionAction {
     QueueOnly,
-    StartTurn { prompt: String, generation: u64 },
-    ReleaseQueuedTurn { submission_id: String },
+    StartTurn {
+        queued_messages: VecDeque<QueuedMessage>,
+        content: String,
+        generation: u64,
+    },
+    ReleaseQueuedTurn {
+        submission_id: String,
+    },
 }
 
 impl ExternalMessageSubmission {
@@ -84,17 +90,52 @@ impl ExternalMessageSubmission {
     }
 
     pub(super) fn requests_turn(&self) -> bool {
-        !matches!(self.action, ExternalMessageSubmissionAction::QueueOnly)
+        matches!(
+            self.action.as_ref(),
+            Some(
+                ExternalMessageSubmissionAction::StartTurn { .. }
+                    | ExternalMessageSubmissionAction::ReleaseQueuedTurn { .. }
+            )
+        )
     }
 
-    pub(super) fn start(self) {
-        match self.action {
+    pub(super) fn start(mut self) {
+        let Some(action) = self.action.take() else {
+            return;
+        };
+        match action {
             ExternalMessageSubmissionAction::QueueOnly => {}
-            ExternalMessageSubmissionAction::StartTurn { prompt, generation } => {
-                start_turn(self.agent, prompt, generation);
+            ExternalMessageSubmissionAction::StartTurn {
+                mut queued_messages,
+                content,
+                generation,
+            } => {
+                let prompt = prepend_queued_messages(&mut queued_messages, content);
+                start_turn(Arc::clone(&self.agent), prompt, generation);
             }
             ExternalMessageSubmissionAction::ReleaseQueuedTurn { submission_id } => {
-                release_queued_turn(self.agent, &submission_id);
+                release_queued_turn(Arc::clone(&self.agent), &submission_id);
+            }
+        }
+    }
+}
+
+impl Drop for ExternalMessageSubmission {
+    fn drop(&mut self) {
+        let Some(action) = self.action.take() else {
+            return;
+        };
+        match action {
+            ExternalMessageSubmissionAction::QueueOnly => {}
+            ExternalMessageSubmissionAction::StartTurn {
+                queued_messages,
+                generation,
+                ..
+            } => {
+                rollback_reserved_turn(Arc::clone(&self.agent), queued_messages, generation);
+            }
+            ExternalMessageSubmissionAction::ReleaseQueuedTurn { submission_id } => {
+                rollback_queued_turn(Arc::clone(&self.agent), &submission_id);
             }
         }
     }
@@ -209,6 +250,31 @@ impl ExternalAgentManager {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn begin_turn_for_tests(&self, agent_id: ThreadId) {
+        if let Some(agent) = self.agent(agent_id) {
+            let mut runtime = agent
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            runtime.running = true;
+            runtime.generation = runtime.generation.wrapping_add(1);
+            agent.status_tx.send_replace(AgentStatus::Running);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_turn_for_tests(&self, agent_id: ThreadId, status: AgentStatus) {
+        if let Some(agent) = self.agent(agent_id) {
+            let generation = agent
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .generation;
+            finish_turn(agent, generation, status);
+        }
+    }
+
     pub(super) fn subscribe(&self, agent_id: ThreadId) -> Option<watch::Receiver<AgentStatus>> {
         self.agent(agent_id)
             .map(|agent| agent.status_tx.subscribe())
@@ -251,7 +317,8 @@ impl ExternalAgentManager {
                 runtime.running = true;
                 runtime.generation = runtime.generation.wrapping_add(1);
                 ExternalMessageSubmissionAction::StartTurn {
-                    prompt: prepend_queued_messages(&mut runtime.queued_messages, content),
+                    queued_messages: runtime.queued_messages.drain(..).collect(),
+                    content,
                     generation: runtime.generation,
                 }
             }
@@ -259,7 +326,7 @@ impl ExternalAgentManager {
         Ok(ExternalMessageSubmission {
             submission_id,
             agent,
-            action,
+            action: Some(action),
         })
     }
 
@@ -341,6 +408,48 @@ fn release_queued_turn(agent: Arc<ExternalAgent>, submission_id: &str) {
             .find(|message| message.submission_id.as_deref() == Some(submission_id))
         {
             message.ready_to_start = true;
+        }
+        take_ready_queued_turn(&mut runtime)
+    };
+    if let Some((prompt, generation)) = turn {
+        start_turn(agent, prompt, generation);
+    }
+}
+
+fn rollback_queued_turn(agent: Arc<ExternalAgent>, submission_id: &str) {
+    let turn = {
+        let mut runtime = agent
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(position) = runtime
+            .queued_messages
+            .iter()
+            .position(|message| message.submission_id.as_deref() == Some(submission_id))
+        {
+            runtime.queued_messages.remove(position);
+        }
+        take_ready_queued_turn(&mut runtime)
+    };
+    if let Some((prompt, generation)) = turn {
+        start_turn(agent, prompt, generation);
+    }
+}
+
+fn rollback_reserved_turn(
+    agent: Arc<ExternalAgent>,
+    mut queued_messages: VecDeque<QueuedMessage>,
+    generation: u64,
+) {
+    let turn = {
+        let mut runtime = agent
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if runtime.running && runtime.generation == generation && runtime.active_task.is_none() {
+            runtime.running = false;
+            queued_messages.append(&mut runtime.queued_messages);
+            runtime.queued_messages = queued_messages;
         }
         take_ready_queued_turn(&mut runtime)
     };
