@@ -953,9 +953,18 @@ async fn external_queue_only_message_does_not_invoke_start_hook() {
     );
 }
 
-async fn cancel_external_submission_before_start(control: &AgentControl, agent_id: ThreadId) {
+async fn hold_external_submission_before_start(
+    control: &AgentControl,
+    agent_id: ThreadId,
+    message: &str,
+) -> (
+    tokio::task::JoinHandle<CodexResult<(String, bool)>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let (hook_entered_tx, hook_entered_rx) = tokio::sync::oneshot::channel();
+    let (release_hook_tx, release_hook_rx) = tokio::sync::oneshot::channel();
     let task_control = control.clone();
+    let message = message.to_string();
     let task = tokio::spawn(async move {
         task_control
             .send_external_inter_agent_communication_with_start_hook(
@@ -964,18 +973,24 @@ async fn cancel_external_submission_before_start(control: &AgentControl, agent_i
                     AgentPath::root(),
                     AgentPath::root().join("worker").expect("worker path"),
                     Vec::new(),
-                    "cancelled follow-up".to_string(),
+                    message,
                     /*trigger_turn*/ true,
                 ),
                 AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
                 move || async move {
                     let _ = hook_entered_tx.send(());
-                    std::future::pending::<()>().await;
+                    let _ = release_hook_rx.await;
                 },
             )
             .await
     });
     hook_entered_rx.await.expect("start hook should be entered");
+    (task, release_hook_tx)
+}
+
+async fn cancel_external_submission_before_start(control: &AgentControl, agent_id: ThreadId) {
+    let (task, _release_hook) =
+        hold_external_submission_before_start(control, agent_id, "cancelled follow-up").await;
     task.abort();
     assert!(
         task.await
@@ -1062,6 +1077,124 @@ async fn external_queued_reservation_rolls_back_when_start_hook_is_cancelled() {
     assert_matches!(
         control.get_status(agent_id).await,
         AgentStatus::Completed(_)
+    );
+
+    assert_matches!(
+        start_followup_and_wait_for_test_harness_terminal(&control, agent_id).await,
+        AgentStatus::Errored(_)
+    );
+}
+
+async fn setup_crossed_queued_reservations() -> (
+    AgentControl,
+    ThreadId,
+    tokio::task::JoinHandle<CodexResult<(String, bool)>>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<CodexResult<(String, bool)>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+    control.external_agents.begin_turn_for_tests(agent_id);
+    let (first_task, first_release) =
+        hold_external_submission_before_start(&control, agent_id, "follow-up A").await;
+    control.external_agents.finish_turn_for_tests(
+        agent_id,
+        AgentStatus::Completed(Some("current turn done".to_string())),
+    );
+    let (second_task, second_release) =
+        hold_external_submission_before_start(&control, agent_id, "follow-up B").await;
+    assert_eq!(
+        control
+            .external_agents
+            .queued_message_contents_for_tests(agent_id),
+        vec!["follow-up A".to_string(), "follow-up B".to_string()]
+    );
+    (
+        control,
+        agent_id,
+        first_task,
+        first_release,
+        second_task,
+        second_release,
+    )
+}
+
+#[tokio::test]
+async fn crossed_queued_reservation_keeps_second_commit_after_first_is_cancelled() {
+    let (control, agent_id, first_task, _first_release, second_task, second_release) =
+        setup_crossed_queued_reservations().await;
+
+    first_task.abort();
+    assert!(
+        first_task
+            .await
+            .expect_err("first reservation should be cancelled")
+            .is_cancelled()
+    );
+    assert_eq!(
+        control
+            .external_agents
+            .queued_message_contents_for_tests(agent_id),
+        vec!["follow-up B".to_string()]
+    );
+
+    second_release
+        .send(())
+        .expect("release second reservation hook");
+    let (_, requests_turn) = second_task
+        .await
+        .expect("second reservation task")
+        .expect("second reservation should commit");
+    assert!(requests_turn);
+    let mut status_rx = control
+        .subscribe_status(agent_id)
+        .await
+        .expect("external status subscription");
+    let status = loop {
+        let status = status_rx.borrow().clone();
+        if is_final(&status) {
+            break status;
+        }
+        status_rx
+            .changed()
+            .await
+            .expect("test harness terminal status");
+    };
+    assert_matches!(status, AgentStatus::Errored(_));
+}
+
+#[tokio::test]
+async fn crossed_queued_reservations_do_not_block_followup_after_both_are_cancelled() {
+    let (control, agent_id, first_task, _first_release, second_task, _second_release) =
+        setup_crossed_queued_reservations().await;
+
+    first_task.abort();
+    assert!(
+        first_task
+            .await
+            .expect_err("first reservation should be cancelled")
+            .is_cancelled()
+    );
+    second_task.abort();
+    assert!(
+        second_task
+            .await
+            .expect_err("second reservation should be cancelled")
+            .is_cancelled()
+    );
+    assert!(
+        control
+            .external_agents
+            .queued_message_contents_for_tests(agent_id)
+            .is_empty()
     );
 
     assert_matches!(

@@ -275,6 +275,22 @@ impl ExternalAgentManager {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn queued_message_contents_for_tests(&self, agent_id: ThreadId) -> Vec<String> {
+        self.agent(agent_id)
+            .map(|agent| {
+                agent
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .queued_messages
+                    .iter()
+                    .map(|message| message.content.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(super) fn subscribe(&self, agent_id: ThreadId) -> Option<watch::Receiver<AgentStatus>> {
         self.agent(agent_id)
             .map(|agent| agent.status_tx.subscribe())
@@ -303,7 +319,12 @@ impl ExternalAgentManager {
                     ready_to_start: true,
                 });
                 ExternalMessageSubmissionAction::QueueOnly
-            } else if runtime.running {
+            } else if runtime.running
+                || runtime
+                    .queued_messages
+                    .iter()
+                    .any(|message| message.trigger_turn)
+            {
                 runtime.queued_messages.push_back(QueuedMessage {
                     content,
                     trigger_turn,
