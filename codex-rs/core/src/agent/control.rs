@@ -50,6 +50,7 @@ use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::ReadThreadParams;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -126,6 +127,7 @@ pub(crate) struct AgentControl {
     state: Arc<AgentRegistry>,
     external_agents: Arc<external::ExternalAgentManager>,
     external_backend_routes: Arc<Mutex<HashMap<ThreadId, ExternalBackendRoute>>>,
+    external_completion_watchers: Arc<Mutex<HashSet<ThreadId>>>,
     v2_residency: Arc<V2Residency>,
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
@@ -147,6 +149,15 @@ impl AgentControl {
         self.external_agents.contains(agent_id)
     }
 
+    pub(crate) fn external_backend_identity(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<(String, Option<String>)> {
+        self.external_agents
+            .identity(agent_id)
+            .map(|identity| (identity.harness, identity.model))
+    }
+
     /// Construct a new `AgentControl` that can spawn/message agents via the given manager state.
     pub(crate) fn new(
         manager: Weak<ThreadManagerState>,
@@ -160,6 +171,7 @@ impl AgentControl {
             state: Arc::default(),
             external_agents: Arc::default(),
             external_backend_routes: Arc::default(),
+            external_completion_watchers: Arc::default(),
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
@@ -678,9 +690,39 @@ impl AgentControl {
         child_reference: String,
         child_agent_path: Option<AgentPath>,
     ) {
+        if self.is_external_agent(child_thread_id) {
+            let mut watchers = self
+                .external_completion_watchers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !watchers.insert(child_thread_id) {
+                return;
+            }
+        }
         let control = self.clone();
         tokio::spawn(async move {
             let is_external = control.is_external_agent(child_thread_id);
+            struct ClearExternalWatcher {
+                control: AgentControl,
+                child_thread_id: ThreadId,
+                is_external: bool,
+            }
+            impl Drop for ClearExternalWatcher {
+                fn drop(&mut self) {
+                    if self.is_external {
+                        self.control
+                            .external_completion_watchers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&self.child_thread_id);
+                    }
+                }
+            }
+            let _clear_external_watcher = ClearExternalWatcher {
+                control: control.clone(),
+                child_thread_id,
+                is_external,
+            };
             // Native V2 turns emit the live terminal transition from Session so it is adjacent
             // to the typed terminal turn event. Legacy native agents and ACP agents use this
             // watcher as their transition source instead. A missing native child is treated as
@@ -705,29 +747,40 @@ impl AgentControl {
                 Ok(mut status_rx) => {
                     let mut status = status_rx.borrow().clone();
                     loop {
+                        let should_notify = terminal_status_tracker.should_notify(&status);
+                        if should_notify && !native_v2 {
+                            control
+                                .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
+                                .await;
+                        }
                         if matches!(status, AgentStatus::Interrupted) {
-                            if terminal_status_tracker.should_notify(&status) && !native_v2 {
-                                control
-                                    .maybe_notify_parent_of_terminal_status(
-                                        child_thread_id,
-                                        &status,
-                                    )
-                                    .await;
-                            }
                             // ACP agents finish their current lifecycle at interruption. Legacy
                             // native agents remain watchable and may transition back to Running.
                             if is_external {
                                 return;
                             }
                         } else {
-                            let should_notify = terminal_status_tracker.should_notify(&status);
-                            if should_notify && !native_v2 {
-                                control
-                                    .maybe_notify_parent_of_terminal_status(
-                                        child_thread_id,
-                                        &status,
-                                    )
-                                    .await;
+                            let keep_watching_external = is_external
+                                && is_final(&status)
+                                && !matches!(status, AgentStatus::Shutdown);
+                            if should_notify && keep_watching_external {
+                                if let Some(child_agent_path) = child_agent_path.clone() {
+                                    control
+                                        .forward_v2_child_completion_to_parent(
+                                            child_thread_id,
+                                            parent_thread_id,
+                                            child_agent_path,
+                                            &status,
+                                        )
+                                        .await;
+                                }
+                            }
+                            if keep_watching_external {
+                                if status_rx.changed().await.is_err() {
+                                    return;
+                                }
+                                status = status_rx.borrow().clone();
+                                continue;
                             }
                         }
 
@@ -776,38 +829,12 @@ impl AgentControl {
                 let Some(child_agent_path) = child_agent_path.clone() else {
                     return;
                 };
-                let Some(parent_agent_path) = child_agent_path
-                    .as_str()
-                    .rsplit_once('/')
-                    .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
-                else {
-                    return;
-                };
-                let Some(message) = format_inter_agent_completion_message(
-                    parent_agent_path.clone(),
-                    child_agent_path.clone(),
-                    &status,
-                ) else {
-                    return;
-                };
-                // Terminal results request a parent turn so an idle parent
-                // resumes without wait_agent or new user input.
-                let communication = InterAgentCommunication::new(
-                    child_agent_path,
-                    parent_agent_path,
-                    Vec::new(),
-                    message,
-                    /*trigger_turn*/ true,
-                );
-                let context =
-                    AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
-                let _ = control
-                    .send_inter_agent_communication(
+                control
+                    .forward_v2_child_completion_to_parent(
+                        child_thread_id,
                         parent_thread_id,
-                        communication,
-                        context,
-                        /*parent_turn_id*/ None,
-                        /*root_turn_id*/ None,
+                        child_agent_path,
+                        &status,
                     )
                     .await;
                 return;
@@ -820,6 +847,49 @@ impl AgentControl {
                 .inject_user_message_without_turn(message)
                 .await;
         });
+    }
+
+    async fn forward_v2_child_completion_to_parent(
+        &self,
+        child_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        child_agent_path: AgentPath,
+        status: &AgentStatus,
+    ) {
+        let Some(parent_agent_path) = child_agent_path
+            .as_str()
+            .rsplit_once('/')
+            .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
+        else {
+            return;
+        };
+        let Some(message) = format_inter_agent_completion_message(
+            parent_agent_path.clone(),
+            child_agent_path.clone(),
+            status,
+        ) else {
+            return;
+        };
+        // Terminal results request a parent turn so an idle parent
+        // resumes without wait_agent or new user input.
+        let communication = InterAgentCommunication::new(
+            child_agent_path,
+            parent_agent_path,
+            Vec::new(),
+            message,
+            /*trigger_turn*/ true,
+        );
+        let context =
+            AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
+        let _ = self
+            .send_inter_agent_communication(
+                parent_thread_id,
+                communication,
+                context,
+                /*parent_turn_id*/ None,
+                /*root_turn_id*/ None,
+            )
+            .await;
     }
 
     fn maybe_start_external_completion_watcher(&self, child_thread_id: ThreadId) {

@@ -1068,7 +1068,12 @@ impl App {
         if let Some(activity) =
             sub_agent_activity_item(notification).and_then(sub_agent_activity_display)
         {
+            let started = activity.is_running_hint;
+            let thread_id = activity.thread_id;
             self.agent_navigation.record_sub_agent_activity(activity);
+            if started {
+                self.agent_navigation.mark_running(thread_id);
+            }
             self.sync_active_agent_label();
             self.refresh_status_line();
             return;

@@ -630,6 +630,13 @@ async fn deliver(
         )
         .await
         .map_err(|error| collab_agent_error(agent_id, error))?;
+    let (kind, harness, model) = followup_activity(
+        mode.trigger_turn(),
+        session
+            .services
+            .agent_control
+            .external_backend_identity(agent_id),
+    );
     emit_sub_agent_activity(
         &session,
         turn,
@@ -637,11 +644,26 @@ async fn deliver(
             id: call_id,
             agent_thread_id: agent_id,
             agent_path,
-            kind: SubAgentActivityKind::Interacted,
-            harness: None,
-            model: None,
+            kind,
+            harness,
+            model,
         },
     )
     .await;
     Ok(FunctionToolOutput::from_text(String::new(), Some(true)))
+}
+
+fn followup_activity(
+    trigger_turn: bool,
+    identity: Option<(String, Option<String>)>,
+) -> (SubAgentActivityKind, Option<String>, Option<String>) {
+    if trigger_turn {
+        let (harness, model) = match identity {
+            Some((harness, model)) => (Some(harness), model),
+            None => (None, None),
+        };
+        (SubAgentActivityKind::Started, harness, model)
+    } else {
+        (SubAgentActivityKind::Interacted, None, None)
+    }
 }

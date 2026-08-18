@@ -200,3 +200,42 @@ fn spawn_output_reports_first_fallback_explicit_and_default_model() {
         json!({"task_name": "/root/worker", "harness": "cursor", "model": null})
     );
 }
+
+#[test]
+fn triggered_followup_starts_activity_with_backend_identity() {
+    assert_eq!(
+        followup_activity(
+            /*trigger_turn*/ true,
+            Some((
+                "cursor".to_string(),
+                Some("cursor-grok-4.6-high".to_string())
+            )),
+        ),
+        (
+            SubAgentActivityKind::Started,
+            Some("cursor".to_string()),
+            Some("cursor-grok-4.6-high".to_string()),
+        )
+    );
+    assert_eq!(
+        followup_activity(
+            /*trigger_turn*/ true,
+            Some(("grok-build".to_string(), None))
+        ),
+        (
+            SubAgentActivityKind::Started,
+            Some("grok-build".to_string()),
+            None,
+        )
+    );
+    assert_eq!(
+        followup_activity(
+            /*trigger_turn*/ false,
+            Some((
+                "cursor".to_string(),
+                Some("cursor-grok-4.6-high".to_string())
+            )),
+        ),
+        (SubAgentActivityKind::Interacted, None, None)
+    );
+}

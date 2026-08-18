@@ -133,6 +133,29 @@ impl ExternalAgentManager {
         self.agent(agent_id).map(|agent| agent.identity.clone())
     }
 
+    #[cfg(test)]
+    pub(super) fn register_for_tests(&self, agent_id: ThreadId, identity: ExternalAgentIdentity) {
+        let (status_tx, _) = watch::channel(AgentStatus::PendingInit);
+        let (command_tx, _command_rx) = async_channel::unbounded();
+        let agent = Arc::new(ExternalAgent {
+            identity,
+            command_tx,
+            runtime: Mutex::new(ExternalAgentRuntime::default()),
+            status_tx,
+        });
+        self.agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(agent_id, agent);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_status_for_tests(&self, agent_id: ThreadId, status: AgentStatus) {
+        if let Some(agent) = self.agent(agent_id) {
+            agent.status_tx.send_replace(status);
+        }
+    }
+
     pub(super) fn subscribe(&self, agent_id: ThreadId) -> Option<watch::Receiver<AgentStatus>> {
         self.agent(agent_id)
             .map(|agent| agent.status_tx.subscribe())

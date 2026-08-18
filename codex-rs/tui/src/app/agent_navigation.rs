@@ -456,6 +456,13 @@ mod tests {
 
         state.mark_running(child);
         assert_eq!(state.running_subagent_count(Some(primary)), 1);
+        state.mark_stopped(child);
+        assert_eq!(state.running_subagent_count(Some(primary)), 0);
+        state.mark_running_hint(child);
+        assert_eq!(state.running_subagent_count(Some(primary)), 0);
+
+        state.mark_running(child);
+        assert_eq!(state.running_subagent_count(Some(primary)), 1);
         state.mark_closed(child);
         assert_eq!(state.running_subagent_count(Some(primary)), 0);
     }

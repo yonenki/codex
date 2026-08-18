@@ -812,6 +812,70 @@ async fn legacy_completion_watcher_notifies_terminal_transitions_once() {
 }
 
 #[tokio::test]
+async fn external_followup_emits_second_terminal_with_backend_identity() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "reviewer",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        },
+    );
+    harness.control.start_completion_watcher(
+        child_thread_id,
+        parent_thread_id,
+        child_agent_path.to_string(),
+        Some(child_agent_path.clone()),
+    );
+
+    harness
+        .control
+        .external_agents
+        .set_status_for_tests(child_thread_id, AgentStatus::Running);
+    harness.control.external_agents.set_status_for_tests(
+        child_thread_id,
+        AgentStatus::Completed(Some("first done".to_string())),
+    );
+    let first = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(first[0].status, SubAgentTerminalStatus::Completed);
+    assert_eq!(first[0].harness.as_deref(), Some("cursor"));
+    assert_eq!(first[0].model.as_deref(), Some("cursor-grok-4.6-high"));
+
+    harness
+        .control
+        .external_agents
+        .set_status_for_tests(child_thread_id, AgentStatus::Running);
+    // Let the completion watcher observe Running and clear the duplicate-terminal
+    // guard before the second Completed arrives.
+    sleep(Duration::from_millis(25)).await;
+    harness.control.external_agents.set_status_for_tests(
+        child_thread_id,
+        AgentStatus::Completed(Some("second done".to_string())),
+    );
+    let second = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(second[0].status, SubAgentTerminalStatus::Completed);
+    assert_eq!(second[0].harness.as_deref(), Some("cursor"));
+    assert_eq!(second[0].model.as_deref(), Some("cursor-grok-4.6-high"));
+    assert_eq!(second[0].agent_path, Some(child_agent_path));
+}
+
+#[tokio::test]
 async fn spawn_agent_errors_when_manager_dropped() {
     let control = AgentControl::default();
     let (_home, config) = test_config().await;

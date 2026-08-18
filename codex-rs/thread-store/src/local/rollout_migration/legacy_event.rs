@@ -204,8 +204,8 @@ pub(super) fn completed_item(
                 kind: event.kind,
                 agent_thread_id: event.agent_thread_id,
                 agent_path: event.agent_path.clone(),
-                harness: None,
-                model: None,
+                harness: event.harness.clone(),
+                model: event.model.clone(),
             }),
             None,
         )),
@@ -255,4 +255,43 @@ pub(super) fn completed_item(
         _ => None,
     };
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::completed_item;
+    use crate::ThreadStoreResult;
+    use codex_protocol::AgentPath;
+    use codex_protocol::ThreadId;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::SubAgentActivityEvent;
+    use codex_protocol::protocol::SubAgentActivityKind;
+
+    #[test]
+    fn completed_item_preserves_sub_agent_activity_backend_identity() {
+        let agent_thread_id = ThreadId::new();
+        let event = EventMsg::SubAgentActivity(SubAgentActivityEvent {
+            event_id: "activity-1".to_string(),
+            occurred_at_ms: 0,
+            agent_thread_id,
+            agent_path: AgentPath::root().join("worker").expect("worker path"),
+            harness: Some("cursor".to_string()),
+            model: Some("cursor-grok-4.6-high".to_string()),
+            kind: SubAgentActivityKind::Started,
+        });
+        let mut next_item_id = || -> ThreadStoreResult<String> { Ok("unused".to_string()) };
+        let (item, turn_id) = completed_item(&event, &mut next_item_id)
+            .expect("legacy conversion")
+            .expect("sub-agent activity should migrate");
+        assert_eq!(turn_id, None);
+        let TurnItem::SubAgentActivity(activity) = item else {
+            panic!("expected sub-agent activity item");
+        };
+        assert_eq!(activity.id, "activity-1");
+        assert_eq!(activity.agent_thread_id, agent_thread_id);
+        assert_eq!(activity.kind, SubAgentActivityKind::Started);
+        assert_eq!(activity.harness.as_deref(), Some("cursor"));
+        assert_eq!(activity.model.as_deref(), Some("cursor-grok-4.6-high"));
+    }
 }
