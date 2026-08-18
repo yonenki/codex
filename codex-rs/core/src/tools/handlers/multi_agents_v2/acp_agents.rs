@@ -494,12 +494,13 @@ async fn fallback_candidate_index(
 }
 
 fn ensure_fallback_source_terminal(status: AgentStatus) -> Result<(), FunctionCallError> {
-    match status {
-        AgentStatus::PendingInit | AgentStatus::Running => Err(FunctionCallError::RespondToModel(
+    if crate::agent::status::is_final(&status) {
+        Ok(())
+    } else {
+        Err(FunctionCallError::RespondToModel(
             "fallback source is still active; wait for a terminal result before retrying"
                 .to_string(),
-        )),
-        _ => Ok(()),
+        ))
     }
 }
 

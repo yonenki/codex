@@ -152,11 +152,17 @@ fn fallback_fails_after_last_pool_candidate() {
 
 #[test]
 fn fallback_requires_prior_candidate_to_reach_terminal_status() {
-    let error = ensure_fallback_source_terminal(AgentStatus::Running)
-        .expect_err("active source must not overlap with fallback");
-    assert!(
-        matches!(error, FunctionCallError::RespondToModel(message) if message.contains("still active"))
-    );
+    for status in [
+        AgentStatus::PendingInit,
+        AgentStatus::Running,
+        AgentStatus::Interrupted,
+    ] {
+        let error = ensure_fallback_source_terminal(status)
+            .expect_err("non-final source must not overlap with fallback");
+        assert!(
+            matches!(error, FunctionCallError::RespondToModel(message) if message.contains("still active"))
+        );
+    }
     ensure_fallback_source_terminal(AgentStatus::Completed(Some("done".to_string())))
         .expect("completed source may fall back");
 }
