@@ -168,7 +168,11 @@ fn apply_kind(state: &mut TeamSessionState, event: &TeamEvent) -> TeamRuntimeRes
         }
         TeamEventKind::ExternalWaitResolved => {
             state.waiting_reason = None;
-            state.lifecycle = TeamLifecycle::Running;
+            state.lifecycle = if state.agents.is_empty() {
+                TeamLifecycle::Running
+            } else {
+                TeamLifecycle::WaitingAgent
+            };
             Ok(())
         }
         TeamEventKind::TransitionRecommended

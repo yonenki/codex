@@ -204,12 +204,39 @@ async fn end_team_closes_session() {
         })
         .await
         .expect("start");
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+    let recorded = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("record result");
+    let transitioned = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .await
+        .expect("transition to terminal");
     let ended = control
         .end_team(EndTeamCommand {
             team_session_id: started.team_session_id.clone(),
             aborted: false,
             reason: "done".into(),
-            expected_revision: started.revision,
+            expected_revision: transitioned.revision,
         })
         .await
         .expect("end");
@@ -325,8 +352,8 @@ async fn closed_team_rejects_lifecycle_and_unstarted_node_completion() {
     let ended = control
         .end_team(EndTeamCommand {
             team_session_id: started.team_session_id.clone(),
-            aborted: false,
-            reason: "done".into(),
+            aborted: true,
+            reason: "aborted".into(),
             expected_revision: started.revision,
         })
         .await
@@ -340,6 +367,274 @@ async fn closed_team_rejects_lifecycle_and_unstarted_node_completion() {
         .await
         .expect_err("closed");
     assert!(matches!(err, TeamRuntimeError::ClosedTeam(_)));
+}
+
+#[tokio::test]
+async fn rejects_double_start_while_node_run_is_active() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+
+    // Second start on active uncompleted run must be rejected.
+    let err = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect_err("double start must fail");
+    assert!(matches!(err, TeamRuntimeError::ActiveNodeRunExists(_)));
+}
+
+#[tokio::test]
+async fn rejects_transition_before_node_result_completion() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+
+    // Transition before node started: rejected.
+    let err = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect_err("transition before node start");
+    assert!(matches!(err, TeamRuntimeError::NoCompletedNodeRun(_)));
+
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+
+    // Transition before record_result: rejected.
+    let err = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect_err("transition before record_result");
+    assert!(matches!(err, TeamRuntimeError::NoCompletedNodeRun(_)));
+
+    // After record_result, transition with matching result succeeds.
+    let recorded = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("record_result");
+    let transitioned = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .await
+        .expect("transition");
+    assert_eq!(
+        transitioned.current_node.unwrap().node_id.as_str(),
+        "completed"
+    );
+}
+
+#[tokio::test]
+async fn rejects_non_terminal_or_active_run_or_agent_end_team_without_abort() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+
+    // 1. Non-terminal node end_team(aborted: false) rejected.
+    let err = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: false,
+            reason: "done".into(),
+            expected_revision: started.revision,
+        })
+        .await
+        .expect_err("non-terminal end rejected");
+    assert!(matches!(err, TeamRuntimeError::NonTerminalNode { .. }));
+
+    // Move to terminal node "completed".
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let recorded = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("result");
+    let transitioned = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .await
+        .expect("transition");
+
+    // 2. Terminal node with active run: start_node on terminal node without record_result.
+    let terminal_run = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: transitioned.revision,
+        })
+        .await
+        .expect("terminal start_node");
+    let err = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: false,
+            reason: "done".into(),
+            expected_revision: terminal_run.revision,
+        })
+        .await
+        .expect_err("active run end rejected");
+    assert!(matches!(err, TeamRuntimeError::ActiveNodeRunExists(_)));
+
+    // Complete the terminal run.
+    let terminal_completed = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "done".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            expected_revision: terminal_run.revision,
+        })
+        .await
+        .expect("terminal result");
+
+    // Now end_team(aborted: false) on terminal with no active run succeeds.
+    let ended = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: false,
+            reason: "done".into(),
+            expected_revision: terminal_completed.revision,
+        })
+        .await
+        .expect("terminal end succeeded");
+    assert_eq!(ended.lifecycle, crate::state::TeamLifecycle::Completed);
+}
+
+#[tokio::test]
+async fn allows_aborted_end_team_mid_run() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    // Mid-run on non-terminal node with active run: aborted=true is allowed.
+    let aborted = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: true,
+            reason: "user requested abort".into(),
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("abort");
+    assert_eq!(aborted.lifecycle, crate::state::TeamLifecycle::Aborted);
+}
+
+#[tokio::test]
+async fn record_wait_entered_and_resolved_appends_trace_events() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+
+    let waited = control
+        .record_wait_entered(&started.team_session_id, "wait_agent:worker")
+        .await
+        .expect("wait entered");
+    assert_eq!(
+        waited.lifecycle,
+        crate::state::TeamLifecycle::WaitingExternal
+    );
+    assert_eq!(waited.waiting_reason.as_deref(), Some("wait_agent:worker"));
+
+    let resolved = control
+        .record_wait_resolved(&started.team_session_id, "wait_agent:worker")
+        .await
+        .expect("wait resolved");
+    assert_eq!(resolved.lifecycle, crate::state::TeamLifecycle::Running);
+    assert_eq!(resolved.waiting_reason, None);
 }
 
 #[tokio::test]

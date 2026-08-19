@@ -170,6 +170,7 @@ impl TeamStore for MemoryTeamStore {
     }
 }
 
+#[derive(Clone)]
 pub struct SqliteTeamStore {
     pool: SqlitePool,
 }

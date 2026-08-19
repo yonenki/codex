@@ -27,7 +27,7 @@ async fn sqlite_restores_team_node_and_binding() {
         })
         .await
         .expect("start");
-    let node = control
+    let _node = control
         .start_node(StartNodeCommand {
             team_session_id: started.team_session_id.clone(),
             node_id: None,
@@ -56,13 +56,6 @@ async fn sqlite_restores_team_node_and_binding() {
     assert_eq!(status.current_node.unwrap().node_id.as_str(), "work");
     let binding = restored.binding_for("thread-1").await.expect("binding");
     assert_eq!(binding.role, "worker");
-    assert_eq!(
-        binding.node_run_id,
-        node.current_node
-            .as_ref()
-            .and({ None })
-            .unwrap_or(binding.node_run_id.clone())
-    );
     assert!(!binding.node_run_id.as_str().is_empty());
 }
 
@@ -83,13 +76,70 @@ async fn outbox_replays_in_order_after_sink_failure() {
     let _ = control
         .end_team(EndTeamCommand {
             team_session_id: started.team_session_id.clone(),
-            aborted: false,
+            aborted: true,
             reason: "done".into(),
             expected_revision: started.revision,
         })
         .await;
-    // First event stayed in outbox because the sink failed.
+    // Events stayed in outbox because the sink failed twice.
     control.flush_outbox().await.expect("flush");
+}
+
+#[tokio::test]
+async fn same_process_recovery_flushes_outbox_batch_in_sequence_on_next_operation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = crate::SqliteTeamStore::open(&dir.path().join("outbox.sqlite"))
+        .await
+        .expect("open");
+    let recording = crate::RecordingSink::default();
+
+    // 1. Initial run with 1 failing sink attempt.
+    let control1 = TeamControl::with_store(catalog(), store, crate::FailingSink::fail_times(1));
+    // start_team attempts sink and fails, but commits to store/outbox.
+    let started = control1
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("task-1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start_team should succeed locally even if sink fails");
+
+    // 2. Simulate process startup with ensure_restored where sink fails on initial flush.
+    let store2 = crate::SqliteTeamStore::open(&dir.path().join("outbox.sqlite"))
+        .await
+        .expect("reopen");
+    let control2 = TeamControl::with_store(catalog(), store2, crate::FailingSink::fail_times(1));
+    control2
+        .ensure_restored()
+        .await
+        .expect("ensure_restored succeeds and swallows sink failure");
+
+    // 3. Now agent-collab is available (using recording sink). Next production team operation
+    // must flush the entire pending batch in sequence order without manual flush or restart.
+    let store3 = crate::SqliteTeamStore::open(&dir.path().join("outbox.sqlite"))
+        .await
+        .expect("reopen");
+    let control3 = TeamControl::with_store(catalog(), store3.clone(), recording);
+    control3
+        .ensure_restored()
+        .await
+        .expect("ensure_restored recovers and flushes pending outbox");
+
+    // start_node commits event sequence 2 and flushes all events (sequence 1 and 2).
+    let node = control3
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start_node");
+    assert_eq!(node.revision.get(), 2);
+
+    let pending = store3.pending_outbox().await.expect("pending");
+    assert!(pending.is_empty(), "outbox should be fully flushed");
 }
 
 #[tokio::test]

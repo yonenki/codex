@@ -451,10 +451,23 @@ impl TeamControl {
             command.team_session_id,
             command.expected_revision,
             |state| {
+                if let Some(run) = state.current_node_run.as_ref() {
+                    if run.completed_at.is_none() {
+                        return Err(TeamRuntimeError::ActiveNodeRunExists(
+                            state.team_session_id.clone(),
+                        ));
+                    }
+                }
                 let node_id = match command.node_id {
                     Some(id) => id.parse().map_err(TeamRuntimeError::invalid)?,
                     None => state.current_node_id.clone(),
                 };
+                if node_id != state.current_node_id {
+                    return Err(TeamRuntimeError::invalid(format!(
+                        "cannot start node '{node_id}' while current node is '{}'",
+                        state.current_node_id
+                    )));
+                }
                 let node = state
                     .graph
                     .node(&node_id)
@@ -555,6 +568,20 @@ impl TeamControl {
             command.team_session_id,
             command.expected_revision,
             |state| {
+                let run = state.current_node_run.as_ref().ok_or_else(|| {
+                    TeamRuntimeError::NoCompletedNodeRun(state.team_session_id.clone())
+                })?;
+                if run.completed_at.is_none() {
+                    return Err(TeamRuntimeError::NoCompletedNodeRun(
+                        state.team_session_id.clone(),
+                    ));
+                }
+                if run.result.as_deref() != Some(&command.result) {
+                    return Err(TeamRuntimeError::invalid(format!(
+                        "node completed with result '{:?}', cannot transition on '{}'",
+                        run.result, command.result
+                    )));
+                }
                 let node = state.graph.node(&state.current_node_id).ok_or_else(|| {
                     TeamRuntimeError::invalid("current node missing from graph snapshot")
                 })?;
@@ -604,6 +631,28 @@ impl TeamControl {
             command.team_session_id,
             command.expected_revision,
             |state| {
+                if !command.aborted {
+                    if !state.graph.is_terminal(&state.current_node_id) {
+                        return Err(TeamRuntimeError::NonTerminalNode {
+                            team: state.team_session_id.clone(),
+                            node: state.current_node_id.clone(),
+                        });
+                    }
+                    if state
+                        .current_node_run
+                        .as_ref()
+                        .is_some_and(|run| run.completed_at.is_none())
+                    {
+                        return Err(TeamRuntimeError::ActiveNodeRunExists(
+                            state.team_session_id.clone(),
+                        ));
+                    }
+                    if !state.agents.is_empty() {
+                        return Err(TeamRuntimeError::ActiveAgents(
+                            state.team_session_id.clone(),
+                        ));
+                    }
+                }
                 Ok(TeamEvent {
                     event_id: crate::ids::EventId::generate(),
                     team_session_id: state.team_session_id.clone(),
@@ -936,6 +985,40 @@ impl TeamControl {
         .await
     }
 
+    pub async fn record_wait_entered(
+        &self,
+        team_session_id: &TeamSessionId,
+        reason: &str,
+    ) -> TeamRuntimeResult<TeamView> {
+        self.mutate_without_cas(team_session_id.clone(), |state| {
+            Ok(event_from_state(
+                state,
+                TeamEventKind::ExternalWaitEntered,
+                TeamEventPayload::ExternalWait {
+                    reason: reason.to_string(),
+                },
+            ))
+        })
+        .await
+    }
+
+    pub async fn record_wait_resolved(
+        &self,
+        team_session_id: &TeamSessionId,
+        reason: &str,
+    ) -> TeamRuntimeResult<TeamView> {
+        self.mutate_without_cas(team_session_id.clone(), |state| {
+            Ok(event_from_state(
+                state,
+                TeamEventKind::ExternalWaitResolved,
+                TeamEventPayload::ExternalWait {
+                    reason: reason.to_string(),
+                },
+            ))
+        })
+        .await
+    }
+
     pub async fn flush_outbox(&self) -> TeamRuntimeResult<()> {
         let pending = self.store.pending_outbox().await?;
         if pending.is_empty() {
@@ -1026,13 +1109,10 @@ impl TeamControl {
             .persist_event(next.clone(), event.clone())
             .await?;
         *state = next;
-        if let Ok(()) = self.sink.publish(vec![event.clone()]).await {
-            let _ = self
-                .store
-                .mark_outbox_sent(vec![event.event_id.clone()])
-                .await;
+        match self.flush_outbox().await {
+            Ok(()) | Err(TeamRuntimeError::Sink(_)) => Ok(()),
+            Err(err) => Err(err),
         }
-        Ok(())
     }
 
     async fn refresh_surface(&self) {
@@ -1139,6 +1219,26 @@ fn next_actions(
     };
     let mut possible = Vec::new();
     let mut recommended = Vec::new();
+
+    if state.graph.is_terminal(&state.current_node_id) {
+        possible.push(NextAction {
+            tool: ToolCapability::EndTeam,
+            reason: "Close the completed team session.".to_string(),
+        });
+        if state.agents.is_empty()
+            && state
+                .current_node_run
+                .as_ref()
+                .is_none_or(|run| run.completed_at.is_some())
+        {
+            recommended.push(NextAction {
+                tool: ToolCapability::EndTeam,
+                reason: "Terminal node reached with no active runs or agents.".to_string(),
+            });
+            return (possible, recommended);
+        }
+    }
+
     if state.current_node_run.is_none() {
         possible.push(NextAction {
             tool: ToolCapability::StartTeamNode,

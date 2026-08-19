@@ -14,6 +14,17 @@ pub enum TeamRuntimeError {
     ClosedTeam(TeamSessionId),
     #[error("team session {0} has no active node run")]
     NoActiveNodeRun(TeamSessionId),
+    #[error("team session {0} already has an active node run")]
+    ActiveNodeRunExists(TeamSessionId),
+    #[error("team session {0} has no completed node run")]
+    NoCompletedNodeRun(TeamSessionId),
+    #[error("team session {team} is at non-terminal node '{node}'")]
+    NonTerminalNode {
+        team: TeamSessionId,
+        node: codex_team_graph::NodeId,
+    },
+    #[error("team session {0} still has active agents")]
+    ActiveAgents(TeamSessionId),
     #[error("role '{actual}' does not match node role '{expected}'")]
     RoleMismatch { expected: String, actual: String },
     #[error("team session {team} cannot reference {subject} from another team")]

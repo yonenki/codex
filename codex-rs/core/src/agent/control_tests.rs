@@ -5459,6 +5459,92 @@ async fn thread_manager_shares_persistent_team_control() {
     assert_eq!(status.task_ref.as_deref(), Some("issue/1"));
 }
 
+#[tokio::test]
+async fn root_coordinator_team_wait_traces_target_agent_wait_events() {
+    let harness = AgentControlHarness::new().await;
+    let team = harness.control.team();
+    team.replace_catalog(codex_team_graph::TeamGraphCatalog::new([
+        sample_team_graph(),
+    ]))
+    .await;
+
+    let started = team
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("task/root".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+
+    let node = team
+        .start_node(codex_team_runtime::StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+
+    // Root coordinator is not bound to any team.
+    let root_thread = ThreadId::new();
+    assert!(team.binding_snapshot(&root_thread.to_string()).is_none());
+
+    // Bind child agent to team.
+    let child_thread = ThreadId::new();
+    let pending = team
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending binding");
+    team.bind_agent_before_start(child_thread.to_string(), pending)
+        .await
+        .expect("bind child");
+
+    // Target validation under team authority.
+    team.require_same_team(&started.team_session_id, &child_thread.to_string())
+        .await
+        .expect("target belongs to team");
+    let unrelated_thread = ThreadId::new();
+    team.require_same_team(&started.team_session_id, &unrelated_thread.to_string())
+        .await
+        .expect_err("unrelated target rejected");
+
+    // Agent-target wait trace entered.
+    let waited = team
+        .record_wait_entered(&started.team_session_id, "wait_agent:worker")
+        .await
+        .expect("wait entered");
+    assert_eq!(
+        waited.lifecycle,
+        codex_team_runtime::TeamLifecycle::WaitingExternal
+    );
+    assert_eq!(waited.waiting_reason.as_deref(), Some("wait_agent:worker"));
+
+    // Agent-target wait trace resolved.
+    let resolved = team
+        .record_wait_resolved(&started.team_session_id, "wait_agent:worker")
+        .await
+        .expect("wait resolved");
+    // With child agent still attached, resolving external wait returns to WaitingAgent.
+    assert_eq!(
+        resolved.lifecycle,
+        codex_team_runtime::TeamLifecycle::WaitingAgent
+    );
+    assert_eq!(resolved.waiting_reason, None);
+
+    // Child completes.
+    team.record_agent_terminal(&child_thread.to_string(), "completed")
+        .await
+        .expect("child terminal");
+    let after_terminal = team.status(&started.team_session_id).await.expect("status");
+    assert_eq!(
+        after_terminal.lifecycle,
+        codex_team_runtime::TeamLifecycle::Running
+    );
+    assert_eq!(node.revision.get(), 2);
+}
+
 fn sample_team_graph() -> codex_team_graph::TeamGraph {
     let dto: codex_team_graph::TeamGraphToml = toml::from_str(
         r#"

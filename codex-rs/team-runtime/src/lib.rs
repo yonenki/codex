@@ -42,6 +42,7 @@ pub use sink::HttpTeamEventSink;
 pub use sink::RecordingSink;
 pub use sink::TeamEventSink;
 pub use state::NodeRun;
+pub use state::TeamLifecycle;
 pub use state::TeamSessionState;
 pub use store::LazySqliteTeamStore;
 pub use store::MemoryTeamStore;

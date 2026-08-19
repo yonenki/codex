@@ -381,6 +381,13 @@ async fn handle_team_wait(invocation: ToolInvocation) -> Result<TeamToolResult, 
         team.require_same_team(&team_session_id, &resolved.to_string())
             .await
             .map_err(map_team_error)?;
+        let reason = args
+            .reason
+            .clone()
+            .unwrap_or_else(|| format!("wait_agent:{target}"));
+        team.record_wait_entered(&team_session_id, &reason)
+            .await
+            .map_err(map_team_error)?;
         let timeout_ms = args
             .timeout_ms
             .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
@@ -388,7 +395,7 @@ async fn handle_team_wait(invocation: ToolInvocation) -> Result<TeamToolResult, 
         let (status, timed_out) =
             wait_for_team_agent(&invocation, resolved, timeout_ms as u64).await?;
         let view = team
-            .status(&team_session_id)
+            .record_wait_resolved(&team_session_id, &reason)
             .await
             .map_err(map_team_error)?;
         return Ok(TeamToolResult::json(serde_json::json!({
