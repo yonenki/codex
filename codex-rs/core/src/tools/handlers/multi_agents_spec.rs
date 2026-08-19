@@ -113,6 +113,10 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     }
     if options.hide_agent_type_model_reasoning {
         properties.remove("service_tier");
+        // Observer metadata is accepted by the handler but must stay out of the
+        // model-visible schema: models with a reserved `collaboration.spawn_agent`
+        // schema reject any extra property.
+        properties.remove("metadata");
     }
     if !options.expose_spawn_agent_model_overrides {
         properties.remove("model");
@@ -699,6 +703,9 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
     properties.remove("model");
     properties.remove("reasoning_effort");
     properties.remove("service_tier");
+    // See the note in create_spawn_agent_tool_v2: `metadata` must stay out of the
+    // model-visible schema on the reserved-schema path.
+    properties.remove("metadata");
 }
 
 fn spawn_agent_tool_description(
