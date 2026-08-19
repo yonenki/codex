@@ -124,6 +124,7 @@ pub(crate) async fn run_pending_session_start_hooks(
                     turn_id: turn_context.sub_id.clone(),
                     agent_id: context.agent_id,
                     agent_type: context.agent_type,
+                    backend: None,
                 }
             }
             SessionSource::SubAgent(_) => return false,
@@ -340,6 +341,7 @@ pub(crate) async fn run_turn_stop_hooks(
                     agent_id: context.agent_id,
                     agent_type: context.agent_type,
                     agent_transcript_path,
+                    backend: None,
                 },
                 parent_transcript_path,
             )
@@ -697,7 +699,7 @@ fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<Response
         .collect()
 }
 
-async fn emit_hook_started_events(
+pub(crate) async fn emit_hook_started_events(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     preview_runs: Vec<HookRunSummary>,
@@ -825,7 +827,7 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
     ]
 }
 
-fn hook_permission_mode(turn_context: &TurnContext) -> String {
+pub(crate) fn hook_permission_mode(turn_context: &TurnContext) -> String {
     match turn_context.approval_policy() {
         AskForApproval::Never => "bypassPermissions",
         AskForApproval::UnlessTrusted | AskForApproval::OnRequest | AskForApproval::Granular(_) => {

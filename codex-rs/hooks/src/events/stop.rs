@@ -11,6 +11,7 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
+use crate::SubagentBackendIdentity;
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerRunResult;
@@ -40,6 +41,7 @@ pub enum StopHookTarget {
         agent_id: String,
         agent_type: String,
         agent_transcript_path: Option<PathBuf>,
+        backend: Option<SubagentBackendIdentity>,
     },
 }
 
@@ -141,6 +143,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
             agent_id,
             agent_type,
             agent_transcript_path,
+            backend,
         } => {
             let input = SubagentStopCommandInput {
                 session_id: request.session_id.to_string(),
@@ -154,6 +157,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
                 stop_hook_active: request.stop_hook_active,
                 agent_id,
                 agent_type,
+                backend,
                 last_assistant_message: NullableString::from_string(
                     request.last_assistant_message.clone(),
                 ),

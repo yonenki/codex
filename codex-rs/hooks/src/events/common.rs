@@ -4,6 +4,8 @@ use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
+use schemars::JsonSchema;
+use serde::Serialize;
 
 use crate::engine::ConfiguredHandler;
 use crate::engine::dispatcher;
@@ -14,6 +16,14 @@ use crate::output_spill::AdditionalContext;
 pub struct SubagentHookContext {
     pub agent_id: String,
     pub agent_type: String,
+}
+
+/// Identifies the external backend executing a subagent lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SubagentBackendIdentity {
+    pub harness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 pub(crate) fn join_text_chunks(chunks: Vec<String>) -> Option<String> {

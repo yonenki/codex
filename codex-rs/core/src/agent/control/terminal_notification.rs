@@ -1,5 +1,8 @@
 use super::AgentControl;
 use crate::agent::AgentStatus;
+use crate::agent::role::ACP_ROLE_NAME;
+use crate::external_subagent_hooks::ExternalSubagentHookIdentity;
+use crate::external_subagent_hooks::run_external_subagent_stop_hook;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::Event;
@@ -91,6 +94,17 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
         return;
     };
     let external_identity = control.external_agents.identity(child_thread_id);
+    let hook_identity = external_identity
+        .as_ref()
+        .map(|identity| ExternalSubagentHookIdentity {
+            agent_id: child_thread_id,
+            agent_type: metadata
+                .agent_role
+                .clone()
+                .unwrap_or_else(|| ACP_ROLE_NAME.to_string()),
+            harness: identity.harness.clone(),
+            model: identity.model.clone(),
+        });
 
     let event = Event {
         id: child_thread_id.to_string(),
@@ -107,6 +121,15 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
         }),
     };
     parent_thread.send_subagent_terminal_event(event).await;
+    if let Some(identity) = hook_identity {
+        let turn = parent_thread.session.new_default_turn().await;
+        Box::pin(run_external_subagent_stop_hook(
+            &parent_thread.session,
+            &turn,
+            identity,
+        ))
+        .await;
+    }
 }
 
 #[cfg(test)]

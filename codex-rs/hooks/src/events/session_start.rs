@@ -10,6 +10,7 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
+use crate::SubagentBackendIdentity;
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerRunResult;
@@ -58,6 +59,7 @@ pub enum StartHookTarget {
         turn_id: String,
         agent_id: String,
         agent_type: String,
+        backend: Option<SubagentBackendIdentity>,
     },
 }
 
@@ -152,6 +154,7 @@ pub(crate) async fn run(
             turn_id: subagent_turn_id,
             agent_id,
             agent_type,
+            backend,
         } => {
             let input = SubagentStartCommandInput {
                 session_id: request.session_id.to_string(),
@@ -163,6 +166,7 @@ pub(crate) async fn run(
                 permission_mode: request.permission_mode.clone(),
                 agent_id,
                 agent_type,
+                backend,
             };
             let input_json = match serde_json::to_string(&input) {
                 Ok(input_json) => input_json,

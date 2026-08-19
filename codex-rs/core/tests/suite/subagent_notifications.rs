@@ -167,6 +167,7 @@ fn write_home_skill(codex_home: &Path, dir: &str, name: &str, description: &str)
 fn write_subagent_lifecycle_hooks(
     home: &Path,
     stop_prompts: &[&str],
+    subagent_start_matcher: &str,
     subagent_stop_matcher: &str,
 ) -> Result<()> {
     let session_start_script_path = home.join("session_start_hook.py");
@@ -186,18 +187,23 @@ with log_path.open("a", encoding="utf-8") as handle:
 
     let start_script_path = home.join("subagent_start_hook.py");
     let start_log_path = home.join("subagent_start_hook_log.jsonl");
+    let lifecycle_log_path = home.join("subagent_lifecycle_hook_log.jsonl");
     let start_script = format!(
         r#"import json
 from pathlib import Path
 import sys
 
 log_path = Path(r"{start_log_path}")
+lifecycle_log_path = Path(r"{lifecycle_log_path}")
 payload = json.load(sys.stdin)
 with log_path.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(payload) + "\n")
+with lifecycle_log_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"event": "SubagentStart", "payload": payload}}) + "\n")
 print(json.dumps({{"hookSpecificOutput": {{"hookEventName": "SubagentStart", "additionalContext": {SUBAGENT_START_CONTEXT:?}}}}}))
 "#,
         start_log_path = start_log_path.display(),
+        lifecycle_log_path = lifecycle_log_path.display(),
     );
 
     let user_prompt_submit_script_path = home.join("user_prompt_submit_hook.py");
@@ -224,6 +230,7 @@ from pathlib import Path
 import sys
 
 log_path = Path(r"{subagent_stop_log_path}")
+lifecycle_log_path = Path(r"{lifecycle_log_path}")
 block_prompts = {prompts_json}
 
 payload = json.load(sys.stdin)
@@ -233,6 +240,8 @@ if log_path.exists():
 
 with log_path.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(payload) + "\n")
+with lifecycle_log_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"event": "SubagentStop", "payload": payload}}) + "\n")
 
 invocation_index = len(existing)
 if invocation_index < len(block_prompts):
@@ -241,6 +250,7 @@ else:
     print(json.dumps({{"systemMessage": f"subagent stop pass {{invocation_index + 1}} complete"}}))
 "#,
         subagent_stop_log_path = subagent_stop_log_path.display(),
+        lifecycle_log_path = lifecycle_log_path.display(),
         prompts_json = prompts_json,
     );
 
@@ -270,7 +280,7 @@ print(json.dumps({{"systemMessage": "root stop complete"}}))
                 }]
             }],
             "SubagentStart": [{
-                "matcher": "worker",
+                "matcher": subagent_start_matcher,
                 "hooks": [{
                     "type": "command",
                     "command": format!("python3 {}", start_script_path.display()),
@@ -594,7 +604,7 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
 
     let test = test_codex()
         .with_pre_build_hook(|home| {
-            write_subagent_lifecycle_hooks(home, /*stop_prompts*/ &[], "worker")
+            write_subagent_lifecycle_hooks(home, /*stop_prompts*/ &[], "worker", "worker")
                 .expect("failed to write subagent hook fixture");
         })
         .with_config(|config| {
@@ -741,6 +751,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
             write_subagent_lifecycle_hooks(
                 home,
                 /*stop_prompts*/ &[SUBAGENT_STOP_CONTINUATION],
+                "worker",
                 "",
             )
             .expect("failed to write subagent hook fixture");
@@ -1964,7 +1975,17 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     .await;
     let test = test_codex()
         .with_model("koffing")
+        .with_pre_build_hook(|home| {
+            write_subagent_lifecycle_hooks(
+                home,
+                /*stop_prompts*/ &[],
+                "external_worker",
+                "external_worker",
+            )
+            .expect("failed to write external subagent hook fixture");
+        })
         .with_config(move |config| {
+            trust_discovered_hooks(config);
             config
                 .features
                 .enable(Feature::Collab)
@@ -2053,6 +2074,34 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     assert!(completion.contains(ACP_ROLE_INSTRUCTIONS));
     assert!(completion.contains("independent ACP task"));
 
+    let first_lifecycle = wait_for_hook_log(
+        test.codex_home_path(),
+        "subagent_lifecycle_hook_log.jsonl",
+        /*expected_len*/ 2,
+    )
+    .await?;
+    assert_eq!(
+        first_lifecycle
+            .iter()
+            .map(|entry| entry["event"].as_str())
+            .collect::<Vec<_>>(),
+        vec![Some("SubagentStart"), Some("SubagentStop")]
+    );
+    let first_agent_id = first_lifecycle[0]["payload"]["agent_id"]
+        .as_str()
+        .expect("ACP start hook should include agent_id");
+    for entry in &first_lifecycle {
+        assert_eq!(entry["payload"]["agent_id"].as_str(), Some(first_agent_id));
+        assert_eq!(
+            entry["payload"]["agent_type"].as_str(),
+            Some("external_worker")
+        );
+        assert_eq!(
+            entry["payload"]["backend"],
+            json!({"harness": "grok-build", "model": "grok-test"})
+        );
+    }
+
     let followup_call_id = "followup-acp-call";
     let followup_prompt = "continue the ACP session";
     let followup_args = serde_json::to_string(&json!({
@@ -2120,6 +2169,28 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
             .contains("acp follow-up done"),
         "follow-up did not reuse the ACP session: {request:#?}"
     );
+    let lifecycle = wait_for_hook_log(
+        test.codex_home_path(),
+        "subagent_lifecycle_hook_log.jsonl",
+        /*expected_len*/ 4,
+    )
+    .await?;
+    assert_eq!(
+        lifecycle
+            .iter()
+            .map(|entry| entry["event"].as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            Some("SubagentStart"),
+            Some("SubagentStop"),
+            Some("SubagentStart"),
+            Some("SubagentStop"),
+        ]
+    );
+    assert!(lifecycle.iter().all(|entry| {
+        entry["payload"]["agent_id"].as_str() == Some(first_agent_id)
+            && entry["payload"]["backend"] == json!({"harness": "grok-build", "model": "grok-test"})
+    }));
 
     let fallback_call_id = "fallback-acp-call";
     let fallback_prompt = "retry the ACP role without backend names";
@@ -2171,7 +2242,11 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     assert!(fallback_output.contains("/root/worker_retry"));
     let fallback_request = timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(request) = fallback_completion_request.requests().into_iter().next() {
+            if let Some(request) = fallback_completion_request
+                .requests()
+                .into_iter()
+                .find(|request| request.body_contains_text("backend=grok-fallback-test"))
+            {
                 return request;
             }
             sleep(Duration::from_millis(10)).await;

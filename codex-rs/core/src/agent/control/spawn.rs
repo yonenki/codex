@@ -258,14 +258,19 @@ impl AgentControl {
         .await
     }
 
-    pub(crate) async fn spawn_external_agent_with_communication(
+    pub(crate) async fn spawn_external_agent_with_communication<F, Fut>(
         &self,
         config: Config,
         backend: ExternalAgentBackend,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         session_source: SessionSource,
-    ) -> CodexResult<LiveAgent> {
+        on_started: F,
+    ) -> CodexResult<LiveAgent>
+    where
+        F: FnOnce(ThreadId) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         self.ensure_execution_capacity(MultiAgentVersion::V2, &session_source)?;
         let mut reservation = self
             .state
@@ -334,12 +339,11 @@ impl AgentControl {
         self.external_agents
             .register(agent_id, backend, config.cwd.to_path_buf(), env)?;
         if let Err(error) = self
-            .send_inter_agent_communication(
+            .send_external_inter_agent_communication_with_start_hook(
                 agent_id,
                 communication,
                 context,
-                /*parent_turn_id*/ None,
-                /*root_turn_id*/ None,
+                || on_started(agent_id),
             )
             .await
         {
