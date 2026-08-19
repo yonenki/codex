@@ -68,9 +68,18 @@ pub enum TeamEventPayload {
         candidate_sha: Option<String>,
         #[serde(default)]
         evidence_id: Option<String>,
+        /// この結果を QA 集計へ載せるときに true にする。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        qa: Option<bool>,
+        /// Review 指摘数。無いときは Review 結果として数えない。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        findings: Option<u32>,
     },
     AgentAttached {
         role: String,
+        /// 明示的な backend fallback のときだけ true にする。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend_fallback: Option<bool>,
     },
     AgentTerminal {
         status: String,

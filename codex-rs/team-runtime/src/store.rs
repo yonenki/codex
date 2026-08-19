@@ -136,7 +136,13 @@ impl TeamStore for MemoryTeamStore {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(inner.outbox.clone())
+        let mut events = inner.outbox.clone();
+        events.sort_by(|left, right| {
+            left.team_session_id
+                .cmp(&right.team_session_id)
+                .then(left.sequence.cmp(&right.sequence))
+        });
+        Ok(events)
     }
 
     async fn mark_outbox_sent(&self, event_ids: &[EventId]) -> TeamRuntimeResult<()> {

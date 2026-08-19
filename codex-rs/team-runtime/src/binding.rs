@@ -19,6 +19,7 @@ pub struct PendingTeamBinding {
     pub node_run_id: NodeRunId,
     pub node_id: NodeId,
     pub role: String,
+    pub backend_fallback: bool,
 }
 
 impl PendingTeamBinding {
@@ -40,6 +41,7 @@ impl TeamAgentBinding {
             node_run_id: self.node_run_id.clone(),
             node_id: self.node_id.clone(),
             role: self.role.clone(),
+            backend_fallback: false,
         }
     }
 }

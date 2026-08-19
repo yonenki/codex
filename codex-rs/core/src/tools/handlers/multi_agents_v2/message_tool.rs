@@ -65,6 +65,18 @@ pub(crate) async fn handle_message_string_tool(
         ..
     } = invocation;
     let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
+    let caller_thread_id = session.thread_id.to_string();
+    let receiver_thread = receiver_thread_id.to_string();
+    let op = match mode {
+        MessageDeliveryMode::QueueOnly => RawCollaborationOp::SendMessage,
+        MessageDeliveryMode::TriggerTurn => RawCollaborationOp::FollowupTask,
+    };
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller_thread_id,
+        &[receiver_thread.as_str()],
+        op,
+    )?;
     let receiver_agent = session
         .services
         .agent_control

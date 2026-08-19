@@ -36,6 +36,14 @@ async fn handle_interrupt_agent(
     let arguments = function_arguments(payload)?;
     let args: InterruptAgentArgs = parse_arguments(&arguments)?;
     let agent_id = resolve_agent_target(&session, &turn, &args.target).await?;
+    let caller_thread_id = session.thread_id.to_string();
+    let target_thread = agent_id.to_string();
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller_thread_id,
+        &[target_thread.as_str()],
+        RawCollaborationOp::Interrupt,
+    )?;
     let receiver_agent = session
         .services
         .agent_control

@@ -4617,3 +4617,360 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("permission profile set");
     assert_eq!(config, expected);
 }
+
+fn sample_team_catalog() -> codex_team_graph::TeamGraphCatalog {
+    let dto: codex_team_graph::TeamGraphToml = toml::from_str(
+        r#"
+schema_version = 1
+name = "sample"
+version = "1"
+description = "Sample team graph."
+start = "work"
+terminals = ["completed"]
+[[nodes]]
+id = "work"
+purpose = "Implement the candidate."
+role = "worker"
+prompt = "Implement the approved scope."
+completion = "A candidate exists."
+available_tools = ["spawn_agent", "record_team_result", "transition_team"]
+recommended_tools = ["spawn_agent"]
+[[nodes.transitions]]
+on = "candidate_ready"
+to = "completed"
+recommended = true
+guide = "Worker returned a candidate."
+[[nodes]]
+id = "completed"
+purpose = "Team finished."
+prompt = "Stop. The team is complete."
+completion = "The team session is closed."
+"#,
+    )
+    .expect("toml");
+    let graph = codex_team_graph::TeamGraph::try_from(dto).expect("graph");
+    codex_team_graph::validate_team_graph(&graph, &["worker".into()].into_iter().collect())
+        .expect("valid");
+    codex_team_graph::TeamGraphCatalog::new([graph])
+}
+
+async fn prepare_v2_session() -> (crate::session::session::Session, TurnContext, ThreadManager) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    set_turn_config(&mut turn, config);
+    (session, turn, manager)
+}
+
+async fn start_sample_team(
+    session: &crate::session::session::Session,
+) -> codex_team_runtime::TeamSessionId {
+    let team = session.services.agent_control.team();
+    team.replace_catalog(sample_team_catalog()).await;
+    let started = team
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    team.start_node(codex_team_runtime::StartNodeCommand {
+        team_session_id: started.team_session_id.clone(),
+        node_id: None,
+        expected_revision: started.revision,
+    })
+    .await
+    .expect("start node");
+    started.team_session_id
+}
+
+fn assert_team_tool_guidance(err: FunctionCallError, team_tool: &str) {
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected model-facing error");
+    };
+    assert!(
+        message.contains(team_tool),
+        "error should name {team_tool}: {message}"
+    );
+    assert!(
+        message.contains("team_session_id"),
+        "error should require team_session_id: {message}"
+    );
+}
+
+fn expect_model_err(
+    result: Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>,
+    context: &str,
+) -> FunctionCallError {
+    match result {
+        Ok(_) => panic!("{context}: expected a model-facing error"),
+        Err(err) => err,
+    }
+}
+
+#[tokio::test]
+async fn raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let open_team = expect_model_err(
+        SpawnAgentHandlerV2::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "spawn_agent",
+                function_payload(json!({"task_name": "worker", "message": "do work"})),
+            ))
+            .await,
+        "unbound root with open Team",
+    );
+    assert_team_tool_guidance(open_team, "team.spawn_agent");
+
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(session.thread_id.to_string(), pending)
+        .await
+        .expect("bind caller");
+
+    let bound_caller = expect_model_err(
+        SpawnAgentHandlerV2::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "spawn_agent",
+                function_payload(json!({"task_name": "child", "message": "do work"})),
+            ))
+            .await,
+        "Team-bound child raw spawn",
+    );
+    assert_team_tool_guidance(bound_caller, "team.spawn_agent");
+}
+
+#[tokio::test]
+async fn raw_collaboration_allows_unbound_caller_and_target() {
+    let (session, _turn, _manager) = prepare_v2_session().await;
+    let caller = session.thread_id.to_string();
+    reject_unbound_raw_spawn_when_teams_open(&session, &caller, "collaboration.spawn_agent")
+        .expect("no open Team");
+    reject_team_bound_raw_collaboration(&session, &caller, &[], RawCollaborationOp::Spawn)
+        .expect("unbound spawn");
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller,
+        &[caller.as_str()],
+        RawCollaborationOp::SendMessage,
+    )
+    .expect("unbound send");
+}
+
+#[tokio::test]
+async fn raw_message_followup_and_interrupt_reject_bound_caller_or_target() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let target = ThreadId::new();
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(target.to_string(), pending)
+        .await
+        .expect("bind target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let target = target.to_string();
+
+    for (handler_name, payload, expected_tool) in [
+        (
+            "send_message",
+            json!({"target": target, "message": "hello"}),
+            "team.send_message",
+        ),
+        (
+            "followup_task",
+            json!({"target": target, "message": "continue"}),
+            "team.followup_agent",
+        ),
+        (
+            "interrupt_agent",
+            json!({"target": target}),
+            "team.interrupt_agent",
+        ),
+    ] {
+        let invocation = invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            handler_name,
+            function_payload(payload),
+        );
+        let err = match handler_name {
+            "send_message" => expect_model_err(
+                SendMessageHandlerV2.handle(invocation).await,
+                "bound target send",
+            ),
+            "followup_task" => expect_model_err(
+                FollowupTaskHandlerV2.handle(invocation).await,
+                "bound target followup",
+            ),
+            _ => expect_model_err(
+                InterruptAgentHandler.handle(invocation).await,
+                "bound target interrupt",
+            ),
+        };
+        assert_team_tool_guidance(err, expected_tool);
+    }
+}
+
+#[tokio::test]
+async fn raw_same_team_message_is_rejected_and_unknown_target_keeps_lookup_error() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let target = ThreadId::new();
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller");
+    let target_pending = team
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("target pending");
+    team.bind_agent_before_start(target.to_string(), target_pending)
+        .await
+        .expect("bind same-team target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let target = target.to_string();
+
+    let same_team = expect_model_err(
+        SendMessageHandlerV2
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_message",
+                function_payload(json!({"target": target, "message": "hello"})),
+            ))
+            .await,
+        "same-team raw send",
+    );
+    assert_team_tool_guidance(same_team, "team.send_message");
+
+    let missing = expect_model_err(
+        SendMessageHandlerV2
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_message",
+                function_payload(json!({"target": "missing-agent", "message": "hello"})),
+            ))
+            .await,
+        "unknown target",
+    );
+    let FunctionCallError::RespondToModel(message) = missing else {
+        panic!("lookup should stay model-facing");
+    };
+    assert!(
+        !message.contains("team.send_message"),
+        "unknown target must keep the existing lookup error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn raw_wait_rejects_bound_caller_and_multi_target_atomically() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(session.thread_id.to_string(), pending)
+        .await
+        .expect("bind caller");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let bound_wait = expect_model_err(
+        WaitAgentHandlerV2::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({})),
+            ))
+            .await,
+        "bound caller wait",
+    );
+    assert_team_tool_guidance(bound_wait, "team.wait");
+
+    let (unbound_session, unbound_turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&unbound_session).await;
+    let bound_target = ThreadId::new();
+    let unbound_target = ThreadId::new();
+    let pending = unbound_session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending target");
+    unbound_session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(bound_target.to_string(), pending)
+        .await
+        .expect("bind one wait target");
+    let multi = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::new(unbound_session),
+                Arc::new(unbound_turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [bound_target.to_string(), unbound_target.to_string()]
+                })),
+            ))
+            .await,
+        "multi-target wait",
+    );
+    assert_team_tool_guidance(multi, "team.wait");
+}

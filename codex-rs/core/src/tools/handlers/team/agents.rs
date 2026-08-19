@@ -74,6 +74,7 @@ struct TeamSpawnArgs {
     agent_type: Option<String>,
     task_name: String,
     message: String,
+    fallback_from: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,7 +125,7 @@ async fn handle_team_spawn(
         .or(args.agent_type)
         .ok_or_else(|| FunctionCallError::RespondToModel("role is required".into()))?;
     let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
-    let pending = invocation
+    let mut pending = invocation
         .session
         .services
         .agent_control
@@ -132,6 +133,10 @@ async fn handle_team_spawn(
         .pending_binding_for_node(&team_session_id, &role)
         .await
         .map_err(map_team_error)?;
+    pending.backend_fallback = args
+        .fallback_from
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
     let message = message_content(args.message)?;
     let turn = invocation.turn.as_ref();
     let mut config = build_agent_spawn_config(
@@ -556,6 +561,12 @@ fn agent_spec(capability: ToolCapability) -> ToolSpec {
                     string_prop("Task name for the spawned agent."),
                 ),
                 ("message".into(), string_prop("Initial task message.")),
+                (
+                    "fallback_from".into(),
+                    string_prop(
+                        "Prior Team-bound agent that failed its backend. Marks this spawn as an explicit backend fallback.",
+                    ),
+                ),
             ]),
             vec!["task_name".into(), "message".into()],
         ),

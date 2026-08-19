@@ -402,6 +402,64 @@ fn reserved_spawn_agent_schema_deep_equals_required_surface() {
 }
 
 #[test]
+fn reserved_collaboration_schemas_stay_free_of_team_identity() {
+    let spawn = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+        available_models: vec![model_preset("visible", /*show_in_picker*/ true)],
+        agent_type_description: "role help".to_string(),
+        expose_agent_type: false,
+        hide_agent_type_model_reasoning: true,
+        expose_spawn_agent_model_overrides: false,
+        multi_agent_version: MultiAgentVersion::V2,
+        usage_hint_text: None,
+    });
+    let tools = [
+        ("spawn_agent", spawn, vec!["task_name", "message"]),
+        (
+            "send_message",
+            create_send_message_tool(),
+            vec!["target", "message"],
+        ),
+        (
+            "followup_task",
+            create_followup_task_tool(),
+            vec!["target", "message"],
+        ),
+        (
+            "wait_agent",
+            create_wait_agent_tool_v2(WaitAgentTimeoutOptions::default()),
+            vec![],
+        ),
+        (
+            "interrupt_agent",
+            create_interrupt_agent_tool_v2(),
+            vec!["target"],
+        ),
+    ];
+    for (name, tool, required) in tools {
+        let ToolSpec::Function(ResponsesApiTool {
+            name: tool_name,
+            parameters,
+            ..
+        }) = tool
+        else {
+            panic!("{name} should stay a function tool");
+        };
+        assert_eq!(tool_name, name);
+        let properties = parameters.properties.as_ref().expect("properties");
+        assert!(
+            !properties.contains_key("team_session_id"),
+            "{name} reserved schema must not gain team_session_id"
+        );
+        if !required.is_empty() {
+            assert_eq!(
+                parameters.required.as_ref(),
+                Some(&required.into_iter().map(str::to_string).collect())
+            );
+        }
+    }
+}
+
+#[test]
 fn send_message_tool_requires_message_and_has_no_output_schema() {
     let ToolSpec::Function(ResponsesApiTool {
         parameters,

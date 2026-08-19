@@ -63,6 +63,18 @@ impl Handler {
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
         let receiver_thread_ids = parse_agent_id_targets(args.targets)?;
+        let caller_thread_id = session.thread_id.to_string();
+        let target_ids: Vec<String> = receiver_thread_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let target_refs: Vec<&str> = target_ids.iter().map(String::as_str).collect();
+        reject_team_bound_raw_collaboration(
+            &session,
+            &caller_thread_id,
+            &target_refs,
+            RawCollaborationOp::Wait,
+        )?;
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {

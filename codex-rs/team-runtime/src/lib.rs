@@ -14,6 +14,7 @@ mod store;
 pub use binding::PendingTeamBinding;
 pub use binding::TeamAgentBinding;
 pub use contract::TEAM_EVENTS_CONTRACT_VERSION;
+pub use contract::TEAM_EVENTS_MAX_BATCH;
 pub use contract::TeamEventEnvelope;
 pub use contract::TeamEventsBatch;
 pub use contract::team_events_path;

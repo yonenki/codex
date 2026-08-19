@@ -169,6 +169,8 @@ pub struct RecordResultCommand {
     pub result: String,
     pub evidence_id: Option<String>,
     pub candidate_sha: Option<String>,
+    pub qa: Option<bool>,
+    pub findings: Option<u32>,
     pub expected_revision: StateRevision,
 }
 
@@ -545,6 +547,8 @@ impl TeamControl {
                             result: command.result,
                             candidate_sha: command.candidate_sha,
                             evidence_id: command.evidence_id,
+                            qa: command.qa,
+                            findings: command.findings,
                         },
                     })
                 },
@@ -738,6 +742,7 @@ impl TeamControl {
             node_run_id: run.node_run_id.clone(),
             node_id: run.node_id.clone(),
             role: role.to_string(),
+            backend_fallback: false,
         })
     }
 
@@ -747,6 +752,7 @@ impl TeamControl {
         pending: PendingTeamBinding,
     ) -> TeamRuntimeResult<TeamAgentBinding> {
         let agent_thread_id = agent_thread_id.into();
+        let backend_fallback = pending.backend_fallback;
         let binding = pending.bind(agent_thread_id.clone());
         self.store.persist_binding(binding.clone()).await?;
         {
@@ -776,6 +782,7 @@ impl TeamControl {
                 role: Some(binding.role.clone()),
                 payload: TeamEventPayload::AgentAttached {
                     role: binding.role.clone(),
+                    backend_fallback: backend_fallback.then_some(true),
                 },
             })
         })
@@ -1028,9 +1035,12 @@ impl TeamControl {
         if pending.is_empty() {
             return Ok(());
         }
-        self.sink.publish(pending.clone()).await?;
-        let ids = pending.iter().map(|event| event.event_id.clone()).collect();
-        self.store.mark_outbox_sent(ids).await
+        for chunk in pending.chunks(crate::TEAM_EVENTS_MAX_BATCH) {
+            self.sink.publish(chunk.to_vec()).await?;
+            let ids = chunk.iter().map(|event| event.event_id.clone()).collect();
+            self.store.mark_outbox_sent(ids).await?;
+        }
+        Ok(())
     }
 
     async fn emit_transition_recommended(

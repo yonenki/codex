@@ -65,6 +65,8 @@ struct TeamSessionArgs {
     evidence_id: Option<String>,
     identity: Option<String>,
     candidate_sha: Option<String>,
+    qa: Option<bool>,
+    findings: Option<u32>,
     deviation_reason: Option<String>,
     aborted: Option<bool>,
     reason: Option<String>,
@@ -127,6 +129,8 @@ async fn handle_lifecycle(
         evidence_id: None,
         identity: None,
         candidate_sha: None,
+        qa: None,
+        findings: None,
         deviation_reason: None,
         aborted: None,
         reason: None,
@@ -170,6 +174,8 @@ async fn handle_lifecycle(
                 })?,
                 evidence_id: args.evidence_id,
                 candidate_sha: args.candidate_sha,
+                qa: args.qa,
+                findings: args.findings,
                 expected_revision: revision(args.expected_revision)?,
             })
             .await
@@ -321,6 +327,18 @@ fn lifecycle_spec(capability: ToolCapability) -> ToolSpec {
                 (
                     "candidate_sha".into(),
                     string_prop("Optional candidate SHA."),
+                ),
+                (
+                    "qa".into(),
+                    JsonSchema::boolean(Some(
+                        "Set true when this result is a QA verdict for metrics.".into(),
+                    )),
+                ),
+                (
+                    "findings".into(),
+                    JsonSchema::number(Some(
+                        "Review finding count. Omit unless this result is a review verdict.".into(),
+                    )),
                 ),
             ]),
             vec![

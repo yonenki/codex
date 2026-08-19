@@ -54,18 +54,18 @@ async fn handle_spawn_agent(
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
     let observer_metadata = parse_spawn_observer_metadata(args.metadata.clone())?;
-    if session
-        .services
-        .agent_control
-        .team()
-        .binding_snapshot(&session.thread_id.to_string())
-        .is_none()
-        && session.services.agent_control.team().open_team_count() > 0
-    {
-        return Err(FunctionCallError::RespondToModel(
-            "open Team sessions require team.spawn_agent(team_session_id, ...). collaboration.spawn_agent cannot infer Team identity.".to_string(),
-        ));
-    }
+    let caller_thread_id = session.thread_id.to_string();
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller_thread_id,
+        &[],
+        RawCollaborationOp::Spawn,
+    )?;
+    reject_unbound_raw_spawn_when_teams_open(
+        &session,
+        &caller_thread_id,
+        "collaboration.spawn_agent",
+    )?;
     let fork_mode = args.fork_mode()?;
     let message = message_content(args.message)?;
     let role_name = args

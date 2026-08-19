@@ -5,6 +5,10 @@ use serde::Serialize;
 
 pub const TEAM_EVENTS_CONTRACT_VERSION: &str = "team-events.v1";
 
+/// agent-collab の team event ingest が 1 リクエストで受理する最大件数。
+/// 両リポジトリで同じ wire 上限を保ち、超過 batch を 400 で落とさない。
+pub const TEAM_EVENTS_MAX_BATCH: usize = 100;
+
 /// Versioned ingest payload that agent-collab should accept idempotently.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamEventsBatch {

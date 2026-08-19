@@ -69,6 +69,8 @@ fn apply_kind(state: &mut TeamSessionState, event: &TeamEvent) -> TeamRuntimeRes
                 result,
                 candidate_sha,
                 evidence_id,
+                qa: _,
+                findings: _,
             } = &event.payload
             {
                 if let Some(run) = state.current_node_run.as_mut() {

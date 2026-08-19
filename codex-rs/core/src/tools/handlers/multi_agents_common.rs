@@ -162,6 +162,76 @@ pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionC
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum RawCollaborationOp {
+    Spawn,
+    SendMessage,
+    FollowupTask,
+    Wait,
+    Interrupt,
+}
+
+impl RawCollaborationOp {
+    fn team_tool(self) -> &'static str {
+        match self {
+            Self::Spawn => "team.spawn_agent",
+            Self::SendMessage => "team.send_message",
+            Self::FollowupTask => "team.followup_agent",
+            Self::Wait => "team.wait",
+            Self::Interrupt => "team.interrupt_agent",
+        }
+    }
+
+    fn raw_tool(self) -> &'static str {
+        match self {
+            Self::Spawn => "collaboration.spawn_agent",
+            Self::SendMessage => "collaboration.send_message",
+            Self::FollowupTask => "collaboration.followup_task",
+            Self::Wait => "collaboration.wait_agent",
+            Self::Interrupt => "collaboration.interrupt_agent",
+        }
+    }
+}
+
+/// caller またはいずれかの target が Team-bound なら raw collaboration を拒否する。
+pub(crate) fn reject_team_bound_raw_collaboration(
+    session: &Session,
+    caller_thread_id: &str,
+    target_thread_ids: &[&str],
+    op: RawCollaborationOp,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    let caller_binding = team.binding_snapshot(caller_thread_id);
+    let target_binding = target_thread_ids
+        .iter()
+        .copied()
+        .find_map(|target| team.binding_snapshot(target));
+    let Some(binding) = caller_binding.as_ref().or(target_binding.as_ref()) else {
+        return Ok(());
+    };
+    Err(FunctionCallError::RespondToModel(format!(
+        "Team-bound collaboration must use {}(team_session_id={}, ...). {} cannot be used when the caller or any target is bound to a Team.",
+        op.team_tool(),
+        binding.team_session_id,
+        op.raw_tool(),
+    )))
+}
+
+/// 未所属 root が open Team ありのまま raw spawn すると帰属を推測できない。
+pub(crate) fn reject_unbound_raw_spawn_when_teams_open(
+    session: &Session,
+    caller_thread_id: &str,
+    spawn_tool: &str,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    if team.binding_snapshot(caller_thread_id).is_none() && team.open_team_count() > 0 {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "open Team sessions require team.spawn_agent(team_session_id, ...). {spawn_tool} cannot infer Team identity."
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn thread_spawn_source(
     parent_thread_id: ThreadId,
     parent_session_source: &SessionSource,

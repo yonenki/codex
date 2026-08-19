@@ -198,6 +198,190 @@ async fn same_process_recovery_flushes_outbox_batch_in_sequence_on_next_operatio
     );
 }
 
+#[derive(Clone)]
+struct PartialFailRecordingSink {
+    fail_on_publish: Arc<Mutex<Option<usize>>>,
+    batches: Arc<Mutex<Vec<Vec<crate::TeamEventEnvelope>>>>,
+}
+
+impl PartialFailRecordingSink {
+    fn fail_on_second_publish() -> Self {
+        Self {
+            fail_on_publish: Arc::new(Mutex::new(Some(2))),
+            batches: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn batches(&self) -> Vec<Vec<crate::TeamEventEnvelope>> {
+        self.batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl crate::TeamEventSink for PartialFailRecordingSink {
+    async fn publish(&self, events: &[crate::TeamEvent]) -> crate::TeamRuntimeResult<()> {
+        let mut fail_on = self
+            .fail_on_publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next_index = self
+            .batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+            + 1;
+        if *fail_on == Some(next_index) {
+            *fail_on = None;
+            return Err(crate::TeamRuntimeError::Sink("chunk failed".into()));
+        }
+        drop(fail_on);
+        self.batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(
+                events
+                    .iter()
+                    .map(crate::TeamEventEnvelope::from_event)
+                    .collect(),
+            );
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn flush_outbox_chunks_pending_across_teams_and_stops_on_failed_chunk() {
+    let store = crate::SqliteTeamStore::memory().await.expect("memory");
+    let seed = TeamControl::with_store(catalog(), store.clone(), FailingSink::fail_times(1_000));
+    let team_a = seed
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("team-a".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start a");
+    let team_b = seed
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("team-b".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start b");
+    let node_a = seed
+        .start_node(StartNodeCommand {
+            team_session_id: team_a.team_session_id.clone(),
+            node_id: None,
+            expected_revision: team_a.revision,
+        })
+        .await
+        .expect("node a");
+    let _ = node_a;
+    let node_b = seed
+        .start_node(StartNodeCommand {
+            team_session_id: team_b.team_session_id.clone(),
+            node_id: None,
+            expected_revision: team_b.revision,
+        })
+        .await
+        .expect("node b");
+    let _ = node_b;
+    for index in 0..52 {
+        seed.record_deviation(&team_a.team_session_id, &format!("a-{index}"))
+            .await
+            .expect("dev a");
+        seed.record_deviation(&team_b.team_session_id, &format!("b-{index}"))
+            .await
+            .expect("dev b");
+    }
+
+    let pending_before = store.pending_outbox().await.expect("pending before flush");
+    assert!(
+        pending_before.len() > crate::TEAM_EVENTS_MAX_BATCH,
+        "need more than one ingest batch, got {}",
+        pending_before.len()
+    );
+    let team_ids: std::collections::BTreeSet<_> = pending_before
+        .iter()
+        .map(|event| event.team_session_id.clone())
+        .collect();
+    assert_eq!(team_ids.len(), 2, "pending must include both teams");
+
+    let sink = PartialFailRecordingSink::fail_on_second_publish();
+    let flusher = TeamControl::with_store(catalog(), store.clone(), sink.clone());
+    let first = flusher.flush_outbox().await;
+    assert!(first.is_err(), "second chunk should stop the flush");
+    let first_batches = sink.batches();
+    assert_eq!(first_batches.len(), 1);
+    assert_eq!(first_batches[0].len(), crate::TEAM_EVENTS_MAX_BATCH);
+    assert_team_sequences_ordered(&first_batches[0]);
+
+    let pending_after_partial = store.pending_outbox().await.expect("pending after partial");
+    assert_eq!(
+        pending_after_partial.len(),
+        pending_before.len() - crate::TEAM_EVENTS_MAX_BATCH
+    );
+    assert_eq!(
+        pending_after_partial[0].event_id,
+        pending_before[crate::TEAM_EVENTS_MAX_BATCH].event_id,
+        "retry resumes from the remaining pending head"
+    );
+
+    flusher.flush_outbox().await.expect("retry remaining");
+    let all_batches = sink.batches();
+    assert_eq!(all_batches.len(), 2);
+    assert!(all_batches[1].len() <= crate::TEAM_EVENTS_MAX_BATCH);
+    assert!(all_batches[1].len() > 0);
+    assert_team_sequences_ordered(&all_batches[1]);
+    assert!(
+        store
+            .pending_outbox()
+            .await
+            .expect("pending after retry")
+            .is_empty()
+    );
+
+    let published: Vec<_> = all_batches.into_iter().flatten().collect();
+    assert_eq!(published.len(), pending_before.len());
+    assert_per_team_sequences_complete(&published);
+}
+
+fn assert_team_sequences_ordered(batch: &[crate::TeamEventEnvelope]) {
+    let mut last: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for envelope in batch {
+        let team = envelope.team_session_id.to_string();
+        if let Some(previous) = last.insert(team.clone(), envelope.sequence) {
+            assert!(
+                envelope.sequence > previous,
+                "team {team} sequence must stay ordered inside a chunk"
+            );
+        }
+    }
+}
+
+fn assert_per_team_sequences_complete(published: &[crate::TeamEventEnvelope]) {
+    let mut by_team: std::collections::BTreeMap<String, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for envelope in published {
+        by_team
+            .entry(envelope.team_session_id.to_string())
+            .or_default()
+            .push(envelope.sequence);
+    }
+    for (team, mut sequences) in by_team {
+        sequences.sort_unstable();
+        let expected: Vec<u64> = (1..=sequences.len() as u64).collect();
+        assert_eq!(
+            sequences, expected,
+            "team {team} must reconverge without a sequence gap"
+        );
+    }
+}
+
 #[tokio::test]
 async fn memory_and_sqlite_keep_event_and_outbox_together() {
     let store = crate::MemoryTeamStore::default();

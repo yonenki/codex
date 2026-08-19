@@ -71,6 +71,8 @@ fn node_completed_payload_serializes_explicit_identity_fields() {
         result: "candidate_ready".into(),
         candidate_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
         evidence_id: Some("ev_work".into()),
+        qa: None,
+        findings: None,
     })
     .expect("serialize present");
     assert_eq!(present["type"], "node_completed");
@@ -80,11 +82,15 @@ fn node_completed_payload_serializes_explicit_identity_fields() {
         "0123456789abcdef0123456789abcdef01234567"
     );
     assert_eq!(present["evidence_id"], "ev_work");
+    assert!(present.get("qa").is_none());
+    assert!(present.get("findings").is_none());
 
     let missing = serde_json::to_value(TeamEventPayload::NodeCompleted {
         result: "candidate_ready".into(),
         candidate_sha: None,
         evidence_id: None,
+        qa: None,
+        findings: None,
     })
     .expect("serialize missing");
     assert_eq!(missing["candidate_sha"], serde_json::Value::Null);
@@ -101,6 +107,8 @@ fn node_completed_payload_serializes_explicit_identity_fields() {
             result: "candidate_ready".into(),
             candidate_sha: None,
             evidence_id: None,
+            qa: None,
+            findings: None,
         }
     );
 }
@@ -210,6 +218,8 @@ fn node_completed_applies_explicit_candidate_sha_and_evidence() {
             result: "candidate_ready".into(),
             candidate_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
             evidence_id: Some("ev_work".into()),
+            qa: None,
+            findings: None,
         },
         ..started_event.clone()
     };

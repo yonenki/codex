@@ -16,6 +16,51 @@ fn control() -> TeamControl {
 }
 
 #[tokio::test]
+async fn bind_agent_emits_backend_fallback_only_when_marked() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let mut pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    control
+        .bind_agent_before_start("agent-normal", pending.clone())
+        .await
+        .expect("normal bind");
+    pending.backend_fallback = true;
+    control
+        .bind_agent_before_start("agent-fallback", pending)
+        .await
+        .expect("fallback bind");
+    let attached: Vec<_> = sink
+        .envelopes()
+        .into_iter()
+        .filter(|envelope| envelope.kind == "agent_attached")
+        .collect();
+    assert_eq!(attached.len(), 2);
+    assert!(attached[0].payload.get("backend_fallback").is_none());
+    assert_eq!(attached[1].payload["backend_fallback"], true);
+}
+
+#[tokio::test]
 async fn two_teams_do_not_share_revision_or_node() {
     let control = control();
     let a = control
@@ -121,6 +166,8 @@ async fn stale_revision_cas_rejects_transition() {
             result: "candidate_ready".into(),
             evidence_id: Some("ev_work".into()),
             candidate_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            qa: None,
+            findings: None,
             expected_revision: node.revision,
         })
         .await
@@ -218,6 +265,8 @@ async fn end_team_closes_session() {
             result: "candidate_ready".into(),
             evidence_id: None,
             candidate_sha: None,
+            qa: None,
+            findings: None,
             expected_revision: node.revision,
         })
         .await
@@ -276,8 +325,10 @@ async fn fake_acp_lifecycle_records_pool_retry_and_unreported_coverage() {
         .record_agent_terminal("acp-1", "errored")
         .await
         .expect("first terminal");
+    let mut fallback = pending;
+    fallback.backend_fallback = true;
     control
-        .bind_agent_before_start("acp-2", pending)
+        .bind_agent_before_start("acp-2", fallback)
         .await
         .expect("retry backend");
     control
@@ -343,6 +394,8 @@ async fn closed_team_rejects_lifecycle_and_unstarted_node_completion() {
             result: "candidate_ready".into(),
             evidence_id: None,
             candidate_sha: None,
+            qa: None,
+            findings: None,
             expected_revision: started.revision,
         })
         .await
@@ -455,6 +508,8 @@ async fn rejects_transition_before_node_result_completion() {
             result: "candidate_ready".into(),
             evidence_id: None,
             candidate_sha: None,
+            qa: None,
+            findings: None,
             expected_revision: node.revision,
         })
         .await
@@ -526,6 +581,8 @@ async fn rejects_normal_end_with_active_run_or_agent_and_allows_abort() {
             result: "candidate_ready".into(),
             evidence_id: None,
             candidate_sha: None,
+            qa: None,
+            findings: None,
             expected_revision: agent_attached.revision,
         })
         .await
@@ -567,6 +624,8 @@ async fn rejects_normal_end_with_active_run_or_agent_and_allows_abort() {
             result: "done".into(),
             evidence_id: None,
             candidate_sha: None,
+            qa: None,
+            findings: None,
             expected_revision: terminal_run.revision,
         })
         .await

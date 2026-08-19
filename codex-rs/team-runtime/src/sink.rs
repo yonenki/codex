@@ -15,9 +15,10 @@ pub trait TeamEventSink: Send + Sync {
     ) -> impl std::future::Future<Output = TeamRuntimeResult<()>> + Send;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RecordingSink {
-    events: Mutex<Vec<TeamEventEnvelope>>,
+    events: std::sync::Arc<Mutex<Vec<TeamEventEnvelope>>>,
+    batches: std::sync::Arc<Mutex<Vec<Vec<TeamEventEnvelope>>>>,
 }
 
 impl RecordingSink {
@@ -27,15 +28,27 @@ impl RecordingSink {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    pub fn batches(&self) -> Vec<Vec<TeamEventEnvelope>> {
+        self.batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl TeamEventSink for RecordingSink {
     async fn publish(&self, events: &[TeamEvent]) -> TeamRuntimeResult<()> {
-        let mut stored = self
-            .events
+        let batch: Vec<TeamEventEnvelope> =
+            events.iter().map(TeamEventEnvelope::from_event).collect();
+        self.events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        stored.extend(events.iter().map(TeamEventEnvelope::from_event));
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(batch.iter().cloned());
+        self.batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(batch);
         Ok(())
     }
 }
@@ -161,6 +174,7 @@ mod tests {
     #[test]
     fn contract_version_is_stable() {
         assert_eq!(TEAM_EVENTS_CONTRACT_VERSION, "team-events.v1");
+        assert_eq!(crate::TEAM_EVENTS_MAX_BATCH, 100);
         assert_eq!(
             team_events_path("http://127.0.0.1:9/", "pane 1"),
             "http://127.0.0.1:9/api/agents/pane%201/team-events"
