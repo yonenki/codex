@@ -162,25 +162,96 @@ pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionC
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum V1RawOp {
+    Spawn,
+    SendInput,
+    Wait,
+    Close,
+    Resume,
+}
+
+impl V1RawOp {
+    pub(crate) fn raw_tool(self) -> &'static str {
+        match self {
+            Self::Spawn => "multi_agent_v1.spawn_agent",
+            Self::SendInput => "multi_agent_v1.send_input",
+            Self::Wait => "multi_agent_v1.wait_agent",
+            Self::Close => "multi_agent_v1.close_agent",
+            Self::Resume => "multi_agent_v1.resume_agent",
+        }
+    }
+
+    pub(crate) fn has_no_equivalent_team_op(self) -> bool {
+        matches!(self, Self::Close | Self::Resume)
+    }
+}
+
+/// caller またはいずれかの target が Team-bound なら legacy v1 raw collaboration を拒否する。
+pub(crate) fn reject_team_bound_raw_collaboration_v1(
+    session: &Session,
+    caller_thread_id: &str,
+    target_thread_ids: &[&str],
+    op: V1RawOp,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    let caller_binding = team.binding_snapshot(caller_thread_id);
+    let target_binding = target_thread_ids
+        .iter()
+        .copied()
+        .find_map(|target| team.binding_snapshot(target));
+    let Some(binding) = caller_binding.as_ref().or(target_binding.as_ref()) else {
+        return Ok(());
+    };
+    let message = if op.has_no_equivalent_team_op() {
+        format!(
+            "Team-bound {} has no equivalent Team operation. Delegate Team operations to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id={}. {} cannot be used when the caller or any target is bound to a Team.",
+            op.raw_tool(),
+            binding.team_session_id,
+            op.raw_tool(),
+        )
+    } else {
+        format!(
+            "Team-bound {} is unsupported. Delegate Team operations to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id={}. {} cannot be used when the caller or any target is bound to a Team.",
+            op.raw_tool(),
+            binding.team_session_id,
+            op.raw_tool(),
+        )
+    };
+    Err(FunctionCallError::RespondToModel(message))
+}
+
+/// 未所属 root が open Team ありのまま legacy v1 raw spawn すると帰属を推測できない。
+pub(crate) fn reject_unbound_raw_spawn_when_teams_open_v1(
+    session: &Session,
+    caller_thread_id: &str,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    if team.binding_snapshot(caller_thread_id).is_none() && team.open_team_count() > 0 {
+        return Err(FunctionCallError::RespondToModel(
+            "open Team sessions require delegating to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id. multi_agent_v1.spawn_agent cannot infer Team identity.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RawCollaborationOp {
     Spawn,
     SendMessage,
     FollowupTask,
     Wait,
     Interrupt,
-    Close,
-    Resume,
 }
 
 impl RawCollaborationOp {
     fn team_tool(self) -> &'static str {
         match self {
-            Self::Spawn | Self::Resume => "team.spawn_agent",
+            Self::Spawn => "team.spawn_agent",
             Self::SendMessage => "team.send_message",
             Self::FollowupTask => "team.followup_agent",
             Self::Wait => "team.wait",
-            Self::Interrupt | Self::Close => "team.interrupt_agent",
+            Self::Interrupt => "team.interrupt_agent",
         }
     }
 
@@ -191,13 +262,7 @@ impl RawCollaborationOp {
             Self::FollowupTask => "collaboration.followup_task",
             Self::Wait => "collaboration.wait_agent",
             Self::Interrupt => "collaboration.interrupt_agent",
-            Self::Close => "multi_agent_v1.close_agent",
-            Self::Resume => "multi_agent_v1.resume_agent",
         }
-    }
-
-    fn unsupported_as_raw_team_op(self) -> bool {
-        matches!(self, Self::Close | Self::Resume)
     }
 }
 
@@ -217,22 +282,12 @@ pub(crate) fn reject_team_bound_raw_collaboration(
     let Some(binding) = caller_binding.as_ref().or(target_binding.as_ref()) else {
         return Ok(());
     };
-    let message = if op.unsupported_as_raw_team_op() {
-        format!(
-            "Team-bound {} is unsupported. Use {}(team_session_id={}, ...) as the managed Team operation. {} cannot be used when the caller or any target is bound to a Team.",
-            op.raw_tool(),
-            op.team_tool(),
-            binding.team_session_id,
-            op.raw_tool(),
-        )
-    } else {
-        format!(
-            "Team-bound collaboration must use {}(team_session_id={}, ...). {} cannot be used when the caller or any target is bound to a Team.",
-            op.team_tool(),
-            binding.team_session_id,
-            op.raw_tool(),
-        )
-    };
+    let message = format!(
+        "Team-bound collaboration must use {}(team_session_id={}, ...). {} cannot be used when the caller or any target is bound to a Team.",
+        op.team_tool(),
+        binding.team_session_id,
+        op.raw_tool(),
+    );
     Err(FunctionCallError::RespondToModel(message))
 }
 

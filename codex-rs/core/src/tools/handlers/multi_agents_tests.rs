@@ -4654,6 +4654,25 @@ completion = "The team session is closed."
     codex_team_graph::TeamGraphCatalog::new([graph])
 }
 
+async fn prepare_v1_session() -> (crate::session::session::Session, TurnContext, ThreadManager) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .disable(Feature::MultiAgentV2)
+        .expect("disable v2");
+    config.features.enable(Feature::Collab).expect("enable v1");
+    set_turn_config(&mut turn, config);
+    (session, turn, manager)
+}
+
 async fn prepare_v2_session() -> (crate::session::session::Session, TurnContext, ThreadManager) {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -4696,7 +4715,7 @@ async fn start_sample_team(
     started.team_session_id
 }
 
-fn assert_team_tool_guidance(err: FunctionCallError, team_tool: &str) {
+fn assert_v2_team_tool_guidance(err: FunctionCallError, team_tool: &str) {
     let FunctionCallError::RespondToModel(message) = err else {
         panic!("expected model-facing error");
     };
@@ -4708,6 +4727,46 @@ fn assert_team_tool_guidance(err: FunctionCallError, team_tool: &str) {
         message.contains("team_session_id"),
         "error should require team_session_id: {message}"
     );
+}
+
+fn assert_v1_team_delegation_guidance(
+    err: FunctionCallError,
+    v1_tool: &str,
+    is_close_or_resume: bool,
+) {
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected model-facing error");
+    };
+    assert!(
+        message.contains(v1_tool),
+        "error should name {v1_tool}: {message}"
+    );
+    assert!(
+        message.contains("unbound root coordinator"),
+        "error should guide delegating to unbound root coordinator: {message}"
+    );
+    assert!(
+        message.contains("multi_agent_v2"),
+        "error should mention multi_agent_v2: {message}"
+    );
+    assert!(
+        message.contains("team_session_id"),
+        "error should require team_session_id: {message}"
+    );
+    assert!(
+        !message.contains("team.spawn_agent")
+            && !message.contains("team.send_message")
+            && !message.contains("team.followup_agent")
+            && !message.contains("team.wait")
+            && !message.contains("team.interrupt_agent"),
+        "error must not guide calling team.* directly in v1: {message}"
+    );
+    if is_close_or_resume {
+        assert!(
+            message.contains("has no equivalent Team operation"),
+            "error should state no equivalent Team operation: {message}"
+        );
+    }
 }
 
 fn expect_model_err(
@@ -4738,7 +4797,7 @@ async fn raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
             .await,
         "unbound root with open Team",
     );
-    assert_team_tool_guidance(open_team, "team.spawn_agent");
+    assert_v2_team_tool_guidance(open_team, "team.spawn_agent");
 
     let pending = session
         .services
@@ -4766,7 +4825,7 @@ async fn raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
             .await,
         "Team-bound child raw spawn",
     );
-    assert_team_tool_guidance(bound_caller, "team.spawn_agent");
+    assert_v2_team_tool_guidance(bound_caller, "team.spawn_agent");
 }
 
 #[tokio::test]
@@ -4846,7 +4905,7 @@ async fn raw_message_followup_and_interrupt_reject_bound_caller_or_target() {
                 "bound target interrupt",
             ),
         };
-        assert_team_tool_guidance(err, expected_tool);
+        assert_v2_team_tool_guidance(err, expected_tool);
     }
 }
 
@@ -4885,7 +4944,7 @@ async fn raw_same_team_message_is_rejected_and_unknown_target_keeps_lookup_error
             .await,
         "same-team raw send",
     );
-    assert_team_tool_guidance(same_team, "team.send_message");
+    assert_v2_team_tool_guidance(same_team, "team.send_message");
 
     let missing = expect_model_err(
         SendMessageHandlerV2
@@ -4939,7 +4998,7 @@ async fn raw_wait_rejects_bound_caller_and_multi_target_atomically() {
             .await,
         "bound caller wait",
     );
-    assert_team_tool_guidance(bound_wait, "team.wait");
+    assert_v2_team_tool_guidance(bound_wait, "team.wait");
 
     let (unbound_session, unbound_turn, _manager) = prepare_v2_session().await;
     let team_session_id = start_sample_team(&unbound_session).await;
@@ -4972,12 +5031,12 @@ async fn raw_wait_rejects_bound_caller_and_multi_target_atomically() {
             .await,
         "multi-target wait",
     );
-    assert_team_tool_guidance(multi, "team.wait");
+    assert_v1_team_delegation_guidance(multi, "multi_agent_v1.wait_agent", false);
 }
 
 #[tokio::test]
 async fn v1_raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
-    let (session, turn, _manager) = prepare_v2_session().await;
+    let (session, turn, _manager) = prepare_v1_session().await;
     let team_session_id = start_sample_team(&session).await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -4993,7 +5052,7 @@ async fn v1_raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
             .await,
         "unbound root with open Team",
     );
-    assert_team_tool_guidance(open_team, "team.spawn_agent");
+    assert_v1_team_delegation_guidance(open_team, "multi_agent_v1.spawn_agent", false);
 
     let pending = session
         .services
@@ -5021,12 +5080,12 @@ async fn v1_raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
             .await,
         "Team-bound child raw spawn",
     );
-    assert_team_tool_guidance(bound_caller, "team.spawn_agent");
+    assert_v1_team_delegation_guidance(bound_caller, "multi_agent_v1.spawn_agent", false);
 }
 
 #[tokio::test]
 async fn v1_send_input_rejects_bound_caller_or_target_for_send_and_interrupt() {
-    let (session, turn, _manager) = prepare_v2_session().await;
+    let (session, turn, _manager) = prepare_v1_session().await;
     let team_session_id = start_sample_team(&session).await;
     let same_team_target = ThreadId::new();
     let cross_team = start_sample_team(&session).await;
@@ -5063,7 +5122,7 @@ async fn v1_send_input_rejects_bound_caller_or_target_for_send_and_interrupt() {
             .await,
         "same-team send_input",
     );
-    assert_team_tool_guidance(same_send, "team.followup_agent");
+    assert_v1_team_delegation_guidance(same_send, "multi_agent_v1.send_input", false);
 
     let cross_interrupt = expect_model_err(
         SendInputHandler
@@ -5080,12 +5139,12 @@ async fn v1_send_input_rejects_bound_caller_or_target_for_send_and_interrupt() {
             .await,
         "cross-team interrupt send_input",
     );
-    assert_team_tool_guidance(cross_interrupt, "team.interrupt_agent");
+    assert_v1_team_delegation_guidance(cross_interrupt, "multi_agent_v1.send_input", false);
 }
 
 #[tokio::test]
 async fn v1_close_and_resume_reject_team_bound_without_bypass() {
-    let (session, turn, _manager) = prepare_v2_session().await;
+    let (session, turn, _manager) = prepare_v1_session().await;
     let team_session_id = start_sample_team(&session).await;
     let target = ThreadId::new();
     let pending = session
@@ -5116,7 +5175,7 @@ async fn v1_close_and_resume_reject_team_bound_without_bypass() {
             .await,
         "bound close_agent",
     );
-    assert_team_tool_guidance(close, "team.interrupt_agent");
+    assert_v1_team_delegation_guidance(close, "multi_agent_v1.close_agent", true);
 
     let resume = expect_model_err(
         ResumeAgentHandler
@@ -5129,38 +5188,65 @@ async fn v1_close_and_resume_reject_team_bound_without_bypass() {
             .await,
         "bound resume_agent",
     );
-    assert_team_tool_guidance(resume, "team.spawn_agent");
+    assert_v1_team_delegation_guidance(resume, "multi_agent_v1.resume_agent", true);
+}
+
+#[tokio::test]
+async fn v1_wait_rejects_bound_caller_and_bound_target() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let bound_target = ThreadId::new();
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(bound_target.to_string(), pending)
+        .await
+        .expect("bind target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let bound_target_wait = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [bound_target.to_string()]
+                })),
+            ))
+            .await,
+        "bound target wait_agent v1",
+    );
+    assert_v1_team_delegation_guidance(bound_target_wait, "multi_agent_v1.wait_agent", false);
 }
 
 #[tokio::test]
 async fn v1_raw_ops_keep_unknown_target_and_allow_unbound_success_path() {
-    let (session, turn, _manager) = prepare_v2_session().await;
+    let (session, turn, _manager) = prepare_v1_session().await;
     let caller = session.thread_id.to_string();
-    reject_unbound_raw_spawn_when_teams_open(&session, &caller, "collaboration.spawn_agent")
-        .expect("no open Team");
-    reject_team_bound_raw_collaboration(&session, &caller, &[], RawCollaborationOp::Spawn)
+    reject_unbound_raw_spawn_when_teams_open_v1(&session, &caller).expect("no open Team");
+    reject_team_bound_raw_collaboration_v1(&session, &caller, &[], V1RawOp::Spawn)
         .expect("unbound spawn");
-    reject_team_bound_raw_collaboration(
+    reject_team_bound_raw_collaboration_v1(
         &session,
         &caller,
         &[caller.as_str()],
-        RawCollaborationOp::FollowupTask,
+        V1RawOp::SendInput,
     )
     .expect("unbound send");
-    reject_team_bound_raw_collaboration(
-        &session,
-        &caller,
-        &[caller.as_str()],
-        RawCollaborationOp::Close,
-    )
-    .expect("unbound close");
-    reject_team_bound_raw_collaboration(
-        &session,
-        &caller,
-        &[caller.as_str()],
-        RawCollaborationOp::Resume,
-    )
-    .expect("unbound resume");
+    reject_team_bound_raw_collaboration_v1(&session, &caller, &[caller.as_str()], V1RawOp::Close)
+        .expect("unbound close");
+    reject_team_bound_raw_collaboration_v1(&session, &caller, &[caller.as_str()], V1RawOp::Resume)
+        .expect("unbound resume");
 
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -5182,7 +5268,98 @@ async fn v1_raw_ops_keep_unknown_target_and_allow_unbound_success_path() {
         panic!("lookup should stay model-facing");
     };
     assert!(
-        !message.contains("team.followup_agent") && !message.contains("team.send_message"),
+        !message.contains("multi_agent_v2") && !message.contains("unbound root coordinator"),
         "unknown target must keep the existing lookup error: {message}"
     );
+}
+
+#[tokio::test]
+async fn tool_plan_hides_team_tools_in_v1_and_exposes_team_tools_in_v2() {
+    let (v1_session, v1_turn, _manager) = prepare_v1_session().await;
+    let step_store = codex_extension_api::ExtensionData::new("test");
+    let v1_turn = Arc::new(v1_turn);
+    let v1_step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&v1_turn));
+    let v1_router = crate::tools::spec_plan::build_tool_router(
+        &v1_session,
+        &v1_turn,
+        &v1_step_context.environments,
+        &v1_step_context.mcp,
+        false,
+        &step_store,
+        None,
+    )
+    .expect("v1 router");
+
+    let v1_visible = v1_router.model_visible_specs();
+    assert!(
+        !v1_visible.iter().any(|spec| spec.name() == "team"),
+        "v1 must not expose team namespace: {v1_visible:?}"
+    );
+    assert!(
+        !v1_visible
+            .iter()
+            .any(|spec| spec.name().starts_with("team.")),
+        "v1 must not expose team.* tools: {v1_visible:?}"
+    );
+    assert!(
+        v1_visible
+            .iter()
+            .any(|spec| spec.name() == MULTI_AGENT_V1_NAMESPACE),
+        "v1 must expose multi_agent_v1 namespace: {v1_visible:?}"
+    );
+    assert!(
+        !v1_router
+            .registered_tool_names_for_test()
+            .iter()
+            .any(|name| name.name.starts_with("team.") || name.name == "team"),
+        "v1 must not register team tools"
+    );
+
+    let (v2_session, v2_turn, _manager) = prepare_v2_session().await;
+    let step_store = codex_extension_api::ExtensionData::new("test");
+    let v2_turn = Arc::new(v2_turn);
+    let v2_step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&v2_turn));
+    let v2_router = crate::tools::spec_plan::build_tool_router(
+        &v2_session,
+        &v2_turn,
+        &v2_step_context.environments,
+        &v2_step_context.mcp,
+        false,
+        &step_store,
+        None,
+    )
+    .expect("v2 router");
+
+    let v2_visible = v2_router.model_visible_specs();
+    assert!(
+        !v2_visible
+            .iter()
+            .any(|spec| spec.name() == MULTI_AGENT_V1_NAMESPACE),
+        "v2 must not expose multi_agent_v1 namespace: {v2_visible:?}"
+    );
+    let team_spec = v2_visible
+        .iter()
+        .find(|spec| spec.name() == "team")
+        .expect("v2 unbound root must expose team namespace");
+    let codex_tools::ToolSpec::Namespace(team_namespace) = team_spec else {
+        panic!("team spec must be a namespace tool");
+    };
+    let team_function_names = team_namespace
+        .tools
+        .iter()
+        .map(|tool| match tool {
+            codex_tools::ResponsesApiNamespaceTool::Function(f) => f.name.as_str(),
+            codex_tools::ResponsesApiNamespaceTool::Custom(c) => c.name.as_str(),
+        })
+        .collect::<Vec<_>>();
+    assert!(team_function_names.contains(&"spawn_agent"));
+    assert!(team_function_names.contains(&"send_message"));
+    assert!(team_function_names.contains(&"followup_agent"));
+    assert!(team_function_names.contains(&"wait"));
+    assert!(team_function_names.contains(&"interrupt_agent"));
+    assert!(team_function_names.contains(&"list_agents"));
+    assert!(team_function_names.contains(&"list_team_graphs"));
+    assert!(team_function_names.contains(&"list_teams"));
+    assert!(team_function_names.contains(&"start_team"));
+    assert!(team_function_names.contains(&"get_team_status"));
 }

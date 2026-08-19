@@ -48,11 +48,11 @@ async fn handle_resume_agent(
     })?;
     let caller_thread_id = session.thread_id.to_string();
     let target = receiver_thread_id.to_string();
-    reject_team_bound_raw_collaboration(
+    reject_team_bound_raw_collaboration_v1(
         &session,
         &caller_thread_id,
         &[target.as_str()],
-        RawCollaborationOp::Resume,
+        V1RawOp::Resume,
     )?;
     let receiver_agent = session
         .services

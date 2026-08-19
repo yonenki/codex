@@ -41,11 +41,11 @@ async fn handle_close_agent(
     let agent_id = parse_agent_id_target(&args.target)?;
     let caller_thread_id = session.thread_id.to_string();
     let target = agent_id.to_string();
-    reject_team_bound_raw_collaboration(
+    reject_team_bound_raw_collaboration_v1(
         &session,
         &caller_thread_id,
         &[target.as_str()],
-        RawCollaborationOp::Close,
+        V1RawOp::Close,
     )?;
     let receiver_agent = session.services.agent_control.get_agent_metadata(agent_id);
     let known_agent = receiver_agent.is_some();
