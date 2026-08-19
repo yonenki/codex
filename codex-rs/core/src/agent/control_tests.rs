@@ -285,6 +285,7 @@ fn register_test_agent_metadata(
         agent_path: Some(agent_path),
         agent_nickname: Some(agent_nickname.to_string()),
         agent_role: Some(agent_role.to_string()),
+        metadata: None,
     });
 }
 
@@ -873,6 +874,287 @@ async fn external_followup_emits_second_terminal_with_backend_identity() {
 }
 
 #[tokio::test]
+async fn queued_followup_emits_start_after_current_generation_stops() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "reviewer",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "grok-build".to_string(),
+            model: Some("grok-test".to_string()),
+        },
+    );
+    harness.control.start_completion_watcher(
+        child_thread_id,
+        parent_thread_id,
+        child_agent_path.to_string(),
+        Some(child_agent_path),
+    );
+    harness
+        .control
+        .external_agents
+        .begin_turn_for_tests(child_thread_id);
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let hook_events = std::sync::Arc::clone(&events);
+    let (hook_entered_tx, hook_entered_rx) = tokio::sync::oneshot::channel();
+    let (release_hook_tx, release_hook_rx) = tokio::sync::oneshot::channel();
+    let send = tokio::spawn({
+        let control = harness.control.clone();
+        async move {
+            control
+                .send_external_inter_agent_communication_with_start_hook(
+                    child_thread_id,
+                    InterAgentCommunication::new(
+                        AgentPath::root(),
+                        AgentPath::root().join("worker").expect("worker path"),
+                        Vec::new(),
+                        "queued follow-up".to_string(),
+                        /*trigger_turn*/ true,
+                    ),
+                    AgentCommunicationContext::new(
+                        AgentCommunicationKind::Followup,
+                        ThreadId::new(),
+                    ),
+                    move || {
+                        let hook_events = std::sync::Arc::clone(&hook_events);
+                        async move {
+                            hook_events.lock().expect("event log").push("start");
+                            let _ = hook_entered_tx.send(());
+                            let _ = release_hook_rx.await;
+                        }
+                    },
+                )
+                .await
+        }
+    });
+
+    timeout(Duration::from_millis(200), hook_entered_rx)
+        .await
+        .expect_err("queued follow-up must not fire Start before the current generation stops");
+    let (_, requests_turn) = send.await.expect("send task").expect("queued follow-up");
+    assert!(requests_turn);
+    assert!(
+        events.lock().expect("event log").is_empty(),
+        "Start must wait for the real next generation: {:?}",
+        events.lock().expect("event log")
+    );
+
+    harness.control.external_agents.finish_turn_for_tests(
+        child_thread_id,
+        AgentStatus::Completed(Some("current turn done".to_string())),
+    );
+    let stopped = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(stopped[0].status, SubAgentTerminalStatus::Completed);
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if events.lock().expect("event log").as_slice() == ["start"] {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Start should run after Stop");
+    release_hook_tx.send(()).expect("release start hook");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                harness.control.get_status(child_thread_id).await,
+                AgentStatus::Running | AgentStatus::Errored(_)
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("next generation should start after the deferred Start hook");
+    assert_eq!(*events.lock().expect("event log"), ["start"]);
+}
+
+#[tokio::test]
+async fn followup_after_terminal_waits_for_watcher_stop_before_next_start() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "reviewer",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "grok-build".to_string(),
+            model: Some("grok-test".to_string()),
+        },
+    );
+    harness
+        .control
+        .external_agents
+        .begin_turn_for_tests(child_thread_id);
+    harness.control.external_agents.finish_turn_for_tests(
+        child_thread_id,
+        AgentStatus::Completed(Some("generation-one".to_string())),
+    );
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(vec!["start-n"]));
+    let hook_events = std::sync::Arc::clone(&events);
+    let (hook_entered_tx, hook_entered_rx) = tokio::sync::oneshot::channel();
+    let (release_hook_tx, release_hook_rx) = tokio::sync::oneshot::channel();
+    let (_, requests_turn) = harness
+        .control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "follow-up after terminal".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            move || {
+                let hook_events = std::sync::Arc::clone(&hook_events);
+                async move {
+                    hook_events.lock().expect("event log").push("start-n1");
+                    let _ = hook_entered_tx.send(());
+                    let _ = release_hook_rx.await;
+                }
+            },
+        )
+        .await
+        .expect("follow-up after terminal should queue");
+    assert!(requests_turn);
+    assert_eq!(
+        *events.lock().expect("event log"),
+        ["start-n"],
+        "Start(N+1) must not run before the watcher confirms Stop(N)"
+    );
+    assert_matches!(
+        harness.control.get_status(child_thread_id).await,
+        AgentStatus::Completed(_)
+    );
+
+    let first_stop = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(first_stop[0].status, SubAgentTerminalStatus::Completed);
+    timeout(Duration::from_secs(2), hook_entered_rx)
+        .await
+        .expect("Start(N+1) should run after Stop(N)")
+        .expect("start hook sender");
+    release_hook_tx.send(()).expect("release start hook");
+
+    let second_stop = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(second_stop[0].status, SubAgentTerminalStatus::Errored);
+    assert_eq!(*events.lock().expect("event log"), ["start-n", "start-n1"]);
+}
+
+#[tokio::test]
+async fn external_interrupted_generation_keeps_watcher_for_queued_followup() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "worker",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        },
+    );
+    harness.control.start_completion_watcher(
+        child_thread_id,
+        parent_thread_id,
+        child_agent_path.to_string(),
+        Some(child_agent_path),
+    );
+    harness
+        .control
+        .external_agents
+        .begin_turn_for_tests(child_thread_id);
+
+    harness
+        .control
+        .external_agents
+        .interrupt(child_thread_id)
+        .expect("interrupt generation one");
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let starts_for_hook = Arc::clone(&starts);
+    let (_, requests_turn) = harness
+        .control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "follow-up while interrupted Stop is pending".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            move || async move {
+                starts_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("queue follow-up behind interrupted terminal");
+    assert!(requests_turn);
+
+    let terminals = receive_terminal_events(&parent_thread, child_thread_id, 2).await;
+    assert_eq!(
+        terminals
+            .iter()
+            .map(|event| event.status)
+            .collect::<Vec<_>>(),
+        vec![
+            SubAgentTerminalStatus::Interrupted,
+            SubAgentTerminalStatus::Errored,
+        ]
+    );
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn external_turn_start_hook_precedes_running_status() {
     let control = AgentControl::default();
     let child_thread_id = ThreadId::new();
@@ -1057,7 +1339,7 @@ async fn external_immediate_reservation_rolls_back_when_start_hook_is_cancelled(
 }
 
 #[tokio::test]
-async fn external_queued_reservation_rolls_back_when_start_hook_is_cancelled() {
+async fn external_queued_generation_rolls_back_when_deferred_start_hook_is_cancelled() {
     let control = AgentControl::default();
     let agent_id = ThreadId::new();
     control.external_agents.register_for_tests(
@@ -1069,11 +1351,33 @@ async fn external_queued_reservation_rolls_back_when_start_hook_is_cancelled() {
     );
     control.external_agents.begin_turn_for_tests(agent_id);
 
-    cancel_external_submission_before_start(&control, agent_id).await;
+    let (_, requests_turn) = control
+        .send_external_inter_agent_communication_with_start_hook(
+            agent_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "queued follow-up".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            || std::future::ready(()),
+        )
+        .await
+        .expect("queued follow-up should reserve");
+    assert!(requests_turn);
+
     control.external_agents.finish_turn_for_tests(
         agent_id,
         AgentStatus::Completed(Some("current turn done".to_string())),
     );
+    control.external_agents.ack_terminal_observer(agent_id, 1);
+    let pending = control
+        .external_agents
+        .take_ready_pending_start(agent_id)
+        .expect("queued generation should be ready after Stop");
+    drop(pending);
     assert_matches!(
         control.get_status(agent_id).await,
         AgentStatus::Completed(_)
@@ -1085,14 +1389,8 @@ async fn external_queued_reservation_rolls_back_when_start_hook_is_cancelled() {
     );
 }
 
-async fn setup_crossed_queued_reservations() -> (
-    AgentControl,
-    ThreadId,
-    tokio::task::JoinHandle<CodexResult<(String, bool)>>,
-    tokio::sync::oneshot::Sender<()>,
-    tokio::task::JoinHandle<CodexResult<(String, bool)>>,
-    tokio::sync::oneshot::Sender<()>,
-) {
+#[tokio::test]
+async fn two_queued_followups_start_together_after_current_generation_stops() {
     let control = AgentControl::default();
     let agent_id = ThreadId::new();
     control.external_agents.register_for_tests(
@@ -1103,57 +1401,41 @@ async fn setup_crossed_queued_reservations() -> (
         },
     );
     control.external_agents.begin_turn_for_tests(agent_id);
-    let (first_task, first_release) =
-        hold_external_submission_before_start(&control, agent_id, "follow-up A").await;
-    control.external_agents.finish_turn_for_tests(
-        agent_id,
-        AgentStatus::Completed(Some("current turn done".to_string())),
-    );
-    let (second_task, second_release) =
-        hold_external_submission_before_start(&control, agent_id, "follow-up B").await;
+    for message in ["follow-up A", "follow-up B"] {
+        let (_, requests_turn) = control
+            .send_external_inter_agent_communication_with_start_hook(
+                agent_id,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::root().join("worker").expect("worker path"),
+                    Vec::new(),
+                    message.to_string(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+                || std::future::ready(()),
+            )
+            .await
+            .expect("queued follow-up should reserve");
+        assert!(requests_turn);
+    }
     assert_eq!(
         control
             .external_agents
             .queued_message_contents_for_tests(agent_id),
         vec!["follow-up A".to_string(), "follow-up B".to_string()]
     );
-    (
-        control,
+
+    control.external_agents.finish_turn_for_tests(
         agent_id,
-        first_task,
-        first_release,
-        second_task,
-        second_release,
-    )
-}
-
-#[tokio::test]
-async fn crossed_queued_reservation_keeps_second_commit_after_first_is_cancelled() {
-    let (control, agent_id, first_task, _first_release, second_task, second_release) =
-        setup_crossed_queued_reservations().await;
-
-    first_task.abort();
-    assert!(
-        first_task
-            .await
-            .expect_err("first reservation should be cancelled")
-            .is_cancelled()
+        AgentStatus::Completed(Some("current turn done".to_string())),
     );
-    assert_eq!(
-        control
-            .external_agents
-            .queued_message_contents_for_tests(agent_id),
-        vec!["follow-up B".to_string()]
-    );
-
-    second_release
-        .send(())
-        .expect("release second reservation hook");
-    let (_, requests_turn) = second_task
-        .await
-        .expect("second reservation task")
-        .expect("second reservation should commit");
-    assert!(requests_turn);
+    control.external_agents.ack_terminal_observer(agent_id, 1);
+    let pending = control
+        .external_agents
+        .take_ready_pending_start(agent_id)
+        .expect("queued follow-ups should start after Stop");
+    pending.start().await;
     let mut status_rx = control
         .subscribe_status(agent_id)
         .await
@@ -1172,23 +1454,45 @@ async fn crossed_queued_reservation_keeps_second_commit_after_first_is_cancelled
 }
 
 #[tokio::test]
-async fn crossed_queued_reservations_do_not_block_followup_after_both_are_cancelled() {
-    let (control, agent_id, first_task, _first_release, second_task, _second_release) =
-        setup_crossed_queued_reservations().await;
-
-    first_task.abort();
-    assert!(
-        first_task
-            .await
-            .expect_err("first reservation should be cancelled")
-            .is_cancelled()
+async fn dropping_a_ready_queued_generation_does_not_block_later_followup() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
     );
-    second_task.abort();
-    assert!(
-        second_task
+    control.external_agents.begin_turn_for_tests(agent_id);
+    for message in ["follow-up A", "follow-up B"] {
+        control
+            .send_external_inter_agent_communication_with_start_hook(
+                agent_id,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::root().join("worker").expect("worker path"),
+                    Vec::new(),
+                    message.to_string(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+                || std::future::ready(()),
+            )
             .await
-            .expect_err("second reservation should be cancelled")
-            .is_cancelled()
+            .expect("queued follow-up should reserve");
+    }
+
+    control.external_agents.finish_turn_for_tests(
+        agent_id,
+        AgentStatus::Completed(Some("current turn done".to_string())),
+    );
+    control.external_agents.ack_terminal_observer(agent_id, 1);
+    drop(
+        control
+            .external_agents
+            .take_ready_pending_start(agent_id)
+            .expect("queued generation should be ready after Stop"),
     );
     assert!(
         control

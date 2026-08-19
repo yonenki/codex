@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::events::common::SubagentBackendIdentity;
 use crate::events::common::SubagentHookContext;
 
 const GENERATED_DIR: &str = "generated";
@@ -546,6 +547,10 @@ pub(crate) struct SubagentStartCommandInput {
     pub permission_mode: String,
     pub agent_id: String,
     pub agent_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<SubagentBackendIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -605,6 +610,8 @@ pub(crate) struct SubagentStopCommandInput {
     pub stop_hook_active: bool,
     pub agent_id: String,
     pub agent_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<SubagentBackendIdentity>,
     pub last_assistant_message: NullableString,
 }
 

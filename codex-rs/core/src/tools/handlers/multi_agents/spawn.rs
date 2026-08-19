@@ -54,6 +54,7 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+    let observer_metadata = parse_spawn_observer_metadata(args.metadata)?;
     let role_name = args
         .agent_type
         .as_deref()
@@ -139,6 +140,7 @@ async fn handle_spawn_agent(
             root_turn_id: turn.turn_metadata_state.root_turn_id(),
             environments: Some(step_context.environments.to_selections()),
             multi_agent_v2_usage_hints: None,
+            metadata: observer_metadata,
         },
     ))
     .await
@@ -243,6 +245,7 @@ struct SpawnAgentArgs {
     service_tier: Option<String>,
     #[serde(default)]
     fork_context: bool,
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

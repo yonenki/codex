@@ -85,6 +85,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) root_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
     pub(crate) multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
+    pub(crate) metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -340,8 +341,8 @@ impl AgentControl {
         on_started: F,
     ) -> CodexResult<(String, bool)>
     where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = ()>,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         if !self.external_agents.contains(agent_id) {
             return Err(CodexErr::ThreadNotFound(agent_id));
@@ -368,14 +369,55 @@ impl AgentControl {
         }
         let communication_id = submission.submission_id().to_string();
         let requests_turn = submission.requests_turn();
-        if requests_turn {
+        if submission.starts_generation_now() {
             on_started().await;
+            let _ = submission.start();
+        } else if requests_turn {
+            // 実行中の queued follow-up は次generationの予約にすぎない。
+            // Start は現turnのStopのあと、そのgenerationが実際に始まるときに出す。
+            submission.defer_start_hook(Box::new(move || Box::pin(on_started())));
+            if let Some(pending) = submission.start() {
+                pending.start().await;
+            }
+        } else {
+            let _ = submission.start();
         }
-        submission.start();
         if requests_turn {
             self.maybe_start_external_completion_watcher(agent_id);
         }
         Ok((communication_id, requests_turn))
+    }
+
+    pub(super) async fn promote_ready_external_generation(&self, agent_id: ThreadId) {
+        if let Some(pending) = self.external_agents.take_ready_pending_start(agent_id) {
+            pending.start().await;
+        }
+    }
+
+    async fn confirm_external_terminal_and_promote(
+        &self,
+        child_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        child_agent_path: Option<AgentPath>,
+        status: &AgentStatus,
+        generation: Option<u64>,
+        forward_completion: bool,
+    ) {
+        if forward_completion && let Some(child_agent_path) = child_agent_path {
+            self.forward_v2_child_completion_to_parent(
+                child_thread_id,
+                parent_thread_id,
+                child_agent_path,
+                status,
+            )
+            .await;
+        }
+        if let Some(generation) = generation {
+            self.external_agents
+                .ack_terminal_observer(child_thread_id, generation);
+        }
+        self.promote_ready_external_generation(child_thread_id)
+            .await;
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -789,36 +831,30 @@ impl AgentControl {
                                 .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
                                 .await;
                         }
-                        if matches!(status, AgentStatus::Interrupted) {
-                            // ACP agents finish their current lifecycle at interruption. Legacy
-                            // native agents remain watchable and may transition back to Running.
-                            if is_external {
+                        if should_notify && is_external {
+                            let interrupted = matches!(status, AgentStatus::Interrupted);
+                            control
+                                .confirm_external_terminal_and_promote(
+                                    child_thread_id,
+                                    parent_thread_id,
+                                    child_agent_path.clone(),
+                                    &status,
+                                    external_generation,
+                                    !interrupted,
+                                )
+                                .await;
+                        }
+                        // An ACP terminal closes one generation, not the watcher. Follow-ups can
+                        // promote the same agent immediately after observer acknowledgement.
+                        let keep_watching_external = is_external
+                            && is_final(&status)
+                            && !matches!(status, AgentStatus::Shutdown);
+                        if keep_watching_external {
+                            if status_rx.changed().await.is_err() {
                                 return;
                             }
-                        } else {
-                            let keep_watching_external = is_external
-                                && is_final(&status)
-                                && !matches!(status, AgentStatus::Shutdown);
-                            if should_notify
-                                && keep_watching_external
-                                && let Some(child_agent_path) = child_agent_path.clone()
-                            {
-                                control
-                                    .forward_v2_child_completion_to_parent(
-                                        child_thread_id,
-                                        parent_thread_id,
-                                        child_agent_path,
-                                        &status,
-                                    )
-                                    .await;
-                            }
-                            if keep_watching_external {
-                                if status_rx.changed().await.is_err() {
-                                    return;
-                                }
-                                status = status_rx.borrow().clone();
-                                continue;
-                            }
+                            status = status_rx.borrow().clone();
+                            continue;
                         }
 
                         if is_final(&status) {
@@ -844,14 +880,24 @@ impl AgentControl {
                         status = external_status.clone();
                     }
                     let external_generation = external_lifecycle.map(|(_, generation)| generation);
-                    if terminal_status_tracker.should_notify(&status, external_generation)
-                        && !native_v2
-                    {
-                        control
-                            .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
-                            .await;
-                        if matches!(status, AgentStatus::Interrupted) && is_external {
-                            return;
+                    if terminal_status_tracker.should_notify(&status, external_generation) {
+                        if !native_v2 {
+                            control
+                                .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
+                                .await;
+                        }
+                        if is_external {
+                            let interrupted = matches!(status, AgentStatus::Interrupted);
+                            control
+                                .confirm_external_terminal_and_promote(
+                                    child_thread_id,
+                                    parent_thread_id,
+                                    child_agent_path.clone(),
+                                    &status,
+                                    external_generation,
+                                    !interrupted,
+                                )
+                                .await;
                         }
                     }
                     if !is_final(&status) {
@@ -861,6 +907,9 @@ impl AgentControl {
                 }
             };
 
+            if is_external {
+                return;
+            }
             let Ok(state) = control.upgrade() else {
                 return;
             };
@@ -985,6 +1034,7 @@ impl AgentControl {
             agent_path,
             agent_nickname,
             agent_role,
+            metadata: None,
         })
     }
 

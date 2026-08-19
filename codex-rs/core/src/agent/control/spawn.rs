@@ -258,14 +258,20 @@ impl AgentControl {
         .await
     }
 
-    pub(crate) async fn spawn_external_agent_with_communication(
+    pub(crate) async fn spawn_external_agent_with_communication<F, Fut>(
         &self,
         config: Config,
         backend: ExternalAgentBackend,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         session_source: SessionSource,
-    ) -> CodexResult<LiveAgent> {
+        metadata: Option<std::collections::BTreeMap<String, String>>,
+        on_started: F,
+    ) -> CodexResult<LiveAgent>
+    where
+        F: FnOnce(ThreadId) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         self.ensure_execution_capacity(MultiAgentVersion::V2, &session_source)?;
         let mut reservation = self
             .state
@@ -291,6 +297,7 @@ impl AgentControl {
             agent_role,
             /*preferred_agent_nickname*/ None,
         )?;
+        agent_metadata.metadata = metadata;
         let agent_id = self.generate_thread_id();
         let mut env = create_env(&config.permissions.shell_environment_policy, Some(agent_id));
         inject_session_id_env(&mut env, self.session_id());
@@ -334,12 +341,11 @@ impl AgentControl {
         self.external_agents
             .register(agent_id, backend, config.cwd.to_path_buf(), env)?;
         if let Err(error) = self
-            .send_inter_agent_communication(
+            .send_external_inter_agent_communication_with_start_hook(
                 agent_id,
                 communication,
                 context,
-                /*parent_turn_id*/ None,
-                /*root_turn_id*/ None,
+                move || on_started(agent_id),
             )
             .await
         {
@@ -573,6 +579,7 @@ impl AgentControl {
             }
             other => (other, AgentMetadata::default()),
         };
+        agent_metadata.metadata = options.metadata.clone();
         let notification_source = session_source.clone();
 
         // The same `AgentControl` is sent to spawn the thread.

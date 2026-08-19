@@ -6,7 +6,10 @@ use crate::agent::role::acp_backend;
 use crate::agent::role::acp_role_settings;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
+use crate::external_subagent_hooks::ExternalSubagentHookIdentity;
+use crate::external_subagent_hooks::run_external_subagent_start_hook;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::handlers::multi_agents_common::parse_spawn_observer_metadata;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
@@ -29,6 +32,7 @@ struct SpawnArgs {
     model: Option<String>,
     effort: Option<String>,
     agent_type: Option<String>,
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -149,6 +153,10 @@ fn spawn_spec() -> ToolSpec {
                 "Complete plain-text task for the ACP agent. No parent conversation history is inherited."
                     .to_string(),
             )),
+        ),
+        (
+            "metadata".to_string(),
+            crate::tools::handlers::multi_agents_spec::spawn_observer_metadata_schema(),
         ),
     ]);
     ToolSpec::Function(ResponsesApiTool {
@@ -304,6 +312,7 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
     } = invocation;
     let turn = &step_context.turn;
     let args: SpawnArgs = parse_arguments(&function_arguments(payload)?)?;
+    let observer_metadata = parse_spawn_observer_metadata(args.metadata)?;
     let message = message_content(args.message)?;
     let explicit_backend = explicit_backend(args.harness, args.model, args.effort)?;
     let mut config = build_agent_spawn_config(
@@ -374,6 +383,13 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
     );
     let model = selection.backend.model;
     let backend = acp_backend(harness.clone(), model.clone(), selection.backend.effort);
+    let agent_type = role_name.unwrap_or(ACP_ROLE_NAME).to_string();
+    let start_session = Arc::clone(&session);
+    let start_turn = Arc::clone(turn);
+    let start_agent_path = agent_path.clone();
+    let start_harness = harness.clone();
+    let start_model = model.clone();
+    let start_metadata = observer_metadata.clone();
     let spawned = session
         .services
         .agent_control
@@ -383,6 +399,34 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
             communication,
             AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id),
             spawn_source,
+            observer_metadata,
+            move |agent_id| async move {
+                run_external_subagent_start_hook(
+                    &start_session,
+                    &start_turn,
+                    ExternalSubagentHookIdentity {
+                        agent_id,
+                        agent_type,
+                        harness: start_harness.clone(),
+                        model: start_model.clone(),
+                        metadata: start_metadata,
+                    },
+                )
+                .await;
+                emit_sub_agent_activity(
+                    &start_session,
+                    &start_turn,
+                    SubAgentActivityItem {
+                        id: call_id,
+                        agent_thread_id: agent_id,
+                        agent_path: start_agent_path,
+                        kind: SubAgentActivityKind::Started,
+                        harness: Some(start_harness),
+                        model: start_model,
+                    },
+                )
+                .await;
+            },
         )
         .await
         .map_err(collab_spawn_error)?;
@@ -399,19 +443,6 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
                 candidate_index,
             );
     }
-    emit_sub_agent_activity(
-        &session,
-        turn,
-        SubAgentActivityItem {
-            id: call_id,
-            agent_thread_id: spawned.thread_id,
-            agent_path: agent_path.clone(),
-            kind: SubAgentActivityKind::Started,
-            harness: Some(harness.clone()),
-            model: model.clone(),
-        },
-    )
-    .await;
     Ok(FunctionToolOutput::from_text(
         acp_spawn_output(&agent_path, &harness, model.as_deref()),
         Some(true),
@@ -621,19 +652,33 @@ async fn deliver(
     let identity = session
         .services
         .agent_control
-        .external_backend_identity(agent_id);
-    let (harness, model) = match identity {
-        Some((harness, model)) => (Some(harness), model),
-        None => (None, None),
-    };
+        .external_backend_identity(agent_id)
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "target ACP agent is missing its backend identity".to_string(),
+            )
+        })?;
+    let (harness, model) = identity;
+    let agent_type = known
+        .agent_role
+        .unwrap_or_else(|| ACP_ROLE_NAME.to_string());
     let started_activity = SubAgentActivityItem {
         id: call_id.clone(),
         agent_thread_id: agent_id,
         agent_path: agent_path.clone(),
         kind: SubAgentActivityKind::Started,
+        harness: Some(harness.clone()),
+        model: model.clone(),
+    };
+    let start_identity = ExternalSubagentHookIdentity {
+        agent_id,
+        agent_type,
         harness,
         model,
+        metadata: known.metadata,
     };
+    let start_session = Arc::clone(&session);
+    let start_turn = Arc::clone(turn);
     let (_, requests_turn) = session
         .services
         .agent_control
@@ -641,7 +686,10 @@ async fn deliver(
             agent_id,
             communication,
             AgentCommunicationContext::new(mode.communication_kind(), session.thread_id),
-            || emit_sub_agent_activity(&session, turn, started_activity),
+            move || async move {
+                run_external_subagent_start_hook(&start_session, &start_turn, start_identity).await;
+                emit_sub_agent_activity(&start_session, &start_turn, started_activity).await;
+            },
         )
         .await
         .map_err(|error| collab_agent_error(agent_id, error))?;

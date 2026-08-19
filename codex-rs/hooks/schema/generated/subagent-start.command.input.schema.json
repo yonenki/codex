@@ -7,6 +7,21 @@
         "string",
         "null"
       ]
+    },
+    "SubagentBackendIdentity": {
+      "description": "Identifies the external backend executing a subagent lifecycle.",
+      "properties": {
+        "harness": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "harness"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -16,12 +31,21 @@
     "agent_type": {
       "type": "string"
     },
+    "backend": {
+      "$ref": "#/definitions/SubagentBackendIdentity"
+    },
     "cwd": {
       "type": "string"
     },
     "hook_event_name": {
       "const": "SubagentStart",
       "type": "string"
+    },
+    "metadata": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
     },
     "model": {
       "type": "string"

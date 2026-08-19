@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::AgentStatus;
 use crate::agent::role::acp_backend;
+use codex_tools::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -154,6 +155,19 @@ fn fallback_requires_prior_candidate_to_reach_terminal_status() {
     }
     ensure_fallback_source_terminal(AgentStatus::Completed(Some("done".to_string())))
         .expect("completed source may fall back");
+}
+
+#[test]
+fn spawn_spec_accepts_observer_metadata_string_map() {
+    let ToolSpec::Function(spec) = spawn_spec() else {
+        panic!("acp spawn should be a function tool");
+    };
+    let properties = spec
+        .parameters
+        .properties
+        .as_ref()
+        .expect("spawn parameters");
+    assert!(properties.contains_key("metadata"));
 }
 
 #[test]
