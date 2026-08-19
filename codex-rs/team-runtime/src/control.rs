@@ -9,9 +9,11 @@ use crate::ids::NodeRunId;
 use crate::ids::StateRevision;
 use crate::ids::TeamSessionId;
 use crate::reducer::reduce;
+use crate::sink::EnvTeamEventSink;
 use crate::sink::TeamEventSink;
 use crate::state::TeamLifecycle;
 use crate::state::TeamSessionState;
+use crate::store::LazySqliteTeamStore;
 use crate::store::MemoryTeamStore;
 use crate::store::TeamStore;
 use chrono::Utc;
@@ -23,6 +25,8 @@ use codex_team_graph::ToolCapability;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -34,6 +38,7 @@ pub struct TeamControl {
     bindings: Mutex<BTreeMap<String, TeamAgentBinding>>,
     surface: std::sync::RwLock<SurfaceSnapshot>,
     tool_reporting_agents: Mutex<std::collections::HashSet<String>>,
+    restored: tokio::sync::OnceCell<()>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -184,6 +189,21 @@ pub struct EndTeamCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvidenceCommand {
+    pub team_session_id: TeamSessionId,
+    pub evidence_id: String,
+    pub identity: Option<String>,
+    pub expected_revision: StateRevision,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalWaitCommand {
+    pub team_session_id: TeamSessionId,
+    pub reason: String,
+    pub expected_revision: StateRevision,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NextAction {
     pub tool: ToolCapability,
     pub reason: String,
@@ -231,6 +251,7 @@ impl TeamControl {
             bindings: Mutex::new(BTreeMap::new()),
             surface: std::sync::RwLock::new(SurfaceSnapshot::default()),
             tool_reporting_agents: Mutex::new(std::collections::HashSet::new()),
+            restored: tokio::sync::OnceCell::const_new(),
         }
     }
 
@@ -278,6 +299,23 @@ impl TeamControl {
         Self::memory(TeamGraphCatalog::default())
     }
 
+    pub fn team_store_path(codex_home: &Path) -> PathBuf {
+        codex_home.join("team-sessions.sqlite")
+    }
+
+    /// 標準 Codex 起動が使う永続 store と agent-collab ingest sink。
+    pub fn production(codex_home: &Path) -> Self {
+        Self::for_codex_home(codex_home, EnvTeamEventSink::from_process_env())
+    }
+
+    pub fn for_codex_home(codex_home: &Path, sink: impl TeamEventSink + 'static) -> Self {
+        Self::with_store(
+            TeamGraphCatalog::default(),
+            LazySqliteTeamStore::new(Self::team_store_path(codex_home)),
+            sink,
+        )
+    }
+
     pub fn with_store(
         catalog: TeamGraphCatalog,
         store: impl TeamStore + 'static,
@@ -295,6 +333,19 @@ impl TeamControl {
 
     pub async fn replace_catalog(&self, catalog: TeamGraphCatalog) {
         *self.catalog.lock().await = catalog;
+    }
+
+    pub async fn ensure_restored(&self) -> TeamRuntimeResult<()> {
+        self.restored
+            .get_or_try_init(|| async {
+                self.restore().await?;
+                match self.flush_outbox().await {
+                    Ok(()) | Err(TeamRuntimeError::Sink(_)) => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+            .await?;
+        Ok(())
     }
 
     pub async fn restore(&self) -> TeamRuntimeResult<()> {
@@ -332,11 +383,13 @@ impl TeamControl {
     }
 
     pub async fn list_teams(&self) -> Vec<TeamView> {
+        let _ = self.ensure_restored().await;
         let teams = self.teams.lock().await;
         teams.values().map(view_from_state).collect()
     }
 
     pub async fn has_open_teams(&self) -> bool {
+        let _ = self.ensure_restored().await;
         self.teams
             .lock()
             .await
@@ -345,6 +398,7 @@ impl TeamControl {
     }
 
     pub async fn status(&self, team_session_id: &TeamSessionId) -> TeamRuntimeResult<TeamView> {
+        self.ensure_restored().await?;
         let teams = self.teams.lock().await;
         teams
             .get(team_session_id)
@@ -353,6 +407,7 @@ impl TeamControl {
     }
 
     pub async fn start_team(&self, command: StartTeamCommand) -> TeamRuntimeResult<TeamView> {
+        self.ensure_restored().await?;
         let graph = self.get_graph(&command.graph_name).await?;
         let team_session_id = TeamSessionId::generate();
         let mut state = TeamSessionState::start(
@@ -436,37 +491,59 @@ impl TeamControl {
     }
 
     pub async fn record_result(&self, command: RecordResultCommand) -> TeamRuntimeResult<TeamView> {
-        self.mutate(
-            command.team_session_id,
-            command.expected_revision,
-            |state| {
-                let kind = TeamEventKind::NodeCompleted;
-                Ok(TeamEvent {
-                    event_id: crate::ids::EventId::generate(),
-                    team_session_id: state.team_session_id.clone(),
-                    sequence: state.next_sequence,
-                    kind,
-                    occurred_at: Utc::now(),
-                    graph_name: state.graph.name.clone(),
-                    graph_version: state.graph.version.clone(),
-                    graph_hash: state.graph_hash.clone(),
-                    node_id: Some(state.current_node_id.clone()),
-                    node_run_id: state
-                        .current_node_run
-                        .as_ref()
-                        .map(|run| run.node_run_id.clone()),
-                    attempt: state.current_node_run.as_ref().map(|run| run.attempt),
-                    agent_thread_id: None,
-                    role: None,
-                    payload: TeamEventPayload::NodeCompleted {
-                        result: command.result,
-                        candidate_sha: command.candidate_sha,
-                        evidence_id: command.evidence_id,
-                    },
-                })
-            },
-        )
-        .await
+        self.ensure_restored().await?;
+        let recommended = {
+            let teams = self.teams.lock().await;
+            let state = teams
+                .get(&command.team_session_id)
+                .ok_or_else(|| TeamRuntimeError::TeamNotFound(command.team_session_id.clone()))?;
+            require_open(state)?;
+            require_active_node_run(state)?;
+            state.graph.node(&state.current_node_id).and_then(|node| {
+                node.transition_for(&command.result)
+                    .filter(|transition| transition.recommended)
+                    .map(|transition| (command.result.clone(), transition.to.to_string()))
+            })
+        };
+        let view = self
+            .mutate(
+                command.team_session_id.clone(),
+                command.expected_revision,
+                |state| {
+                    require_active_node_run(state)?;
+                    Ok(TeamEvent {
+                        event_id: crate::ids::EventId::generate(),
+                        team_session_id: state.team_session_id.clone(),
+                        sequence: state.next_sequence,
+                        kind: TeamEventKind::NodeCompleted,
+                        occurred_at: Utc::now(),
+                        graph_name: state.graph.name.clone(),
+                        graph_version: state.graph.version.clone(),
+                        graph_hash: state.graph_hash.clone(),
+                        node_id: Some(state.current_node_id.clone()),
+                        node_run_id: state
+                            .current_node_run
+                            .as_ref()
+                            .map(|run| run.node_run_id.clone()),
+                        attempt: state.current_node_run.as_ref().map(|run| run.attempt),
+                        agent_thread_id: None,
+                        role: None,
+                        payload: TeamEventPayload::NodeCompleted {
+                            result: command.result,
+                            candidate_sha: command.candidate_sha,
+                            evidence_id: command.evidence_id,
+                        },
+                    })
+                },
+            )
+            .await?;
+        match recommended {
+            Some((result, to)) => {
+                self.emit_transition_recommended(&view.team_session_id, &result, &to)
+                    .await
+            }
+            None => Ok(view),
+        }
     }
 
     pub async fn next(&self, team_session_id: &TeamSessionId) -> TeamRuntimeResult<TeamView> {
@@ -580,17 +657,33 @@ impl TeamControl {
         team_session_id: &TeamSessionId,
         role: &str,
     ) -> TeamRuntimeResult<PendingTeamBinding> {
+        self.ensure_restored().await?;
         let teams = self.teams.lock().await;
         let state = teams
             .get(team_session_id)
             .ok_or_else(|| TeamRuntimeError::TeamNotFound(team_session_id.clone()))?;
         if !state.is_open() {
-            return Err(TeamRuntimeError::invalid("team session is closed"));
+            return Err(TeamRuntimeError::ClosedTeam(team_session_id.clone()));
         }
-        let run = state
-            .current_node_run
-            .as_ref()
-            .ok_or_else(|| TeamRuntimeError::invalid("start_team_node before team.spawn_agent"))?;
+        let run = require_active_node_run(state)?;
+        let node = state
+            .graph
+            .node(&run.node_id)
+            .ok_or_else(|| TeamRuntimeError::invalid(format!("unknown node '{}'", run.node_id)))?;
+        match node.role.as_ref() {
+            Some(expected) if expected.as_str() != role => {
+                return Err(TeamRuntimeError::RoleMismatch {
+                    expected: expected.to_string(),
+                    actual: role.to_string(),
+                });
+            }
+            Some(_) => {}
+            None => {
+                return Err(TeamRuntimeError::invalid(
+                    "current node does not declare a Role for team.spawn_agent",
+                ));
+            }
+        }
         Ok(PendingTeamBinding {
             team_session_id: team_session_id.clone(),
             node_run_id: run.node_run_id.clone(),
@@ -771,6 +864,78 @@ impl TeamControl {
         .await
     }
 
+    pub async fn record_evidence(
+        &self,
+        command: EvidenceCommand,
+        kind: TeamEventKind,
+    ) -> TeamRuntimeResult<TeamView> {
+        if !matches!(
+            kind,
+            TeamEventKind::EvidenceRecorded
+                | TeamEventKind::EvidenceInvalidated
+                | TeamEventKind::EvidenceReused
+        ) {
+            return Err(TeamRuntimeError::invalid(
+                "evidence command requires an evidence event kind",
+            ));
+        }
+        self.mutate(
+            command.team_session_id,
+            command.expected_revision,
+            |state| {
+                Ok(event_from_state(
+                    state,
+                    kind,
+                    TeamEventPayload::Evidence {
+                        evidence_id: command.evidence_id,
+                        identity: command.identity,
+                    },
+                ))
+            },
+        )
+        .await
+    }
+
+    pub async fn enter_external_wait(
+        &self,
+        command: ExternalWaitCommand,
+    ) -> TeamRuntimeResult<TeamView> {
+        self.mutate(
+            command.team_session_id,
+            command.expected_revision,
+            |state| {
+                Ok(event_from_state(
+                    state,
+                    TeamEventKind::ExternalWaitEntered,
+                    TeamEventPayload::ExternalWait {
+                        reason: command.reason,
+                    },
+                ))
+            },
+        )
+        .await
+    }
+
+    pub async fn resolve_external_wait(
+        &self,
+        command: ExternalWaitCommand,
+    ) -> TeamRuntimeResult<TeamView> {
+        self.mutate(
+            command.team_session_id,
+            command.expected_revision,
+            |state| {
+                Ok(event_from_state(
+                    state,
+                    TeamEventKind::ExternalWaitResolved,
+                    TeamEventPayload::ExternalWait {
+                        reason: command.reason,
+                    },
+                ))
+            },
+        )
+        .await
+    }
+
     pub async fn flush_outbox(&self) -> TeamRuntimeResult<()> {
         let pending = self.store.pending_outbox().await?;
         if pending.is_empty() {
@@ -781,16 +946,39 @@ impl TeamControl {
         self.store.mark_outbox_sent(ids).await
     }
 
+    async fn emit_transition_recommended(
+        &self,
+        team_session_id: &TeamSessionId,
+        result: &str,
+        to: &str,
+    ) -> TeamRuntimeResult<TeamView> {
+        self.mutate_without_cas(team_session_id.clone(), |state| {
+            Ok(event_from_state(
+                state,
+                TeamEventKind::TransitionRecommended,
+                TeamEventPayload::Transition {
+                    result: Some(result.to_string()),
+                    to: Some(to.to_string()),
+                    recommended: true,
+                    deviation_reason: None,
+                },
+            ))
+        })
+        .await
+    }
+
     async fn mutate(
         &self,
         team_session_id: TeamSessionId,
         expected_revision: StateRevision,
         build: impl FnOnce(&mut TeamSessionState) -> TeamRuntimeResult<TeamEvent>,
     ) -> TeamRuntimeResult<TeamView> {
+        self.ensure_restored().await?;
         let mut teams = self.teams.lock().await;
         let state = teams
             .get_mut(&team_session_id)
             .ok_or_else(|| TeamRuntimeError::TeamNotFound(team_session_id.clone()))?;
+        require_open(state)?;
         if state.revision != expected_revision {
             return Err(TeamRuntimeError::StaleRevision {
                 expected: expected_revision,
@@ -810,6 +998,7 @@ impl TeamControl {
         team_session_id: TeamSessionId,
         build: impl FnOnce(&mut TeamSessionState) -> TeamRuntimeResult<TeamEvent>,
     ) -> TeamRuntimeResult<TeamView> {
+        self.ensure_restored().await?;
         let mut teams = self.teams.lock().await;
         let state = teams
             .get_mut(&team_session_id)
@@ -866,6 +1055,49 @@ impl TeamControl {
             recommended,
             open_team_count: teams.values().filter(|team| team.is_open()).count(),
         };
+    }
+}
+
+fn require_open(state: &TeamSessionState) -> TeamRuntimeResult<()> {
+    if state.is_open() {
+        Ok(())
+    } else {
+        Err(TeamRuntimeError::ClosedTeam(state.team_session_id.clone()))
+    }
+}
+
+fn require_active_node_run(state: &TeamSessionState) -> TeamRuntimeResult<&crate::state::NodeRun> {
+    match state.current_node_run.as_ref() {
+        Some(run) if run.completed_at.is_none() => Ok(run),
+        _ => Err(TeamRuntimeError::NoActiveNodeRun(
+            state.team_session_id.clone(),
+        )),
+    }
+}
+
+fn event_from_state(
+    state: &TeamSessionState,
+    kind: TeamEventKind,
+    payload: TeamEventPayload,
+) -> TeamEvent {
+    TeamEvent {
+        event_id: crate::ids::EventId::generate(),
+        team_session_id: state.team_session_id.clone(),
+        sequence: state.next_sequence,
+        kind,
+        occurred_at: Utc::now(),
+        graph_name: state.graph.name.clone(),
+        graph_version: state.graph.version.clone(),
+        graph_hash: state.graph_hash.clone(),
+        node_id: Some(state.current_node_id.clone()),
+        node_run_id: state
+            .current_node_run
+            .as_ref()
+            .map(|run| run.node_run_id.clone()),
+        attempt: state.current_node_run.as_ref().map(|run| run.attempt),
+        agent_thread_id: None,
+        role: None,
+        payload,
     }
 }
 

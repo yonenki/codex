@@ -12,7 +12,9 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
+use tokio::sync::OnceCell;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS team_events (
@@ -201,6 +203,68 @@ impl SqliteTeamStore {
             .await
             .map_err(|err| TeamRuntimeError::Store(err.to_string()))?;
         Ok(Self { pool })
+    }
+}
+
+/// 起動時は同期的に開き、最初の persist/restore で SQLite へ接続する。
+pub struct LazySqliteTeamStore {
+    path: PathBuf,
+    inner: OnceCell<SqliteTeamStore>,
+}
+
+impl LazySqliteTeamStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            inner: OnceCell::const_new(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    async fn store(&self) -> TeamRuntimeResult<&SqliteTeamStore> {
+        self.inner
+            .get_or_try_init(|| SqliteTeamStore::open(&self.path))
+            .await
+    }
+}
+
+impl TeamStore for LazySqliteTeamStore {
+    async fn persist_event(
+        &self,
+        state: &TeamSessionState,
+        event: &TeamEvent,
+    ) -> TeamRuntimeResult<()> {
+        self.store().await?.persist_event(state, event).await
+    }
+
+    async fn load_teams(&self) -> TeamRuntimeResult<Vec<TeamSessionState>> {
+        self.store().await?.load_teams().await
+    }
+
+    async fn load_events(
+        &self,
+        team_session_id: &TeamSessionId,
+    ) -> TeamRuntimeResult<Vec<TeamEvent>> {
+        self.store().await?.load_events(team_session_id).await
+    }
+
+    async fn pending_outbox(&self) -> TeamRuntimeResult<Vec<TeamEvent>> {
+        self.store().await?.pending_outbox().await
+    }
+
+    async fn mark_outbox_sent(&self, event_ids: &[EventId]) -> TeamRuntimeResult<()> {
+        self.store().await?.mark_outbox_sent(event_ids).await
+    }
+
+    async fn persist_binding(&self, binding: &TeamAgentBinding) -> TeamRuntimeResult<()> {
+        self.store().await?.persist_binding(binding).await
+    }
+
+    async fn load_bindings(&self) -> TeamRuntimeResult<Vec<TeamAgentBinding>> {
+        self.store().await?.load_bindings().await
     }
 }
 

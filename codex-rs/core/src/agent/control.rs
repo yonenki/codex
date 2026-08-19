@@ -167,6 +167,20 @@ impl AgentControl {
         thread_id_generator: ThreadIdGenerator,
         rollout_budget: Option<RolloutBudgetConfig>,
     ) -> Self {
+        Self::with_team(
+            manager,
+            thread_id_generator,
+            rollout_budget,
+            Arc::new(codex_team_runtime::TeamControl::empty()),
+        )
+    }
+
+    pub(crate) fn with_team(
+        manager: Weak<ThreadManagerState>,
+        thread_id_generator: ThreadIdGenerator,
+        rollout_budget: Option<RolloutBudgetConfig>,
+        team: Arc<codex_team_runtime::TeamControl>,
+    ) -> Self {
         let control = Self {
             session_id: SessionId::default(),
             manager,
@@ -178,7 +192,7 @@ impl AgentControl {
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
-            team: Arc::new(codex_team_runtime::TeamControl::empty()),
+            team,
         };
         if let Some(rollout_budget) = rollout_budget {
             control.rollout_budget.configure(rollout_budget);

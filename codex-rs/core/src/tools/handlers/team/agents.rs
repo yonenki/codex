@@ -4,16 +4,23 @@ use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::ACP_ROLE_NAME;
 use crate::agent::role::acp_backend;
 use crate::agent::role::acp_role_settings;
+use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
+use crate::tools::handlers::multi_agents_common::DEFAULT_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::multi_agents_common::MAX_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::multi_agents_common::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_role;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_runtime_overrides;
 use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
 use crate::tools::handlers::multi_agents_common::collab_spawn_error;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
-use crate::tools::handlers::multi_agents_v2::wait as wait_handler;
 use codex_protocol::AgentPath;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_team_runtime::ExternalWaitCommand;
+use std::time::Duration;
+use tokio::time::timeout;
 
 fn message_content(message: String) -> Result<String, FunctionCallError> {
     if message.trim().is_empty() {
@@ -74,7 +81,16 @@ struct TeamTargetArgs {
     team_session_id: Option<String>,
     target: String,
     message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamWaitArgs {
+    team_session_id: Option<String>,
+    target: Option<String>,
     timeout_ms: Option<i64>,
+    reason: Option<String>,
+    resolve: Option<bool>,
+    expected_revision: Option<u64>,
 }
 
 async fn handle_agent_tool(
@@ -338,22 +354,104 @@ async fn handle_team_message(
 
 async fn handle_team_wait(invocation: ToolInvocation) -> Result<TeamToolResult, FunctionCallError> {
     let arguments = function_arguments(invocation.payload.clone())?;
-    let args: TeamTargetArgs = parse_arguments(&arguments)?;
+    let args: TeamWaitArgs = parse_arguments(&arguments)?;
     let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
-    let _ = args.timeout_ms;
-    let _ = wait_handler::Handler::new(Default::default());
-    let view = invocation
-        .session
-        .services
-        .agent_control
-        .team()
-        .status(&team_session_id)
+    let team = invocation.session.services.agent_control.team();
+    if args.resolve.unwrap_or(false) {
+        let view = team
+            .resolve_external_wait(ExternalWaitCommand {
+                team_session_id,
+                reason: args.reason.unwrap_or_else(|| "resolved".into()),
+                expected_revision: revision(args.expected_revision)?,
+            })
+            .await
+            .map_err(map_team_error)?;
+        return Ok(TeamToolResult::json(serde_json::json!({
+            "view": view,
+            "resolved": true,
+        })));
+    }
+    if let Some(target) = args.target.filter(|value| !value.trim().is_empty()) {
+        let resolved = crate::agent::agent_resolver::resolve_agent_target(
+            &invocation.session,
+            &invocation.turn,
+            &target,
+        )
+        .await?;
+        team.require_same_team(&team_session_id, &resolved.to_string())
+            .await
+            .map_err(map_team_error)?;
+        let timeout_ms = args
+            .timeout_ms
+            .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
+            .clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS);
+        let (status, timed_out) =
+            wait_for_team_agent(&invocation, resolved, timeout_ms as u64).await?;
+        let view = team
+            .status(&team_session_id)
+            .await
+            .map_err(map_team_error)?;
+        return Ok(TeamToolResult::json(serde_json::json!({
+            "view": view,
+            "target": target,
+            "status": status,
+            "timed_out": timed_out,
+        })));
+    }
+    let view = team
+        .enter_external_wait(ExternalWaitCommand {
+            team_session_id,
+            reason: args.reason.unwrap_or_else(|| "external".into()),
+            expected_revision: revision(args.expected_revision)?,
+        })
         .await
         .map_err(map_team_error)?;
     Ok(TeamToolResult::json(serde_json::json!({
         "view": view,
-        "wait": "use collaboration.wait_agent for the existing wait contract; team.wait records Team-scoped status",
+        "waiting": view.waiting_reason,
     })))
+}
+
+async fn wait_for_team_agent(
+    invocation: &ToolInvocation,
+    target: codex_protocol::ThreadId,
+    timeout_ms: u64,
+) -> Result<(AgentStatus, bool), FunctionCallError> {
+    let mut rx = match invocation
+        .session
+        .services
+        .agent_control
+        .subscribe_status(target)
+        .await
+    {
+        Ok(rx) => rx,
+        Err(_) => return Ok((AgentStatus::NotFound, false)),
+    };
+    let current = rx.borrow().clone();
+    if is_final(&current) {
+        return Ok((current, false));
+    }
+    let wait = async {
+        loop {
+            if rx.changed().await.is_err() {
+                return rx.borrow().clone();
+            }
+            let status = rx.borrow().clone();
+            if is_final(&status) {
+                return status;
+            }
+        }
+    };
+    match timeout(Duration::from_millis(timeout_ms), wait).await {
+        Ok(status) => Ok((status, false)),
+        Err(_) => Ok((rx.borrow().clone(), true)),
+    }
+}
+
+fn revision(value: Option<u64>) -> Result<codex_team_runtime::StateRevision, FunctionCallError> {
+    Ok(codex_team_runtime::StateRevision::new(value.ok_or_else(
+        || FunctionCallError::RespondToModel("expected_revision is required".into()),
+    )?))
 }
 
 async fn handle_team_interrupt(
@@ -469,13 +567,32 @@ fn agent_spec(capability: ToolCapability) -> ToolSpec {
         ),
         ToolCapability::Wait => object_spec(
             capability.as_str(),
-            "Inspect Team-scoped wait state. Use collaboration.wait_agent for the existing wait contract.",
+            "Wait for a Team-bound agent, or record and resolve an external wait on the Team trace. Does not change collaboration.wait_agent.",
             BTreeMap::from([
                 team_session,
-                ("target".into(), string_prop("Optional agent target.")),
+                (
+                    "expected_revision".into(),
+                    JsonSchema::number(Some(
+                        "CAS revision required when entering or resolving an external wait.".into(),
+                    )),
+                ),
+                (
+                    "target".into(),
+                    string_prop("Optional Team-bound agent target."),
+                ),
                 (
                     "timeout_ms".into(),
-                    JsonSchema::number(Some("Optional timeout.".into())),
+                    JsonSchema::number(Some("Optional timeout when waiting for an agent.".into())),
+                ),
+                (
+                    "reason".into(),
+                    string_prop("External wait reason when no agent target is given."),
+                ),
+                (
+                    "resolve".into(),
+                    JsonSchema::boolean(Some(
+                        "True records ExternalWaitResolved on the Team trace.".into(),
+                    )),
                 ),
             ]),
             vec!["team_session_id".into()],

@@ -80,10 +80,13 @@ pub enum ToolCapability {
     Wait,
     InterruptAgent,
     ListAgents,
+    RecordEvidence,
+    InvalidateEvidence,
+    ReuseEvidence,
 }
 
 impl ToolCapability {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::ListTeamGraphs,
         Self::GetTeamGraph,
         Self::ListTeams,
@@ -100,6 +103,9 @@ impl ToolCapability {
         Self::Wait,
         Self::InterruptAgent,
         Self::ListAgents,
+        Self::RecordEvidence,
+        Self::InvalidateEvidence,
+        Self::ReuseEvidence,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -120,6 +126,9 @@ impl ToolCapability {
             Self::Wait => "wait",
             Self::InterruptAgent => "interrupt_agent",
             Self::ListAgents => "list_agents",
+            Self::RecordEvidence => "record_evidence",
+            Self::InvalidateEvidence => "invalidate_evidence",
+            Self::ReuseEvidence => "reuse_evidence",
         }
     }
 
@@ -149,6 +158,9 @@ impl ToolCapability {
                 | Self::Wait
                 | Self::InterruptAgent
                 | Self::ListAgents
+                | Self::RecordEvidence
+                | Self::InvalidateEvidence
+                | Self::ReuseEvidence
         )
     }
 }

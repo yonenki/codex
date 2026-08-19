@@ -91,6 +91,34 @@ impl HttpTeamEventSink {
     }
 }
 
+/// agent-collab の既存報告環境が無いときは成功扱いにせず、outbox へ残す。
+pub struct EnvTeamEventSink {
+    inner: Option<HttpTeamEventSink>,
+}
+
+impl EnvTeamEventSink {
+    pub fn from_process_env() -> Self {
+        Self {
+            inner: HttpTeamEventSink::from_env(),
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.inner.is_some()
+    }
+}
+
+impl TeamEventSink for EnvTeamEventSink {
+    async fn publish(&self, events: &[TeamEvent]) -> TeamRuntimeResult<()> {
+        match &self.inner {
+            Some(sink) => sink.publish(events).await,
+            None => Err(TeamRuntimeError::Sink(
+                "AGENT_COLLAB_SERVER_URL, AGENT_COLLAB_AGENT_ID, and AGENT_COLLAB_REPORT_TOKEN are required".to_string(),
+            )),
+        }
+    }
+}
+
 impl TeamEventSink for HttpTeamEventSink {
     async fn publish(&self, events: &[TeamEvent]) -> TeamRuntimeResult<()> {
         if events.is_empty() {

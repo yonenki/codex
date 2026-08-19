@@ -3,10 +3,12 @@ use crate::session::session::Session;
 use codex_team_graph::discover_team_graphs;
 use codex_team_graph::load_known_roles;
 use codex_team_runtime::EndTeamCommand;
+use codex_team_runtime::EvidenceCommand;
 use codex_team_runtime::RecordResultCommand;
 use codex_team_runtime::StartNodeCommand;
 use codex_team_runtime::StartTeamCommand;
 use codex_team_runtime::StateRevision;
+use codex_team_runtime::TeamEventKind;
 use codex_team_runtime::TransitionCommand;
 
 pub(crate) struct TeamLifecycleToolHandler {
@@ -61,6 +63,7 @@ struct TeamSessionArgs {
     branch: Option<String>,
     result: Option<String>,
     evidence_id: Option<String>,
+    identity: Option<String>,
     candidate_sha: Option<String>,
     deviation_reason: Option<String>,
     aborted: Option<bool>,
@@ -122,6 +125,7 @@ async fn handle_lifecycle(
         branch: None,
         result: None,
         evidence_id: None,
+        identity: None,
         candidate_sha: None,
         deviation_reason: None,
         aborted: None,
@@ -192,6 +196,30 @@ async fn handle_lifecycle(
                 reason: args.reason.unwrap_or_else(|| "completed".into()),
                 expected_revision: revision(args.expected_revision)?,
             })
+            .await
+            .map_err(map_team_error)?
+        }
+        ToolCapability::RecordEvidence
+        | ToolCapability::InvalidateEvidence
+        | ToolCapability::ReuseEvidence => {
+            let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
+            let kind = match capability {
+                ToolCapability::RecordEvidence => TeamEventKind::EvidenceRecorded,
+                ToolCapability::InvalidateEvidence => TeamEventKind::EvidenceInvalidated,
+                ToolCapability::ReuseEvidence => TeamEventKind::EvidenceReused,
+                _ => unreachable!("evidence capability"),
+            };
+            team.record_evidence(
+                EvidenceCommand {
+                    team_session_id,
+                    evidence_id: args.evidence_id.ok_or_else(|| {
+                        FunctionCallError::RespondToModel("evidence_id is required".into())
+                    })?,
+                    identity: args.identity,
+                    expected_revision: revision(args.expected_revision)?,
+                },
+                kind,
+            )
             .await
             .map_err(map_team_error)?
         }
@@ -332,6 +360,26 @@ fn lifecycle_spec(capability: ToolCapability) -> ToolSpec {
                 ("reason".into(), string_prop("Completion or abort reason.")),
             ]),
             vec!["team_session_id".into(), "expected_revision".into()],
+        ),
+        ToolCapability::RecordEvidence
+        | ToolCapability::InvalidateEvidence
+        | ToolCapability::ReuseEvidence => object_spec(
+            capability.as_str(),
+            "Record, invalidate, or reuse structured evidence on the Team trace.",
+            BTreeMap::from([
+                team_session,
+                revision,
+                ("evidence_id".into(), string_prop("Evidence identity.")),
+                (
+                    "identity".into(),
+                    string_prop("Optional SHA or artifact identity."),
+                ),
+            ]),
+            vec![
+                "team_session_id".into(),
+                "expected_revision".into(),
+                "evidence_id".into(),
+            ],
         ),
         _ => object_spec(
             capability.as_str(),

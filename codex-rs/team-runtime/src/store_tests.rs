@@ -118,3 +118,29 @@ async fn memory_and_sqlite_keep_event_and_outbox_together() {
     );
     assert_eq!(store.pending_outbox().await.expect("outbox").len(), 1);
 }
+
+#[tokio::test]
+async fn production_codex_home_store_restores_and_flushes_outbox() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let control = TeamControl::for_codex_home(dir.path(), crate::FailingSink::fail_times(1));
+    control.replace_catalog(catalog()).await;
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    assert!(TeamControl::team_store_path(dir.path()).exists());
+
+    let restored = TeamControl::for_codex_home(dir.path(), crate::RecordingSink::default());
+    restored.replace_catalog(catalog()).await;
+    restored.ensure_restored().await.expect("restore and flush");
+    let status = restored
+        .status(&started.team_session_id)
+        .await
+        .expect("status");
+    assert_eq!(status.task_ref.as_deref(), Some("issue/1"));
+}

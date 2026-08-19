@@ -238,7 +238,7 @@ async fn fake_acp_lifecycle_records_pool_retry_and_unreported_coverage() {
         .await
         .expect("node");
     let pending = control
-        .pending_binding_for_node(&started.team_session_id, "textil_worker_default")
+        .pending_binding_for_node(&started.team_session_id, "worker")
         .await
         .expect("pending");
     control
@@ -269,4 +269,132 @@ async fn fake_acp_lifecycle_records_pool_retry_and_unreported_coverage() {
         .expect("second terminal");
     let binding = control.binding_snapshot("acp-2");
     assert!(binding.is_some());
+}
+
+#[tokio::test]
+async fn pending_binding_rejects_role_mismatch() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let err = control
+        .pending_binding_for_node(&started.team_session_id, "textil_worker_default")
+        .await
+        .expect_err("role mismatch");
+    assert!(matches!(err, TeamRuntimeError::RoleMismatch { .. }));
+}
+
+#[tokio::test]
+async fn closed_team_rejects_lifecycle_and_unstarted_node_completion() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let err = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect_err("unstarted node");
+    assert!(matches!(err, TeamRuntimeError::NoActiveNodeRun(_)));
+
+    let ended = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: false,
+            reason: "done".into(),
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("end");
+    let err = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: ended.revision,
+        })
+        .await
+        .expect_err("closed");
+    assert!(matches!(err, TeamRuntimeError::ClosedTeam(_)));
+}
+
+#[tokio::test]
+async fn wait_and_evidence_reach_the_append_only_trace() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let waited = control
+        .enter_external_wait(crate::ExternalWaitCommand {
+            team_session_id: started.team_session_id.clone(),
+            reason: "ci".into(),
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("wait");
+    assert_eq!(waited.waiting_reason.as_deref(), Some("ci"));
+    let resolved = control
+        .resolve_external_wait(crate::ExternalWaitCommand {
+            team_session_id: started.team_session_id.clone(),
+            reason: "ci".into(),
+            expected_revision: waited.revision,
+        })
+        .await
+        .expect("resolve");
+    assert_eq!(resolved.waiting_reason, None);
+
+    let recorded = control
+        .record_evidence(
+            crate::EvidenceCommand {
+                team_session_id: started.team_session_id.clone(),
+                evidence_id: "ev_qa".into(),
+                identity: Some("sha".into()),
+                expected_revision: resolved.revision,
+            },
+            crate::TeamEventKind::EvidenceRecorded,
+        )
+        .await
+        .expect("evidence");
+    control
+        .record_evidence(
+            crate::EvidenceCommand {
+                team_session_id: started.team_session_id.clone(),
+                evidence_id: "ev_qa".into(),
+                identity: None,
+                expected_revision: recorded.revision,
+            },
+            crate::TeamEventKind::EvidenceInvalidated,
+        )
+        .await
+        .expect("invalidate");
 }

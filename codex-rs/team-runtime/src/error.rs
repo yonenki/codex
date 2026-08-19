@@ -10,6 +10,12 @@ pub enum TeamRuntimeError {
     Invalid(String),
     #[error("team session {0} was not found")]
     TeamNotFound(TeamSessionId),
+    #[error("team session {0} is closed")]
+    ClosedTeam(TeamSessionId),
+    #[error("team session {0} has no active node run")]
+    NoActiveNodeRun(TeamSessionId),
+    #[error("role '{actual}' does not match node role '{expected}'")]
+    RoleMismatch { expected: String, actual: String },
     #[error("team session {team} cannot reference {subject} from another team")]
     CrossTeamRef {
         team: TeamSessionId,

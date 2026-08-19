@@ -5429,6 +5429,36 @@ async fn team_spawn_binds_native_agent_before_first_turn() {
     }
 }
 
+#[tokio::test]
+async fn thread_manager_shares_persistent_team_control() {
+    let harness = AgentControlHarness::new().await;
+    harness
+        .control
+        .team()
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([
+            sample_team_graph(),
+        ]))
+        .await;
+    let started = harness
+        .control
+        .team()
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    let other = harness.manager.agent_control();
+    let status = other
+        .team()
+        .status(&started.team_session_id)
+        .await
+        .expect("shared team registry");
+    assert_eq!(status.task_ref.as_deref(), Some("issue/1"));
+}
+
 fn sample_team_graph() -> codex_team_graph::TeamGraph {
     let dto: codex_team_graph::TeamGraphToml = toml::from_str(
         r#"
