@@ -5512,21 +5512,29 @@ async fn root_coordinator_team_wait_traces_target_agent_wait_events() {
 
     // Agent-target wait trace entered.
     let waited = team
-        .record_wait_entered(&started.team_session_id, "wait_agent:worker")
+        .record_agent_wait_entered(
+            &started.team_session_id,
+            &child_thread.to_string(),
+            "worker result",
+        )
         .await
         .expect("wait entered");
     assert_eq!(
         waited.lifecycle,
-        codex_team_runtime::TeamLifecycle::WaitingExternal
+        codex_team_runtime::TeamLifecycle::WaitingAgent
     );
-    assert_eq!(waited.waiting_reason.as_deref(), Some("wait_agent:worker"));
+    assert_eq!(waited.waiting_reason, None);
 
     // Agent-target wait trace resolved.
     let resolved = team
-        .record_wait_resolved(&started.team_session_id, "wait_agent:worker")
+        .record_agent_wait_resolved(
+            &started.team_session_id,
+            &child_thread.to_string(),
+            "worker result",
+        )
         .await
         .expect("wait resolved");
-    // With child agent still attached, resolving external wait returns to WaitingAgent.
+    // With child agent still attached, resolving the wait remains WaitingAgent.
     assert_eq!(
         resolved.lifecycle,
         codex_team_runtime::TeamLifecycle::WaitingAgent

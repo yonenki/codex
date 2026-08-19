@@ -475,7 +475,7 @@ async fn rejects_transition_before_node_result_completion() {
 }
 
 #[tokio::test]
-async fn rejects_non_terminal_or_active_run_or_agent_end_team_without_abort() {
+async fn rejects_normal_end_with_active_run_or_agent_and_allows_abort() {
     let control = control();
     let started = control
         .start_team(StartTeamCommand {
@@ -500,7 +500,7 @@ async fn rejects_non_terminal_or_active_run_or_agent_end_team_without_abort() {
     assert!(matches!(err, TeamRuntimeError::NonTerminalNode { .. }));
 
     // Move to terminal node "completed".
-    let node = control
+    let _node = control
         .start_node(StartNodeCommand {
             team_session_id: started.team_session_id.clone(),
             node_id: None,
@@ -508,13 +508,25 @@ async fn rejects_non_terminal_or_active_run_or_agent_end_team_without_abort() {
         })
         .await
         .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending agent binding");
+    control
+        .bind_agent_before_start("active-worker", pending)
+        .await
+        .expect("bind active agent");
+    let agent_attached = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status after bind");
     let recorded = control
         .record_result(RecordResultCommand {
             team_session_id: started.team_session_id.clone(),
             result: "candidate_ready".into(),
             evidence_id: None,
             candidate_sha: None,
-            expected_revision: node.revision,
+            expected_revision: agent_attached.revision,
         })
         .await
         .expect("result");
@@ -548,7 +560,7 @@ async fn rejects_non_terminal_or_active_run_or_agent_end_team_without_abort() {
         .expect_err("active run end rejected");
     assert!(matches!(err, TeamRuntimeError::ActiveNodeRunExists(_)));
 
-    // Complete the terminal run.
+    // Complete the terminal run while leaving the bound agent active.
     let terminal_completed = control
         .record_result(RecordResultCommand {
             team_session_id: started.team_session_id.clone(),
@@ -560,8 +572,7 @@ async fn rejects_non_terminal_or_active_run_or_agent_end_team_without_abort() {
         .await
         .expect("terminal result");
 
-    // Now end_team(aborted: false) on terminal with no active run succeeds.
-    let ended = control
+    let err = control
         .end_team(EndTeamCommand {
             team_session_id: started.team_session_id.clone(),
             aborted: false,
@@ -569,8 +580,19 @@ async fn rejects_non_terminal_or_active_run_or_agent_end_team_without_abort() {
             expected_revision: terminal_completed.revision,
         })
         .await
-        .expect("terminal end succeeded");
-    assert_eq!(ended.lifecycle, crate::state::TeamLifecycle::Completed);
+        .expect_err("active agent normal end rejected");
+    assert!(matches!(err, TeamRuntimeError::ActiveAgents(_)));
+
+    let ended = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: true,
+            reason: "abort with active agent".into(),
+            expected_revision: terminal_completed.revision,
+        })
+        .await
+        .expect("active agent aborted end allowed");
+    assert_eq!(ended.lifecycle, crate::state::TeamLifecycle::Aborted);
 }
 
 #[tokio::test]
@@ -607,7 +629,7 @@ async fn allows_aborted_end_team_mid_run() {
 }
 
 #[tokio::test]
-async fn record_wait_entered_and_resolved_appends_trace_events() {
+async fn agent_wait_entered_and_resolved_preserves_agent_lifecycle() {
     let control = control();
     let started = control
         .start_team(StartTeamCommand {
@@ -620,17 +642,14 @@ async fn record_wait_entered_and_resolved_appends_trace_events() {
         .expect("start");
 
     let waited = control
-        .record_wait_entered(&started.team_session_id, "wait_agent:worker")
+        .record_agent_wait_entered(&started.team_session_id, "agent-worker", "worker result")
         .await
         .expect("wait entered");
-    assert_eq!(
-        waited.lifecycle,
-        crate::state::TeamLifecycle::WaitingExternal
-    );
-    assert_eq!(waited.waiting_reason.as_deref(), Some("wait_agent:worker"));
+    assert_eq!(waited.lifecycle, crate::state::TeamLifecycle::WaitingAgent);
+    assert_eq!(waited.waiting_reason, None);
 
     let resolved = control
-        .record_wait_resolved(&started.team_session_id, "wait_agent:worker")
+        .record_agent_wait_resolved(&started.team_session_id, "agent-worker", "worker result")
         .await
         .expect("wait resolved");
     assert_eq!(resolved.lifecycle, crate::state::TeamLifecycle::Running);

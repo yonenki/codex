@@ -7,6 +7,49 @@ use crate::control::EndTeamCommand;
 use crate::tests_support::sample_graph;
 use codex_team_graph::TeamGraphCatalog;
 use pretty_assertions::assert_eq;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+#[derive(Clone)]
+struct RecoveringRecordingSink {
+    remaining_failures: Arc<Mutex<u32>>,
+    envelopes: Arc<Mutex<Vec<crate::TeamEventEnvelope>>>,
+}
+
+impl RecoveringRecordingSink {
+    fn fail_once() -> Self {
+        Self {
+            remaining_failures: Arc::new(Mutex::new(1)),
+            envelopes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn envelopes(&self) -> Vec<crate::TeamEventEnvelope> {
+        self.envelopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl crate::TeamEventSink for RecoveringRecordingSink {
+    async fn publish(&self, events: &[crate::TeamEvent]) -> crate::TeamRuntimeResult<()> {
+        let mut remaining = self
+            .remaining_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *remaining > 0 {
+            *remaining -= 1;
+            return Err(crate::TeamRuntimeError::Sink("startup unavailable".into()));
+        }
+        drop(remaining);
+        self.envelopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(events.iter().map(crate::TeamEventEnvelope::from_event));
+        Ok(())
+    }
+}
 
 fn catalog() -> TeamGraphCatalog {
     TeamGraphCatalog::new([sample_graph()])
@@ -91,11 +134,8 @@ async fn same_process_recovery_flushes_outbox_batch_in_sequence_on_next_operatio
     let store = crate::SqliteTeamStore::open(&dir.path().join("outbox.sqlite"))
         .await
         .expect("open");
-    let recording = crate::RecordingSink::default();
-
-    // 1. Initial run with 1 failing sink attempt.
+    // Seed a pending event for the process-start recovery path.
     let control1 = TeamControl::with_store(catalog(), store, crate::FailingSink::fail_times(1));
-    // start_team attempts sink and fails, but commits to store/outbox.
     let started = control1
         .start_team(StartTeamCommand {
             graph_name: "sample".into(),
@@ -106,29 +146,28 @@ async fn same_process_recovery_flushes_outbox_batch_in_sequence_on_next_operatio
         .await
         .expect("start_team should succeed locally even if sink fails");
 
-    // 2. Simulate process startup with ensure_restored where sink fails on initial flush.
+    // One process/control/sink starts unavailable, then becomes healthy after that attempt.
     let store2 = crate::SqliteTeamStore::open(&dir.path().join("outbox.sqlite"))
         .await
         .expect("reopen");
-    let control2 = TeamControl::with_store(catalog(), store2, crate::FailingSink::fail_times(1));
+    let sink = RecoveringRecordingSink::fail_once();
+    let control2 = TeamControl::with_store(catalog(), store2.clone(), sink.clone());
     control2
         .ensure_restored()
         .await
         .expect("ensure_restored succeeds and swallows sink failure");
+    assert_eq!(
+        store2
+            .pending_outbox()
+            .await
+            .expect("pending after startup failure")
+            .len(),
+        1
+    );
 
-    // 3. Now agent-collab is available (using recording sink). Next production team operation
-    // must flush the entire pending batch in sequence order without manual flush or restart.
-    let store3 = crate::SqliteTeamStore::open(&dir.path().join("outbox.sqlite"))
-        .await
-        .expect("reopen");
-    let control3 = TeamControl::with_store(catalog(), store3.clone(), recording);
-    control3
-        .ensure_restored()
-        .await
-        .expect("ensure_restored recovers and flushes pending outbox");
-
-    // start_node commits event sequence 2 and flushes all events (sequence 1 and 2).
-    let node = control3
+    // The next production mutation commits sequence 2, then the now-healthy same sink publishes
+    // the existing pending event and new event together without a restart or manual flush.
+    let node = control2
         .start_node(StartNodeCommand {
             team_session_id: started.team_session_id.clone(),
             node_id: None,
@@ -138,8 +177,25 @@ async fn same_process_recovery_flushes_outbox_batch_in_sequence_on_next_operatio
         .expect("start_node");
     assert_eq!(node.revision.get(), 2);
 
-    let pending = store3.pending_outbox().await.expect("pending");
-    assert!(pending.is_empty(), "outbox should be fully flushed");
+    let envelopes = sink.envelopes();
+    assert_eq!(
+        envelopes
+            .iter()
+            .map(|event| (event.team_session_id.clone(), event.sequence))
+            .collect::<Vec<_>>(),
+        vec![
+            (started.team_session_id.clone(), 1),
+            (started.team_session_id.clone(), 2),
+        ]
+    );
+    assert!(
+        store2
+            .pending_outbox()
+            .await
+            .expect("pending after recovery")
+            .is_empty(),
+        "outbox should be fully flushed"
+    );
 }
 
 #[tokio::test]

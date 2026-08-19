@@ -159,6 +159,18 @@ fn apply_kind(state: &mut TeamSessionState, event: &TeamEvent) -> TeamRuntimeRes
             state.lifecycle = TeamLifecycle::NeedsAttention;
             Ok(())
         }
+        TeamEventKind::AgentWaitEntered => {
+            state.lifecycle = TeamLifecycle::WaitingAgent;
+            Ok(())
+        }
+        TeamEventKind::AgentWaitResolved => {
+            state.lifecycle = if state.agents.is_empty() {
+                TeamLifecycle::Running
+            } else {
+                TeamLifecycle::WaitingAgent
+            };
+            Ok(())
+        }
         TeamEventKind::ExternalWaitEntered => {
             if let TeamEventPayload::ExternalWait { reason } = &event.payload {
                 state.waiting_reason = Some(reason.clone());

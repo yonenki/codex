@@ -985,16 +985,18 @@ impl TeamControl {
         .await
     }
 
-    pub async fn record_wait_entered(
+    pub async fn record_agent_wait_entered(
         &self,
         team_session_id: &TeamSessionId,
+        target: &str,
         reason: &str,
     ) -> TeamRuntimeResult<TeamView> {
         self.mutate_without_cas(team_session_id.clone(), |state| {
             Ok(event_from_state(
                 state,
-                TeamEventKind::ExternalWaitEntered,
-                TeamEventPayload::ExternalWait {
+                TeamEventKind::AgentWaitEntered,
+                TeamEventPayload::AgentWait {
+                    target: target.to_string(),
                     reason: reason.to_string(),
                 },
             ))
@@ -1002,16 +1004,18 @@ impl TeamControl {
         .await
     }
 
-    pub async fn record_wait_resolved(
+    pub async fn record_agent_wait_resolved(
         &self,
         team_session_id: &TeamSessionId,
+        target: &str,
         reason: &str,
     ) -> TeamRuntimeResult<TeamView> {
         self.mutate_without_cas(team_session_id.clone(), |state| {
             Ok(event_from_state(
                 state,
-                TeamEventKind::ExternalWaitResolved,
-                TeamEventPayload::ExternalWait {
+                TeamEventKind::AgentWaitResolved,
+                TeamEventPayload::AgentWait {
+                    target: target.to_string(),
                     reason: reason.to_string(),
                 },
             ))

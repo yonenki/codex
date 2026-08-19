@@ -29,6 +29,8 @@ pub enum TeamEventKind {
     TransitionRecommended,
     TransitionSelected,
     DeviationRecorded,
+    AgentWaitEntered,
+    AgentWaitResolved,
     ExternalWaitEntered,
     ExternalWaitResolved,
 }
@@ -87,6 +89,10 @@ pub enum TeamEventPayload {
         to: Option<String>,
         recommended: bool,
         deviation_reason: Option<String>,
+    },
+    AgentWait {
+        target: String,
+        reason: String,
     },
     ExternalWait {
         reason: String,

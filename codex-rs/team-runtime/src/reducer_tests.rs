@@ -106,6 +106,80 @@ fn node_completed_payload_serializes_explicit_identity_fields() {
 }
 
 #[test]
+fn agent_wait_payload_round_trips_as_its_own_event_type() {
+    let payload = TeamEventPayload::AgentWait {
+        target: "019c-agent".into(),
+        reason: "worker result".into(),
+    };
+    let encoded = serde_json::to_value(&payload).expect("serialize agent wait");
+    assert_eq!(
+        encoded,
+        serde_json::json!({
+            "type": "agent_wait",
+            "target": "019c-agent",
+            "reason": "worker result"
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<TeamEventPayload>(encoded).expect("decode agent wait"),
+        payload
+    );
+}
+
+#[test]
+fn agent_and_external_waits_reduce_to_distinct_lifecycles() {
+    let mut state = started();
+    let base = TeamEvent {
+        event_id: crate::ids::EventId::generate(),
+        team_session_id: state.team_session_id.clone(),
+        sequence: 2,
+        kind: TeamEventKind::AgentWaitEntered,
+        occurred_at: chrono::Utc::now(),
+        graph_name: state.graph.name.clone(),
+        graph_version: state.graph.version.clone(),
+        graph_hash: state.graph_hash.clone(),
+        node_id: None,
+        node_run_id: None,
+        attempt: None,
+        agent_thread_id: None,
+        role: None,
+        payload: TeamEventPayload::AgentWait {
+            target: "agent-worker".into(),
+            reason: "worker result".into(),
+        },
+    };
+    reduce(&mut state, &base).expect("enter agent wait");
+    assert_eq!(state.lifecycle, TeamLifecycle::WaitingAgent);
+    assert_eq!(state.waiting_reason, None);
+
+    reduce(
+        &mut state,
+        &TeamEvent {
+            sequence: 3,
+            kind: TeamEventKind::AgentWaitResolved,
+            ..base.clone()
+        },
+    )
+    .expect("resolve agent wait");
+    assert_eq!(state.lifecycle, TeamLifecycle::Running);
+
+    reduce(
+        &mut state,
+        &TeamEvent {
+            sequence: 4,
+            kind: TeamEventKind::ExternalWaitEntered,
+            payload: TeamEventPayload::ExternalWait {
+                reason: "approval".into(),
+            },
+            ..base
+        },
+    )
+    .expect("enter external wait");
+    assert_eq!(state.lifecycle, TeamLifecycle::WaitingExternal);
+    assert_eq!(state.waiting_reason.as_deref(), Some("approval"));
+}
+
+#[test]
 fn node_completed_applies_explicit_candidate_sha_and_evidence() {
     let mut state = started();
     let node_run_id = NodeRunId::generate();
