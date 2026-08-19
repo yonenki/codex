@@ -69,6 +69,41 @@ fn rejects_unknown_role() {
 }
 
 #[test]
+fn omitted_metric_effects_are_empty_and_known_effects_load() {
+    let graph = parse(sample_toml());
+    assert!(
+        graph
+            .node(&graph.start)
+            .expect("start")
+            .transitions
+            .iter()
+            .all(|transition| transition.metric_effects.is_empty())
+    );
+
+    let annotated = parse(&sample_toml().replace(
+        "guide = \"Worker returned a candidate.\"",
+        "guide = \"Worker returned a candidate.\"\nmetric_effects = [\"review_return_to_work\"]",
+    ));
+    let effects = &annotated.node(&annotated.start).expect("start").transitions[0].metric_effects;
+    assert_eq!(effects, &[crate::MetricEffect::ReviewReturnToWork]);
+}
+
+#[test]
+fn rejects_unknown_metric_effect() {
+    let err = toml::from_str::<TeamGraphToml>(&sample_toml().replace(
+        "guide = \"Worker returned a candidate.\"",
+        "guide = \"Worker returned a candidate.\"\nmetric_effects = [\"analytics_dsl\"]",
+    ))
+    .expect_err("unknown effect");
+    assert!(
+        err.to_string().contains("metric_effects")
+            || err.to_string().contains("unknown variant")
+            || err.to_string().contains("analytics_dsl"),
+        "unknown effect should fail validation: {err}"
+    );
+}
+
+#[test]
 fn rejects_unknown_tool_capability() {
     let err = TeamGraph::try_from(
         toml::from_str::<TeamGraphToml>(

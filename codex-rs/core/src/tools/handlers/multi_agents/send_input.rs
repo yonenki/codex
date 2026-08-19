@@ -43,6 +43,19 @@ impl Handler {
         let args: SendInputArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = parse_agent_id_target(&args.target)?;
         let input_items = parse_collab_input(args.message, args.items)?;
+        let caller_thread_id = session.thread_id.to_string();
+        let receiver_thread = receiver_thread_id.to_string();
+        let op = if args.interrupt {
+            RawCollaborationOp::Interrupt
+        } else {
+            RawCollaborationOp::FollowupTask
+        };
+        reject_team_bound_raw_collaboration(
+            &session,
+            &caller_thread_id,
+            &[receiver_thread.as_str()],
+            op,
+        )?;
         let prompt = render_input_preview(&input_items);
         let receiver_agent = session
             .services

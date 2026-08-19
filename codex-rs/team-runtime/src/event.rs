@@ -4,6 +4,7 @@ use crate::ids::TeamSessionId;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_team_graph::GraphHash;
+use codex_team_graph::MetricEffect;
 use codex_team_graph::NodeId;
 use serde::Deserialize;
 use serde::Serialize;
@@ -98,6 +99,9 @@ pub enum TeamEventPayload {
         to: Option<String>,
         recommended: bool,
         deviation_reason: Option<String>,
+        /// 選択した Graph edge から copy する。tool caller は注入できない。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        metric_effects: Vec<MetricEffect>,
     },
     AgentWait {
         target: String,

@@ -771,3 +771,72 @@ async fn wait_and_evidence_reach_the_append_only_trace() {
         .await
         .expect("invalidate");
 }
+
+#[tokio::test]
+async fn transition_copies_graph_metric_effects_and_ignores_caller_injection() {
+    let sink = crate::RecordingSink::default();
+    let control = TeamControl::with_memory_store(
+        TeamGraphCatalog::new([crate::tests_support::review_return_graph()]),
+        sink.clone(),
+    );
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "review-return".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let recorded = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "changes_requested".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            qa: None,
+            findings: Some(2),
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("result");
+    control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "changes_requested".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .await
+        .expect("transition");
+    let selected = sink
+        .envelopes()
+        .into_iter()
+        .find(|envelope| envelope.kind == "transition_selected")
+        .expect("selected");
+    assert_eq!(
+        selected.payload["metric_effects"],
+        serde_json::json!(["review_return_to_work"])
+    );
+    assert!(
+        !serde_json::to_value(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "changes_requested".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .expect("command json")
+        .as_object()
+        .expect("object")
+        .contains_key("metric_effects"),
+        "tool caller cannot inject metric_effects"
+    );
+}

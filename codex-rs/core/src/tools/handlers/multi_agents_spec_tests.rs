@@ -460,6 +460,49 @@ fn reserved_collaboration_schemas_stay_free_of_team_identity() {
 }
 
 #[test]
+fn reserved_v1_collaboration_schemas_stay_free_of_team_identity() {
+    let spawn = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
+        available_models: Vec::new(),
+        agent_type_description: "role help".to_string(),
+        expose_agent_type: true,
+        hide_agent_type_model_reasoning: false,
+        expose_spawn_agent_model_overrides: true,
+        multi_agent_version: MultiAgentVersion::V1,
+        usage_hint_text: None,
+    });
+    let tools = [
+        ("spawn_agent", spawn),
+        ("send_input", create_send_input_tool_v1()),
+        ("close_agent", create_close_agent_tool_v1()),
+        ("resume_agent", create_resume_agent_tool()),
+        (
+            "wait_agent",
+            create_wait_agent_tool_v1(WaitAgentTimeoutOptions::default()),
+        ),
+    ];
+    for (name, tool) in tools {
+        let ToolSpec::Namespace(namespace) = tool else {
+            panic!("{name} v1 should stay a namespace tool");
+        };
+        assert_eq!(namespace.name, MULTI_AGENT_V1_NAMESPACE);
+        let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool { parameters, .. })) =
+            namespace.tools.first()
+        else {
+            panic!("{name} should stay a namespace function tool");
+        };
+        let properties = parameters.properties.as_ref().expect("properties");
+        assert!(
+            !properties.contains_key("team_session_id"),
+            "{name} reserved schema must not gain team_session_id"
+        );
+        assert!(
+            !properties.contains_key("metric_effects"),
+            "{name} reserved schema must not gain metric_effects"
+        );
+    }
+}
+
+#[test]
 fn send_message_tool_requires_message_and_has_no_output_schema() {
     let ToolSpec::Function(ResponsesApiTool {
         parameters,

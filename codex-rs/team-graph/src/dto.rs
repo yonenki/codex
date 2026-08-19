@@ -1,3 +1,4 @@
+use crate::ids::MetricEffect;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -40,4 +41,6 @@ pub struct TeamTransitionToml {
     pub recommended: bool,
     #[serde(default)]
     pub guide: String,
+    #[serde(default)]
+    pub metric_effects: Vec<MetricEffect>,
 }

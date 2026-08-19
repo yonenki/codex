@@ -3,6 +3,13 @@ use serde::Serialize;
 use std::fmt;
 use std::str::FromStr;
 
+/// Graph 遷移が reducer へ渡す typed metric effect。任意文字列は受けない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricEffect {
+    ReviewReturnToWork,
+}
+
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 pub const MAX_NODE_PROMPT_CHARS: usize = 4000;
 pub const MAX_GUIDE_CHARS: usize = 800;

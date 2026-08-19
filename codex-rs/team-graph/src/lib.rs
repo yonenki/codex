@@ -23,6 +23,7 @@ pub use graph::TeamGraph;
 pub use graph::TeamNode;
 pub use graph::TeamTransition;
 pub use graph::hash_graph;
+pub use ids::MetricEffect;
 pub use ids::NodeId;
 pub use ids::RoleName;
 pub use ids::SUPPORTED_SCHEMA_VERSION;

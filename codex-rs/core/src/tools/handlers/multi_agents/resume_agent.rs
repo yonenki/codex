@@ -46,6 +46,14 @@ async fn handle_resume_agent(
     let receiver_thread_id = ThreadId::from_string(&args.id).map_err(|err| {
         FunctionCallError::RespondToModel(format!("invalid agent id {}: {err:?}", args.id))
     })?;
+    let caller_thread_id = session.thread_id.to_string();
+    let target = receiver_thread_id.to_string();
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller_thread_id,
+        &[target.as_str()],
+        RawCollaborationOp::Resume,
+    )?;
     let receiver_agent = session
         .services
         .agent_control

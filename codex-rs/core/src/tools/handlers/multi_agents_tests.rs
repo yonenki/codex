@@ -4974,3 +4974,215 @@ async fn raw_wait_rejects_bound_caller_and_multi_target_atomically() {
     );
     assert_team_tool_guidance(multi, "team.wait");
 }
+
+#[tokio::test]
+async fn v1_raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let open_team = expect_model_err(
+        SpawnAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "spawn_agent",
+                function_payload(json!({"message": "do work"})),
+            ))
+            .await,
+        "unbound root with open Team",
+    );
+    assert_team_tool_guidance(open_team, "team.spawn_agent");
+
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(session.thread_id.to_string(), pending)
+        .await
+        .expect("bind caller");
+
+    let bound_caller = expect_model_err(
+        SpawnAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "spawn_agent",
+                function_payload(json!({"message": "do work"})),
+            ))
+            .await,
+        "Team-bound child raw spawn",
+    );
+    assert_team_tool_guidance(bound_caller, "team.spawn_agent");
+}
+
+#[tokio::test]
+async fn v1_send_input_rejects_bound_caller_or_target_for_send_and_interrupt() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let same_team_target = ThreadId::new();
+    let cross_team = start_sample_team(&session).await;
+    let cross_target = ThreadId::new();
+    let team = session.services.agent_control.team();
+    let same_pending = team
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("same pending");
+    team.bind_agent_before_start(same_team_target.to_string(), same_pending)
+        .await
+        .expect("bind same-team target");
+    let cross_pending = team
+        .pending_binding_for_node(&cross_team, "worker")
+        .await
+        .expect("cross pending");
+    team.bind_agent_before_start(cross_target.to_string(), cross_pending)
+        .await
+        .expect("bind cross-team target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let same_send = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": same_team_target.to_string(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "same-team send_input",
+    );
+    assert_team_tool_guidance(same_send, "team.followup_agent");
+
+    let cross_interrupt = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": cross_target.to_string(),
+                    "message": "stop",
+                    "interrupt": true
+                })),
+            ))
+            .await,
+        "cross-team interrupt send_input",
+    );
+    assert_team_tool_guidance(cross_interrupt, "team.interrupt_agent");
+}
+
+#[tokio::test]
+async fn v1_close_and_resume_reject_team_bound_without_bypass() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let target = ThreadId::new();
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(target.to_string(), pending)
+        .await
+        .expect("bind target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let close = expect_model_err(
+        CloseAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "close_agent",
+                function_payload(json!({"target": target.to_string()})),
+            ))
+            .await,
+        "bound close_agent",
+    );
+    assert_team_tool_guidance(close, "team.interrupt_agent");
+
+    let resume = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "resume_agent",
+                function_payload(json!({"id": target.to_string()})),
+            ))
+            .await,
+        "bound resume_agent",
+    );
+    assert_team_tool_guidance(resume, "team.spawn_agent");
+}
+
+#[tokio::test]
+async fn v1_raw_ops_keep_unknown_target_and_allow_unbound_success_path() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let caller = session.thread_id.to_string();
+    reject_unbound_raw_spawn_when_teams_open(&session, &caller, "collaboration.spawn_agent")
+        .expect("no open Team");
+    reject_team_bound_raw_collaboration(&session, &caller, &[], RawCollaborationOp::Spawn)
+        .expect("unbound spawn");
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller,
+        &[caller.as_str()],
+        RawCollaborationOp::FollowupTask,
+    )
+    .expect("unbound send");
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller,
+        &[caller.as_str()],
+        RawCollaborationOp::Close,
+    )
+    .expect("unbound close");
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller,
+        &[caller.as_str()],
+        RawCollaborationOp::Resume,
+    )
+    .expect("unbound resume");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let missing = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": ThreadId::new().to_string(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "unknown target",
+    );
+    let FunctionCallError::RespondToModel(message) = missing else {
+        panic!("lookup should stay model-facing");
+    };
+    assert!(
+        !message.contains("team.followup_agent") && !message.contains("team.send_message"),
+        "unknown target must keep the existing lookup error: {message}"
+    );
+}

@@ -623,6 +623,7 @@ impl TeamControl {
                         to: Some(transition.to.to_string()),
                         recommended,
                         deviation_reason: command.deviation_reason,
+                        metric_effects: transition.metric_effects.clone(),
                     },
                 })
             },
@@ -914,6 +915,7 @@ impl TeamControl {
                     to: None,
                     recommended: false,
                     deviation_reason: Some(reason.to_string()),
+                    metric_effects: Vec::new(),
                 },
             })
         })
@@ -1058,6 +1060,7 @@ impl TeamControl {
                     to: Some(to.to_string()),
                     recommended: true,
                     deviation_reason: None,
+                    metric_effects: Vec::new(),
                 },
             ))
         })

@@ -57,12 +57,44 @@ fn node_start_and_transition_update_current_node() {
             to: Some("completed".into()),
             recommended: true,
             deviation_reason: None,
+            metric_effects: Vec::new(),
         },
         ..started
     };
     reduce(&mut state, &transition).expect("reduce transition");
     assert_eq!(state.current_node_id.as_str(), "completed");
     assert!(state.current_node_run.is_none());
+}
+
+#[test]
+fn transition_payload_omits_empty_metric_effects() {
+    let encoded = serde_json::to_value(TeamEventPayload::Transition {
+        result: Some("approved".into()),
+        to: Some("completed".into()),
+        recommended: true,
+        deviation_reason: None,
+        metric_effects: Vec::new(),
+    })
+    .expect("serialize");
+    assert!(encoded.get("metric_effects").is_none());
+
+    let decoded: TeamEventPayload = serde_json::from_value(serde_json::json!({
+        "type": "transition",
+        "result": "approved",
+        "to": "completed",
+        "recommended": true
+    }))
+    .expect("legacy transition");
+    assert_eq!(
+        decoded,
+        TeamEventPayload::Transition {
+            result: Some("approved".into()),
+            to: Some("completed".into()),
+            recommended: true,
+            deviation_reason: None,
+            metric_effects: Vec::new(),
+        }
+    );
 }
 
 #[test]

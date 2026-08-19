@@ -169,16 +169,18 @@ pub(crate) enum RawCollaborationOp {
     FollowupTask,
     Wait,
     Interrupt,
+    Close,
+    Resume,
 }
 
 impl RawCollaborationOp {
     fn team_tool(self) -> &'static str {
         match self {
-            Self::Spawn => "team.spawn_agent",
+            Self::Spawn | Self::Resume => "team.spawn_agent",
             Self::SendMessage => "team.send_message",
             Self::FollowupTask => "team.followup_agent",
             Self::Wait => "team.wait",
-            Self::Interrupt => "team.interrupt_agent",
+            Self::Interrupt | Self::Close => "team.interrupt_agent",
         }
     }
 
@@ -189,7 +191,13 @@ impl RawCollaborationOp {
             Self::FollowupTask => "collaboration.followup_task",
             Self::Wait => "collaboration.wait_agent",
             Self::Interrupt => "collaboration.interrupt_agent",
+            Self::Close => "multi_agent_v1.close_agent",
+            Self::Resume => "multi_agent_v1.resume_agent",
         }
+    }
+
+    fn unsupported_as_raw_team_op(self) -> bool {
+        matches!(self, Self::Close | Self::Resume)
     }
 }
 
@@ -209,12 +217,23 @@ pub(crate) fn reject_team_bound_raw_collaboration(
     let Some(binding) = caller_binding.as_ref().or(target_binding.as_ref()) else {
         return Ok(());
     };
-    Err(FunctionCallError::RespondToModel(format!(
-        "Team-bound collaboration must use {}(team_session_id={}, ...). {} cannot be used when the caller or any target is bound to a Team.",
-        op.team_tool(),
-        binding.team_session_id,
-        op.raw_tool(),
-    )))
+    let message = if op.unsupported_as_raw_team_op() {
+        format!(
+            "Team-bound {} is unsupported. Use {}(team_session_id={}, ...) as the managed Team operation. {} cannot be used when the caller or any target is bound to a Team.",
+            op.raw_tool(),
+            op.team_tool(),
+            binding.team_session_id,
+            op.raw_tool(),
+        )
+    } else {
+        format!(
+            "Team-bound collaboration must use {}(team_session_id={}, ...). {} cannot be used when the caller or any target is bound to a Team.",
+            op.team_tool(),
+            binding.team_session_id,
+            op.raw_tool(),
+        )
+    };
+    Err(FunctionCallError::RespondToModel(message))
 }
 
 /// 未所属 root が open Team ありのまま raw spawn すると帰属を推測できない。

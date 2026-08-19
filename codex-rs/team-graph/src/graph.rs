@@ -1,4 +1,5 @@
 use crate::dto::TeamGraphToml;
+use crate::ids::MetricEffect;
 use crate::ids::NodeId;
 use crate::ids::RoleName;
 use crate::ids::ToolCapability;
@@ -96,6 +97,8 @@ pub struct TeamTransition {
     pub to: NodeId,
     pub recommended: bool,
     pub guide: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metric_effects: Vec<MetricEffect>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +157,7 @@ impl TryFrom<TeamGraphToml> for TeamGraph {
                         to: NodeId::new(transition.to)?,
                         recommended: transition.recommended,
                         guide: transition.guide,
+                        metric_effects: transition.metric_effects,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;

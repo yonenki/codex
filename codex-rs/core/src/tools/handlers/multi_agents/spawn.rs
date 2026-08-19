@@ -61,6 +61,18 @@ async fn handle_spawn_agent(
         .map(str::trim)
         .filter(|role| !role.is_empty());
     let input_items = parse_collab_input(args.message, args.items)?;
+    let caller_thread_id = session.thread_id.to_string();
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller_thread_id,
+        &[],
+        RawCollaborationOp::Spawn,
+    )?;
+    reject_unbound_raw_spawn_when_teams_open(
+        &session,
+        &caller_thread_id,
+        "collaboration.spawn_agent",
+    )?;
     let prompt = render_input_preview(&input_items);
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);

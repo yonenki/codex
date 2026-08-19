@@ -39,6 +39,14 @@ async fn handle_close_agent(
     let arguments = function_arguments(payload)?;
     let args: CloseAgentArgs = parse_arguments(&arguments)?;
     let agent_id = parse_agent_id_target(&args.target)?;
+    let caller_thread_id = session.thread_id.to_string();
+    let target = agent_id.to_string();
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller_thread_id,
+        &[target.as_str()],
+        RawCollaborationOp::Close,
+    )?;
     let receiver_agent = session.services.agent_control.get_agent_metadata(agent_id);
     let known_agent = receiver_agent.is_some();
     let receiver_agent = receiver_agent.unwrap_or_default();
