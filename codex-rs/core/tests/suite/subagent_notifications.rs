@@ -628,6 +628,11 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
     .await?;
     assert_eq!(start_inputs.len(), 1);
     assert_eq!(start_inputs[0]["agent_type"].as_str(), Some("worker"));
+    assert!(
+        start_inputs[0].get("backend").is_none(),
+        "native SubagentStart must not invent an ACP backend identity: {}",
+        start_inputs[0]
+    );
     let spawned_id = wait_for_spawned_thread_id(&test).await?;
     assert_eq!(
         start_inputs[0]["agent_id"].as_str(),
@@ -806,6 +811,12 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
     assert_eq!(
         subagent_stop_inputs[0]["last_assistant_message"].as_str(),
         Some("child done first")
+    );
+    assert!(
+        subagent_stop_inputs
+            .iter()
+            .all(|input| input.get("backend").is_none()),
+        "native SubagentStop must not invent an ACP backend identity"
     );
 
     let stop_inputs = read_hook_log(test.codex_home_path(), "stop_hook_log.jsonl")?;
@@ -1978,7 +1989,7 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         .with_pre_build_hook(|home| {
             write_subagent_lifecycle_hooks(
                 home,
-                /*stop_prompts*/ &[],
+                /*stop_prompts*/ &["do not resume parent from ACP stop"],
                 "external_worker",
                 "external_worker",
             )
@@ -2073,6 +2084,14 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     assert!(completion.contains("acp done"));
     assert!(completion.contains(ACP_ROLE_INSTRUCTIONS));
     assert!(completion.contains("independent ACP task"));
+    assert!(
+        !completion.contains(SUBAGENT_START_CONTEXT),
+        "ACP SubagentStart additionalContext must not be consumed as a parent prompt: {completion}"
+    );
+    assert!(
+        !completion.contains("do not resume parent from ACP stop"),
+        "ACP SubagentStop block must not be consumed as a parent follow-up: {completion}"
+    );
 
     let first_lifecycle = wait_for_hook_log(
         test.codex_home_path(),
@@ -2099,6 +2118,11 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         assert_eq!(
             entry["payload"]["backend"],
             json!({"harness": "grok-build", "model": "grok-test"})
+        );
+        assert_eq!(
+            entry["payload"]["model"].as_str(),
+            Some("koffing"),
+            "top-level hook model remains the parent session model"
         );
     }
 
@@ -2164,10 +2188,15 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     })
     .await
     .expect("idle parent should resume after ACP follow-up completion");
+    let followup_completion = serde_json::to_string(&request.inputs_of_type("agent_message"))?;
     assert!(
-        serde_json::to_string(&request.inputs_of_type("agent_message"))?
-            .contains("acp follow-up done"),
+        followup_completion.contains("acp follow-up done"),
         "follow-up did not reuse the ACP session: {request:#?}"
+    );
+    assert!(
+        !followup_completion.contains(SUBAGENT_START_CONTEXT)
+            && !followup_completion.contains("do not resume parent from ACP stop"),
+        "ACP lifecycle hook output must not be consumed as follow-up input: {followup_completion}"
     );
     let lifecycle = wait_for_hook_log(
         test.codex_home_path(),
