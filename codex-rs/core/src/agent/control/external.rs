@@ -62,6 +62,8 @@ struct ExternalAgentRuntime {
     generation: u64,
     queued_messages: VecDeque<QueuedMessage>,
     active_task: Option<AbortHandle>,
+    /// observerがこのgenerationのStop/completionを確定するまで次turnを始めない。
+    unacked_terminal_generation: Option<u64>,
 }
 
 struct QueuedMessage {
@@ -320,6 +322,7 @@ impl ExternalAgentManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             runtime.running = true;
             runtime.generation = runtime.generation.wrapping_add(1);
+            runtime.unacked_terminal_generation = None;
             agent.status_tx.send_replace(AgentStatus::Running);
         }
     }
@@ -333,6 +336,18 @@ impl ExternalAgentManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .generation;
             finish_turn(agent, generation, status);
+        }
+    }
+
+    pub(super) fn ack_terminal_observer(&self, agent_id: ThreadId, generation: u64) {
+        if let Some(agent) = self.agent(agent_id) {
+            let mut runtime = agent
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if runtime.unacked_terminal_generation == Some(generation) {
+                runtime.unacked_terminal_generation = None;
+            }
         }
     }
 
@@ -403,6 +418,7 @@ impl ExternalAgentManager {
                 });
                 ExternalMessageSubmissionAction::QueueOnly
             } else if runtime.running
+                || runtime.unacked_terminal_generation.is_some()
                 || runtime
                     .queued_messages
                     .iter()
@@ -447,6 +463,7 @@ impl ExternalAgentManager {
             runtime.running = false;
             runtime.generation = runtime.generation.wrapping_add(1);
             runtime.queued_messages.clear();
+            runtime.unacked_terminal_generation = Some(runtime.generation);
             agent.status_tx.send_replace(AgentStatus::Interrupted);
             runtime.active_task.take()
         };
@@ -479,6 +496,7 @@ fn take_ready_queued_turn(
     runtime: &mut ExternalAgentRuntime,
 ) -> Option<(String, u64, Option<GenerationStartHook>)> {
     if runtime.running
+        || runtime.unacked_terminal_generation.is_some()
         || !runtime
             .queued_messages
             .iter()
@@ -648,8 +666,9 @@ fn finish_turn(agent: Arc<ExternalAgent>, generation: u64, status: AgentStatus) 
     }
     runtime.running = false;
     runtime.active_task = None;
+    runtime.unacked_terminal_generation = Some(generation);
     // 次generationを始める前に、このgenerationの終端を先に公開する。
-    // Stop が先に届き、次の Start は次generationのものになる。
+    // Stop と completion がobserverで確定してから次turnを始める。
     agent.status_tx.send_replace(status);
 }
 

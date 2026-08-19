@@ -394,6 +394,32 @@ impl AgentControl {
         }
     }
 
+    async fn confirm_external_terminal_and_promote(
+        &self,
+        child_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        child_agent_path: Option<AgentPath>,
+        status: &AgentStatus,
+        generation: Option<u64>,
+        forward_completion: bool,
+    ) {
+        if forward_completion && let Some(child_agent_path) = child_agent_path {
+            self.forward_v2_child_completion_to_parent(
+                child_thread_id,
+                parent_thread_id,
+                child_agent_path,
+                status,
+            )
+            .await;
+        }
+        if let Some(generation) = generation {
+            self.external_agents
+                .ack_terminal_observer(child_thread_id, generation);
+        }
+        self.promote_ready_external_generation(child_thread_id)
+            .await;
+    }
+
     async fn send_inter_agent_communication_after_capacity_check(
         &self,
         agent_id: ThreadId,
@@ -805,6 +831,22 @@ impl AgentControl {
                                 .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
                                 .await;
                         }
+                        if should_notify && is_external {
+                            let interrupted = matches!(status, AgentStatus::Interrupted);
+                            control
+                                .confirm_external_terminal_and_promote(
+                                    child_thread_id,
+                                    parent_thread_id,
+                                    child_agent_path.clone(),
+                                    &status,
+                                    external_generation,
+                                    !interrupted,
+                                )
+                                .await;
+                            if interrupted {
+                                return;
+                            }
+                        }
                         if matches!(status, AgentStatus::Interrupted) {
                             // ACP agents finish their current lifecycle at interruption. Legacy
                             // native agents remain watchable and may transition back to Running.
@@ -815,19 +857,6 @@ impl AgentControl {
                             let keep_watching_external = is_external
                                 && is_final(&status)
                                 && !matches!(status, AgentStatus::Shutdown);
-                            if should_notify
-                                && keep_watching_external
-                                && let Some(child_agent_path) = child_agent_path.clone()
-                            {
-                                control
-                                    .forward_v2_child_completion_to_parent(
-                                        child_thread_id,
-                                        parent_thread_id,
-                                        child_agent_path,
-                                        &status,
-                                    )
-                                    .await;
-                            }
                             if keep_watching_external {
                                 if status_rx.changed().await.is_err() {
                                     return;
@@ -860,14 +889,27 @@ impl AgentControl {
                         status = external_status.clone();
                     }
                     let external_generation = external_lifecycle.map(|(_, generation)| generation);
-                    if terminal_status_tracker.should_notify(&status, external_generation)
-                        && !native_v2
-                    {
-                        control
-                            .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
-                            .await;
-                        if matches!(status, AgentStatus::Interrupted) && is_external {
-                            return;
+                    if terminal_status_tracker.should_notify(&status, external_generation) {
+                        if !native_v2 {
+                            control
+                                .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
+                                .await;
+                        }
+                        if is_external {
+                            let interrupted = matches!(status, AgentStatus::Interrupted);
+                            control
+                                .confirm_external_terminal_and_promote(
+                                    child_thread_id,
+                                    parent_thread_id,
+                                    child_agent_path.clone(),
+                                    &status,
+                                    external_generation,
+                                    !interrupted,
+                                )
+                                .await;
+                            if interrupted {
+                                return;
+                            }
                         }
                     }
                     if !is_final(&status) {
@@ -877,6 +919,9 @@ impl AgentControl {
                 }
             };
 
+            if is_external {
+                return;
+            }
             let Ok(state) = control.upgrade() else {
                 return;
             };

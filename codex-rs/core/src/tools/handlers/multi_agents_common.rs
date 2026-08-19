@@ -588,4 +588,28 @@ mod tests {
             .collect::<serde_json::Map<_, _>>();
         assert!(parse_spawn_observer_metadata(Some(JsonValue::Object(too_many))).is_err());
     }
+
+    #[test]
+    fn metadata_limits_count_unicode_scalars() {
+        let scalar = "😀";
+        assert_eq!(scalar.chars().count(), 1);
+        let key_ok = scalar.repeat(MAX_SPAWN_METADATA_KEY_CHARS);
+        let value_ok = scalar.repeat(MAX_SPAWN_METADATA_VALUE_CHARS);
+        let parsed = parse_spawn_observer_metadata(Some(json!({ key_ok.clone(): value_ok })))
+            .expect("scalar-length boundary must be accepted");
+        assert_eq!(parsed.as_ref().map(|metadata| metadata.len()), Some(1));
+
+        assert!(
+            parse_spawn_observer_metadata(Some(
+                json!({ scalar.repeat(MAX_SPAWN_METADATA_KEY_CHARS + 1): "x" })
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_spawn_observer_metadata(Some(
+                json!({ "a": scalar.repeat(MAX_SPAWN_METADATA_VALUE_CHARS + 1) })
+            ))
+            .is_err()
+        );
+    }
 }

@@ -991,6 +991,92 @@ async fn queued_followup_emits_start_after_current_generation_stops() {
 }
 
 #[tokio::test]
+async fn followup_after_terminal_waits_for_watcher_stop_before_next_start() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "reviewer",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "grok-build".to_string(),
+            model: Some("grok-test".to_string()),
+        },
+    );
+    harness
+        .control
+        .external_agents
+        .begin_turn_for_tests(child_thread_id);
+    harness.control.external_agents.finish_turn_for_tests(
+        child_thread_id,
+        AgentStatus::Completed(Some("generation-one".to_string())),
+    );
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(vec!["start-n"]));
+    let hook_events = std::sync::Arc::clone(&events);
+    let (hook_entered_tx, hook_entered_rx) = tokio::sync::oneshot::channel();
+    let (release_hook_tx, release_hook_rx) = tokio::sync::oneshot::channel();
+    let (_, requests_turn) = harness
+        .control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "follow-up after terminal".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            move || {
+                let hook_events = std::sync::Arc::clone(&hook_events);
+                async move {
+                    hook_events.lock().expect("event log").push("start-n1");
+                    let _ = hook_entered_tx.send(());
+                    let _ = release_hook_rx.await;
+                }
+            },
+        )
+        .await
+        .expect("follow-up after terminal should queue");
+    assert!(requests_turn);
+    assert_eq!(
+        *events.lock().expect("event log"),
+        ["start-n"],
+        "Start(N+1) must not run before the watcher confirms Stop(N)"
+    );
+    assert_matches!(
+        harness.control.get_status(child_thread_id).await,
+        AgentStatus::Completed(_)
+    );
+
+    let first_stop = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(first_stop[0].status, SubAgentTerminalStatus::Completed);
+    timeout(Duration::from_secs(2), hook_entered_rx)
+        .await
+        .expect("Start(N+1) should run after Stop(N)")
+        .expect("start hook sender");
+    release_hook_tx.send(()).expect("release start hook");
+
+    let second_stop = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(second_stop[0].status, SubAgentTerminalStatus::Errored);
+    assert_eq!(*events.lock().expect("event log"), ["start-n", "start-n1"]);
+}
+
+#[tokio::test]
 async fn external_turn_start_hook_precedes_running_status() {
     let control = AgentControl::default();
     let child_thread_id = ThreadId::new();
@@ -1208,6 +1294,7 @@ async fn external_queued_generation_rolls_back_when_deferred_start_hook_is_cance
         agent_id,
         AgentStatus::Completed(Some("current turn done".to_string())),
     );
+    control.external_agents.ack_terminal_observer(agent_id, 1);
     let pending = control
         .external_agents
         .take_ready_pending_start(agent_id)
@@ -1265,6 +1352,7 @@ async fn two_queued_followups_start_together_after_current_generation_stops() {
         agent_id,
         AgentStatus::Completed(Some("current turn done".to_string())),
     );
+    control.external_agents.ack_terminal_observer(agent_id, 1);
     let pending = control
         .external_agents
         .take_ready_pending_start(agent_id)
@@ -1321,6 +1409,7 @@ async fn dropping_a_ready_queued_generation_does_not_block_later_followup() {
         agent_id,
         AgentStatus::Completed(Some("current turn done".to_string())),
     );
+    control.external_agents.ack_terminal_observer(agent_id, 1);
     drop(
         control
             .external_agents

@@ -68,9 +68,71 @@ async fn queued_trigger_waits_for_release_before_starting_its_generation() {
         Some((AgentStatus::Completed(Some("first done".to_string())), 1))
     );
 
-    if let Some(pending) = submission.start() {
-        pending.start().await;
+    assert!(
+        submission.start().is_none(),
+        "queued turn must wait for the observer to confirm Stop"
+    );
+    assert_eq!(
+        manager.lifecycle_status(agent_id),
+        Some((AgentStatus::Completed(Some("first done".to_string())), 1))
+    );
+    manager.ack_terminal_observer(agent_id, 1);
+    let pending = manager
+        .take_ready_pending_start(agent_id)
+        .expect("acked terminal should release the queued generation");
+    pending.start().await;
+    assert_eq!(
+        manager.lifecycle_status(agent_id),
+        Some((AgentStatus::Running, 2))
+    );
+}
+
+#[tokio::test]
+async fn followup_after_terminal_waits_for_observer_ack() {
+    let manager = ExternalAgentManager::default();
+    let agent_id = ThreadId::new();
+    manager.register_for_tests(
+        agent_id,
+        ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+    let agent = manager.agent(agent_id).expect("registered agent");
+    {
+        let mut runtime = agent
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.running = true;
+        runtime.generation = 1;
+        agent.status_tx.send_replace(AgentStatus::Running);
     }
+    finish_turn(
+        Arc::clone(&agent),
+        1,
+        AgentStatus::Completed(Some("first done".to_string())),
+    );
+
+    let submission = manager
+        .submit_message(agent_id, "follow up".to_string(), true)
+        .expect("queue follow-up after terminal");
+    assert!(submission.requests_turn());
+    assert!(
+        !submission.starts_generation_now(),
+        "terminal follow-up must not start generation N+1 before Stop is confirmed"
+    );
+    assert_eq!(
+        manager.lifecycle_status(agent_id),
+        Some((AgentStatus::Completed(Some("first done".to_string())), 1))
+    );
+
+    assert!(submission.start().is_none());
+    manager.ack_terminal_observer(agent_id, 1);
+    let pending = manager
+        .take_ready_pending_start(agent_id)
+        .expect("observer ack should start the waiting follow-up");
+    pending.start().await;
     assert_eq!(
         manager.lifecycle_status(agent_id),
         Some((AgentStatus::Running, 2))
