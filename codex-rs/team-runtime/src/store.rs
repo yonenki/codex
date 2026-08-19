@@ -144,7 +144,7 @@ impl TeamStore for MemoryTeamStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner
             .outbox
-            .retain(|event| !event_ids.iter().any(|id| event.event_id == *id));
+            .retain(|event| !event_ids.contains(&event.event_id));
         Ok(())
     }
 

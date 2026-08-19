@@ -65,12 +65,27 @@ fn apply_kind(state: &mut TeamSessionState, event: &TeamEvent) -> TeamRuntimeRes
             Ok(())
         }
         TeamEventKind::NodeCompleted => {
-            if let Some(run) = state.current_node_run.as_mut() {
-                if let TeamEventPayload::NodeCompleted { result } = &event.payload {
+            if let TeamEventPayload::NodeCompleted {
+                result,
+                candidate_sha,
+                evidence_id,
+            } = &event.payload
+            {
+                if let Some(run) = state.current_node_run.as_mut() {
                     run.result = Some(result.clone());
-                    state.last_result = Some(result.clone());
+                    run.completed_at = Some(event.occurred_at);
                 }
-                run.completed_at = Some(event.occurred_at);
+                state.last_result = Some(result.clone());
+                // candidate SHA は payload の明示欄だけを正本にする。
+                if let Some(sha) = candidate_sha {
+                    state.candidate_sha = Some(sha.clone());
+                }
+                if let Some(evidence_id) = evidence_id {
+                    state.evidence.insert(
+                        evidence_id.clone(),
+                        state.candidate_sha.clone().unwrap_or_default(),
+                    );
+                }
             }
             Ok(())
         }

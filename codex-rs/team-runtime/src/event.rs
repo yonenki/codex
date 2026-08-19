@@ -59,8 +59,13 @@ pub enum TeamEventPayload {
     NodeStarted {
         purpose: String,
     },
+    /// Node 完了。candidate SHA と evidence は明示欄だけを正本とし、欠ける場合は null にする。
     NodeCompleted {
         result: String,
+        #[serde(default)]
+        candidate_sha: Option<String>,
+        #[serde(default)]
+        evidence_id: Option<String>,
     },
     AgentAttached {
         role: String,

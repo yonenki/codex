@@ -440,14 +440,6 @@ impl TeamControl {
             command.team_session_id,
             command.expected_revision,
             |state| {
-                if let Some(sha) = command.candidate_sha {
-                    state.candidate_sha = Some(sha);
-                }
-                if let Some(evidence_id) = command.evidence_id {
-                    state
-                        .evidence
-                        .insert(evidence_id, state.candidate_sha.clone().unwrap_or_default());
-                }
                 let kind = TeamEventKind::NodeCompleted;
                 Ok(TeamEvent {
                     event_id: crate::ids::EventId::generate(),
@@ -468,6 +460,8 @@ impl TeamControl {
                     role: None,
                     payload: TeamEventPayload::NodeCompleted {
                         result: command.result,
+                        candidate_sha: command.candidate_sha,
+                        evidence_id: command.evidence_id,
                     },
                 })
             },
@@ -843,14 +837,11 @@ impl TeamControl {
             .persist_event(next.clone(), event.clone())
             .await?;
         *state = next;
-        match self.sink.publish(vec![event.clone()]).await {
-            Ok(()) => {
-                let _ = self
-                    .store
-                    .mark_outbox_sent(vec![event.event_id.clone()])
-                    .await;
-            }
-            Err(_) => {}
+        if let Ok(()) = self.sink.publish(vec![event.clone()]).await {
+            let _ = self
+                .store
+                .mark_outbox_sent(vec![event.event_id.clone()])
+                .await;
         }
         Ok(())
     }

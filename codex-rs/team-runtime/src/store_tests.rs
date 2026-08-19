@@ -60,7 +60,7 @@ async fn sqlite_restores_team_node_and_binding() {
         binding.node_run_id,
         node.current_node
             .as_ref()
-            .and_then(|_| { None })
+            .and({ None })
             .unwrap_or(binding.node_run_id.clone())
     );
     assert!(!binding.node_run_id.as_str().is_empty());

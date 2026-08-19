@@ -115,16 +115,20 @@ async fn stale_revision_cas_rejects_transition() {
         })
         .await
         .expect("node");
-    control
+    let recorded = control
         .record_result(RecordResultCommand {
             team_session_id: started.team_session_id.clone(),
             result: "candidate_ready".into(),
-            evidence_id: None,
-            candidate_sha: Some("abc".into()),
+            evidence_id: Some("ev_work".into()),
+            candidate_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
             expected_revision: node.revision,
         })
         .await
         .expect("result");
+    assert_eq!(
+        recorded.candidate_sha.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
     let err = control
         .transition(TransitionCommand {
             team_session_id: started.team_session_id.clone(),
