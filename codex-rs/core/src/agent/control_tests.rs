@@ -1077,6 +1077,84 @@ async fn followup_after_terminal_waits_for_watcher_stop_before_next_start() {
 }
 
 #[tokio::test]
+async fn external_interrupted_generation_keeps_watcher_for_queued_followup() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "worker",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        },
+    );
+    harness.control.start_completion_watcher(
+        child_thread_id,
+        parent_thread_id,
+        child_agent_path.to_string(),
+        Some(child_agent_path),
+    );
+    harness
+        .control
+        .external_agents
+        .begin_turn_for_tests(child_thread_id);
+
+    harness
+        .control
+        .external_agents
+        .interrupt(child_thread_id)
+        .expect("interrupt generation one");
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let starts_for_hook = Arc::clone(&starts);
+    let (_, requests_turn) = harness
+        .control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "follow-up while interrupted Stop is pending".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            move || async move {
+                starts_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("queue follow-up behind interrupted terminal");
+    assert!(requests_turn);
+
+    let terminals = receive_terminal_events(&parent_thread, child_thread_id, 2).await;
+    assert_eq!(
+        terminals
+            .iter()
+            .map(|event| event.status)
+            .collect::<Vec<_>>(),
+        vec![
+            SubAgentTerminalStatus::Interrupted,
+            SubAgentTerminalStatus::Errored,
+        ]
+    );
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn external_turn_start_hook_precedes_running_status() {
     let control = AgentControl::default();
     let child_thread_id = ThreadId::new();

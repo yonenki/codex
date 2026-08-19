@@ -595,9 +595,9 @@ mod tests {
         assert_eq!(scalar.chars().count(), 1);
         let key_ok = scalar.repeat(MAX_SPAWN_METADATA_KEY_CHARS);
         let value_ok = scalar.repeat(MAX_SPAWN_METADATA_VALUE_CHARS);
-        let parsed = parse_spawn_observer_metadata(Some(json!({ key_ok.clone(): value_ok })))
+        let parsed = parse_spawn_observer_metadata(Some(json!({ key_ok: value_ok })))
             .expect("scalar-length boundary must be accepted");
-        assert_eq!(parsed.as_ref().map(|metadata| metadata.len()), Some(1));
+        assert_eq!(parsed.as_ref().map(std::collections::BTreeMap::len), Some(1));
 
         assert!(
             parse_spawn_observer_metadata(Some(

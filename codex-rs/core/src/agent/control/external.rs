@@ -234,7 +234,7 @@ impl ExternalAgentManager {
             },
             command_tx,
             runtime: Mutex::new(ExternalAgentRuntime::default()),
-            status_tx: status_tx.clone(),
+            status_tx,
         });
         let mut agents = self
             .agents
@@ -247,7 +247,9 @@ impl ExternalAgentManager {
         }
         tokio::spawn(async move {
             if let Err(error) = run_acp_agent(backend, cwd, env, command_rx).await {
-                status_tx.send_replace(AgentStatus::Errored(error));
+                // Transport failure and response-channel drop can cross. Both use the same
+                // generation transition, so exactly one terminal and barrier can win.
+                finish_current_turn(agent, AgentStatus::Errored(error));
             }
         });
         Ok(())
@@ -455,19 +457,23 @@ impl ExternalAgentManager {
         let agent = self
             .agent(agent_id)
             .ok_or(CodexErr::ThreadNotFound(agent_id))?;
-        let active_task = {
+        let (active_task, should_cancel) = {
             let mut runtime = agent
                 .runtime
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.running = false;
-            runtime.generation = runtime.generation.wrapping_add(1);
             runtime.queued_messages.clear();
-            runtime.unacked_terminal_generation = Some(runtime.generation);
-            agent.status_tx.send_replace(AgentStatus::Interrupted);
-            runtime.active_task.take()
+            let should_cancel = runtime.running;
+            let active_task = runtime.active_task.take();
+            if should_cancel {
+                let generation = runtime.generation;
+                publish_terminal_locked(&agent, &mut runtime, generation, AgentStatus::Interrupted);
+            }
+            (active_task, should_cancel)
         };
-        let _ = agent.command_tx.try_send(AcpCommand::Cancel);
+        if should_cancel {
+            let _ = agent.command_tx.try_send(AcpCommand::Cancel);
+        }
         if let Some(task) = active_task {
             task.abort();
         }
@@ -661,8 +667,29 @@ fn finish_turn(agent: Arc<ExternalAgent>, generation: u64, status: AgentStatus) 
         .runtime
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if runtime.generation != generation {
-        return;
+    publish_terminal_locked(&agent, &mut runtime, generation, status);
+}
+
+fn finish_current_turn(agent: Arc<ExternalAgent>, status: AgentStatus) {
+    let mut runtime = agent
+        .runtime
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let generation = runtime.generation;
+    publish_terminal_locked(&agent, &mut runtime, generation, status);
+}
+
+fn publish_terminal_locked(
+    agent: &ExternalAgent,
+    runtime: &mut ExternalAgentRuntime,
+    generation: u64,
+    status: AgentStatus,
+) -> bool {
+    if !runtime.running
+        || runtime.generation != generation
+        || runtime.unacked_terminal_generation.is_some()
+    {
+        return false;
     }
     runtime.running = false;
     runtime.active_task = None;
@@ -670,6 +697,7 @@ fn finish_turn(agent: Arc<ExternalAgent>, generation: u64, status: AgentStatus) 
     // 次generationを始める前に、このgenerationの終端を先に公開する。
     // Stop と completion がobserverで確定してから次turnを始める。
     agent.status_tx.send_replace(status);
+    true
 }
 
 async fn run_acp_agent(

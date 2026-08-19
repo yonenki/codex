@@ -843,27 +843,18 @@ impl AgentControl {
                                     !interrupted,
                                 )
                                 .await;
-                            if interrupted {
-                                return;
-                            }
                         }
-                        if matches!(status, AgentStatus::Interrupted) {
-                            // ACP agents finish their current lifecycle at interruption. Legacy
-                            // native agents remain watchable and may transition back to Running.
-                            if is_external {
+                        // An ACP terminal closes one generation, not the watcher. Follow-ups can
+                        // promote the same agent immediately after observer acknowledgement.
+                        let keep_watching_external = is_external
+                            && is_final(&status)
+                            && !matches!(status, AgentStatus::Shutdown);
+                        if keep_watching_external {
+                            if status_rx.changed().await.is_err() {
                                 return;
                             }
-                        } else {
-                            let keep_watching_external = is_external
-                                && is_final(&status)
-                                && !matches!(status, AgentStatus::Shutdown);
-                            if keep_watching_external {
-                                if status_rx.changed().await.is_err() {
-                                    return;
-                                }
-                                status = status_rx.borrow().clone();
-                                continue;
-                            }
+                            status = status_rx.borrow().clone();
+                            continue;
                         }
 
                         if is_final(&status) {
@@ -907,9 +898,6 @@ impl AgentControl {
                                     !interrupted,
                                 )
                                 .await;
-                            if interrupted {
-                                return;
-                            }
                         }
                     }
                     if !is_final(&status) {
