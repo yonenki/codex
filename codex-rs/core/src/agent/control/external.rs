@@ -224,6 +224,7 @@ impl ExternalAgentManager {
         backend: ResolvedExternalAgentBackend,
         cwd: std::path::PathBuf,
         env: HashMap<String, String>,
+        team: Option<std::sync::Arc<codex_team_runtime::TeamControl>>,
     ) -> CodexResult<()> {
         let (status_tx, _) = watch::channel(AgentStatus::PendingInit);
         let (command_tx, command_rx) = async_channel::unbounded();
@@ -246,7 +247,7 @@ impl ExternalAgentManager {
             )));
         }
         tokio::spawn(async move {
-            if let Err(error) = run_acp_agent(backend, cwd, env, command_rx).await {
+            if let Err(error) = run_acp_agent(backend, cwd, env, command_rx, agent_id, team).await {
                 // Transport failure and response-channel drop can cross. Both use the same
                 // generation transition, so exactly one terminal and barrier can win.
                 finish_current_turn(agent, AgentStatus::Errored(error));
@@ -705,6 +706,8 @@ async fn run_acp_agent(
     cwd: std::path::PathBuf,
     env: HashMap<String, String>,
     command_rx: async_channel::Receiver<AcpCommand>,
+    agent_id: ThreadId,
+    team: Option<std::sync::Arc<codex_team_runtime::TeamControl>>,
 ) -> Result<(), String> {
     let output = Arc::new(Mutex::new(String::new()));
     let notification_output = Arc::clone(&output);
@@ -721,6 +724,19 @@ async fn run_acp_agent(
         .on_receive_notification(
             async move |notification: SessionNotification, _connection| {
                 append_agent_text(&notification, &notification_output);
+                if let Some(team) = team.as_ref()
+                    && format!("{:?}", notification.update).contains("ToolCall")
+                {
+                    let _ = team
+                        .record_tool_operation(
+                            &agent_id.to_string(),
+                            "acp.tool_call",
+                            "acp",
+                            codex_team_runtime::TeamEventKind::ToolOperationStarted,
+                            Some("reported"),
+                        )
+                        .await;
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),

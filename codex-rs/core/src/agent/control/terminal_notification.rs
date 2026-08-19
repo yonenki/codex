@@ -71,6 +71,15 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
     let Some(status) = terminal_status(status) else {
         return;
     };
+    let status_label = match status {
+        SubAgentTerminalStatus::Completed => "completed",
+        SubAgentTerminalStatus::Errored => "errored",
+        SubAgentTerminalStatus::Interrupted => "interrupted",
+    };
+    let _ = control
+        .team
+        .record_agent_terminal(&child_thread_id.to_string(), status_label)
+        .await;
     let Some(metadata) = control.state.agent_metadata_for_thread(child_thread_id) else {
         return;
     };

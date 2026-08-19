@@ -313,6 +313,18 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
     let turn = &step_context.turn;
     let args: SpawnArgs = parse_arguments(&function_arguments(payload)?)?;
     let observer_metadata = parse_spawn_observer_metadata(args.metadata)?;
+    if session
+        .services
+        .agent_control
+        .team()
+        .binding_snapshot(&session.thread_id.to_string())
+        .is_none()
+        && session.services.agent_control.team().open_team_count() > 0
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "open Team sessions require team.spawn_agent(team_session_id, ...). acp.spawn cannot infer Team identity.".to_string(),
+        ));
+    }
     let message = message_content(args.message)?;
     let explicit_backend = explicit_backend(args.harness, args.model, args.effort)?;
     let mut config = build_agent_spawn_config(
@@ -400,6 +412,7 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
             AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id),
             spawn_source,
             observer_metadata,
+            None,
             move |agent_id| async move {
                 run_external_subagent_start_hook(
                     &start_session,

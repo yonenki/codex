@@ -12,6 +12,19 @@ use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 
 pub(crate) async fn notify_tool_start(invocation: &ToolInvocation) {
+    let _ = invocation
+        .session
+        .services
+        .agent_control
+        .team()
+        .record_tool_operation(
+            &invocation.session.thread_id.to_string(),
+            &invocation.tool_name.to_string(),
+            &invocation.call_id,
+            codex_team_runtime::TeamEventKind::ToolOperationStarted,
+            None,
+        )
+        .await;
     let contributors = invocation
         .session
         .services
@@ -78,6 +91,27 @@ async fn notify_tool_finish_parts(
     source: ToolCallSource,
     outcome: ToolCallOutcome,
 ) {
+    let kind = match outcome {
+        ToolCallOutcome::Completed { success: true } => {
+            codex_team_runtime::TeamEventKind::ToolOperationCompleted
+        }
+        ToolCallOutcome::Completed { success: false }
+        | ToolCallOutcome::Blocked
+        | ToolCallOutcome::Failed { .. }
+        | ToolCallOutcome::Aborted => codex_team_runtime::TeamEventKind::ToolOperationFailed,
+    };
+    let _ = session
+        .services
+        .agent_control
+        .team()
+        .record_tool_operation(
+            &session.thread_id.to_string(),
+            &tool_name.to_string(),
+            call_id,
+            kind,
+            None,
+        )
+        .await;
     for contributor in session.services.extensions.tool_lifecycle_contributors() {
         contributor
             .on_tool_finish(ToolFinishInput {

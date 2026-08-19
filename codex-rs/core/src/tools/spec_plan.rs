@@ -52,6 +52,10 @@ use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHa
 use crate::tools::handlers::multi_agents_v2::SpawnAcpAgentHandler;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::handlers::team::TeamAgentToolHandler;
+use crate::tools::handlers::team::TeamLifecycleToolHandler;
+use crate::tools::handlers::team::all_team_capabilities;
+use crate::tools::handlers::team::team_namespace;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::hosted_spec::WebSearchToolOptions;
@@ -78,6 +82,7 @@ use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_team_graph::ToolCapability;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
@@ -149,6 +154,7 @@ pub(crate) fn build_tool_router(
     };
     let mut registry = ToolRegistry::default();
     add_core_tool_sources(&context, &mut registry);
+    add_team_tools(session, &context, &mut registry);
 
     let hosted_specs = if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source)
     {
@@ -1235,6 +1241,63 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             registry
                 .add_with_exposure(WaitAgentHandler::new(context.wait_agent_timeouts), exposure);
             registry.add_with_exposure(CloseAgentHandler, exposure);
+        }
+    }
+}
+
+fn add_team_tools(
+    session: &Session,
+    context: &CoreToolPlanContext<'_>,
+    registry: &mut ToolRegistry,
+) {
+    if !multi_agent_v2_enabled(context.turn_context) {
+        return;
+    }
+    let thread_id = session.thread_id.to_string();
+    let team = session.services.agent_control.team();
+    let bound = team.binding_snapshot(&thread_id);
+    let capabilities = if let Some(available) = team.available_tools_for(&thread_id) {
+        available
+    } else if bound.is_some() {
+        Vec::new()
+    } else {
+        all_team_capabilities().to_vec()
+    };
+    let exposure = if context
+        .turn_context
+        .config
+        .multi_agent_v2
+        .non_code_mode_only
+    {
+        ToolExposure::DirectModelOnly
+    } else {
+        ToolExposure::Direct
+    };
+    for capability in capabilities {
+        match capability {
+            ToolCapability::SpawnAgent
+            | ToolCapability::SendMessage
+            | ToolCapability::FollowupAgent
+            | ToolCapability::Wait
+            | ToolCapability::InterruptAgent
+            | ToolCapability::ListAgents => {
+                registry.register_trusted_with_exposure(
+                    multi_agent_v2_handler(
+                        TeamAgentToolHandler::new(capability),
+                        Some(team_namespace()),
+                    ),
+                    exposure,
+                );
+            }
+            _ => {
+                registry.register_trusted_with_exposure(
+                    multi_agent_v2_handler(
+                        TeamLifecycleToolHandler::new(capability),
+                        Some(team_namespace()),
+                    ),
+                    exposure,
+                );
+            }
         }
     }
 }

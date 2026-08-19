@@ -1,0 +1,33 @@
+use crate::ids::StateRevision;
+use crate::ids::TeamSessionId;
+use thiserror::Error;
+
+pub type TeamRuntimeResult<T> = Result<T, TeamRuntimeError>;
+
+#[derive(Debug, Error)]
+pub enum TeamRuntimeError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("team session {0} was not found")]
+    TeamNotFound(TeamSessionId),
+    #[error("team session {team} cannot reference {subject} from another team")]
+    CrossTeamRef {
+        team: TeamSessionId,
+        subject: String,
+    },
+    #[error("expected revision {expected}, actual {actual}")]
+    StaleRevision {
+        expected: StateRevision,
+        actual: StateRevision,
+    },
+    #[error("team store failed: {0}")]
+    Store(String),
+    #[error("team event sink failed: {0}")]
+    Sink(String),
+}
+
+impl TeamRuntimeError {
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
+    }
+}

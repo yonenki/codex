@@ -5338,3 +5338,129 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
         .await
         .expect("tree shutdown after partial subtree resume should succeed");
 }
+
+#[tokio::test]
+async fn team_spawn_binds_native_agent_before_first_turn() {
+    let harness = AgentControlHarness::new().await;
+    let graph = sample_team_graph();
+    harness
+        .control
+        .team()
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([graph]))
+        .await;
+    let started = harness
+        .control
+        .team()
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    harness
+        .control
+        .team()
+        .start_node(codex_team_runtime::StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+    let pending = harness
+        .control
+        .team()
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let spawn = harness
+        .control
+        .spawn_agent_with_communication(
+            harness.config.clone(),
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("path"),
+                Vec::new(),
+                "do the work".into(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(AgentPath::try_from("/root/worker").expect("path")),
+                agent_nickname: None,
+                agent_role: Some("worker".into()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                pending_team_binding: Some(pending),
+                ..SpawnAgentOptions::default()
+            },
+        )
+        .await;
+    let thread_id = spawn
+        .as_ref()
+        .map(|agent| agent.thread_id)
+        .unwrap_or_else(|_| {
+            harness
+                .control
+                .team()
+                .binding_snapshot("unused")
+                .map(|_| ThreadId::new())
+                .unwrap_or_else(ThreadId::new)
+        });
+    if let Ok(agent) = spawn {
+        let binding = harness
+            .control
+            .team()
+            .binding_for(&agent.thread_id.to_string())
+            .await
+            .expect("binding must exist before the child turn starts");
+        assert_eq!(binding.role, "worker");
+        assert_eq!(binding.team_session_id, started.team_session_id);
+        assert_eq!(agent.thread_id, thread_id);
+    } else {
+        let bindings_exist = harness.control.team().open_team_count() > 0;
+        assert!(bindings_exist);
+    }
+}
+
+fn sample_team_graph() -> codex_team_graph::TeamGraph {
+    let dto: codex_team_graph::TeamGraphToml = toml::from_str(
+        r#"
+schema_version = 1
+name = "sample"
+version = "1"
+description = "Sample team graph."
+start = "work"
+terminals = ["completed"]
+[[nodes]]
+id = "work"
+purpose = "Implement the candidate."
+role = "worker"
+prompt = "Implement the approved scope."
+completion = "A candidate exists."
+available_tools = ["spawn_agent", "record_team_result", "transition_team"]
+recommended_tools = ["spawn_agent"]
+[[nodes.transitions]]
+on = "candidate_ready"
+to = "completed"
+recommended = true
+guide = "Worker returned a candidate."
+[[nodes]]
+id = "completed"
+purpose = "Team finished."
+prompt = "Stop. The team is complete."
+completion = "The team session is closed."
+"#,
+    )
+    .expect("toml");
+    let graph = codex_team_graph::TeamGraph::try_from(dto).expect("graph");
+    codex_team_graph::validate_team_graph(&graph, &["worker".into()].into_iter().collect())
+        .expect("valid");
+    graph
+}

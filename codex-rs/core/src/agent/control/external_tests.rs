@@ -291,6 +291,7 @@ async fn registration_publishes_immutable_backend_identity_before_harness_startu
             },
             std::env::current_dir().expect("current dir"),
             HashMap::new(),
+            None,
         )
         .expect("register external agent");
 

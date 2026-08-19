@@ -266,6 +266,7 @@ impl AgentControl {
         context: AgentCommunicationContext,
         session_source: SessionSource,
         metadata: Option<std::collections::BTreeMap<String, String>>,
+        pending_team_binding: Option<codex_team_runtime::PendingTeamBinding>,
         on_started: F,
     ) -> CodexResult<LiveAgent>
     where
@@ -338,8 +339,27 @@ impl AgentControl {
             command: resolved_command.to_string_lossy().into_owned(),
             args: host_args,
         };
-        self.external_agents
-            .register(agent_id, backend, config.cwd.to_path_buf(), env)?;
+        self.external_agents.register(
+            agent_id,
+            backend,
+            config.cwd.to_path_buf(),
+            env,
+            Some(std::sync::Arc::clone(&self.team)),
+        )?;
+        let pending_team_binding = if let Some(pending) = pending_team_binding {
+            Some(pending)
+        } else {
+            self.team
+                .binding_for(&parent_thread_id.to_string())
+                .await
+                .map(|binding| binding.to_pending())
+        };
+        if let Some(pending) = pending_team_binding {
+            self.team
+                .bind_agent_before_start(agent_id.to_string(), pending)
+                .await
+                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+        }
         if let Err(error) = self
             .send_external_inter_agent_communication_with_start_hook(
                 agent_id,
@@ -674,6 +694,23 @@ impl AgentControl {
             notification_source.as_ref(),
         )
         .await;
+
+        let pending_team_binding = if let Some(pending) = options.pending_team_binding.clone() {
+            Some(pending)
+        } else if let Some(parent_thread_id) = options.parent_thread_id {
+            self.team
+                .binding_for(&parent_thread_id.to_string())
+                .await
+                .map(|binding| binding.to_pending())
+        } else {
+            None
+        };
+        if let Some(pending) = pending_team_binding {
+            self.team
+                .bind_agent_before_start(new_thread.thread_id.to_string(), pending)
+                .await
+                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+        }
 
         match initial_input {
             SpawnInitialInput::UserInput(input) => {

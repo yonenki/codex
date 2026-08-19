@@ -86,6 +86,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
     pub(crate) multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
     pub(crate) metadata: Option<std::collections::BTreeMap<String, String>>,
+    pub(crate) pending_team_binding: Option<codex_team_runtime::PendingTeamBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +134,7 @@ pub(crate) struct AgentControl {
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
     rollout_budget: Arc<RolloutBudget>,
+    team: Arc<codex_team_runtime::TeamControl>,
 }
 
 impl Default for AgentControl {
@@ -176,6 +178,7 @@ impl AgentControl {
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
+            team: Arc::new(codex_team_runtime::TeamControl::empty()),
         };
         if let Some(rollout_budget) = rollout_budget {
             control.rollout_budget.configure(rollout_budget);
@@ -191,6 +194,10 @@ impl AgentControl {
 
     pub(crate) fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    pub(crate) fn team(&self) -> &codex_team_runtime::TeamControl {
+        &self.team
     }
 
     pub(crate) fn generate_thread_id(&self) -> ThreadId {
