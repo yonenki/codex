@@ -94,6 +94,7 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
         return;
     };
     let external_identity = control.external_agents.identity(child_thread_id);
+    let is_external = external_identity.is_some();
     let hook_identity = external_identity
         .as_ref()
         .map(|identity| ExternalSubagentHookIdentity {
@@ -129,6 +130,9 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
             identity,
         ))
         .await;
+    }
+    if is_external {
+        Box::pin(control.promote_ready_external_generation(child_thread_id)).await;
     }
 }
 

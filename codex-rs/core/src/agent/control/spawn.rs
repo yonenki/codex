@@ -268,8 +268,8 @@ impl AgentControl {
         on_started: F,
     ) -> CodexResult<LiveAgent>
     where
-        F: FnOnce(ThreadId) -> Fut,
-        Fut: std::future::Future<Output = ()>,
+        F: FnOnce(ThreadId) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         self.ensure_execution_capacity(MultiAgentVersion::V2, &session_source)?;
         let mut reservation = self
@@ -343,7 +343,7 @@ impl AgentControl {
                 agent_id,
                 communication,
                 context,
-                || on_started(agent_id),
+                move || on_started(agent_id),
             )
             .await
         {

@@ -13,12 +13,14 @@ fn combines_queued_messages_in_delivery_order() {
             trigger_turn: false,
             submission_id: None,
             ready_to_start: true,
+            on_started: None,
         },
         QueuedMessage {
             content: "second".to_string(),
             trigger_turn: true,
             submission_id: Some("second".to_string()),
             ready_to_start: true,
+            on_started: None,
         },
     ]);
 
@@ -66,7 +68,9 @@ async fn queued_trigger_waits_for_release_before_starting_its_generation() {
         Some((AgentStatus::Completed(Some("first done".to_string())), 1))
     );
 
-    submission.start();
+    if let Some(pending) = submission.start() {
+        pending.start().await;
+    }
     assert_eq!(
         manager.lifecycle_status(agent_id),
         Some((AgentStatus::Running, 2))

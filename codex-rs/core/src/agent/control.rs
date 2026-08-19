@@ -340,8 +340,8 @@ impl AgentControl {
         on_started: F,
     ) -> CodexResult<(String, bool)>
     where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = ()>,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         if !self.external_agents.contains(agent_id) {
             return Err(CodexErr::ThreadNotFound(agent_id));
@@ -368,14 +368,29 @@ impl AgentControl {
         }
         let communication_id = submission.submission_id().to_string();
         let requests_turn = submission.requests_turn();
-        if requests_turn {
+        if submission.starts_generation_now() {
             on_started().await;
+            let _ = submission.start();
+        } else if requests_turn {
+            // 実行中の queued follow-up は次generationの予約にすぎない。
+            // Start は現turnのStopのあと、そのgenerationが実際に始まるときに出す。
+            submission.defer_start_hook(Box::new(move || Box::pin(on_started())));
+            if let Some(pending) = submission.start() {
+                pending.start().await;
+            }
+        } else {
+            let _ = submission.start();
         }
-        submission.start();
         if requests_turn {
             self.maybe_start_external_completion_watcher(agent_id);
         }
         Ok((communication_id, requests_turn))
+    }
+
+    pub(super) async fn promote_ready_external_generation(&self, agent_id: ThreadId) {
+        if let Some(pending) = self.external_agents.take_ready_pending_start(agent_id) {
+            pending.start().await;
+        }
     }
 
     async fn send_inter_agent_communication_after_capacity_check(

@@ -23,12 +23,17 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::Duration;
 use tokio::time::timeout;
+
+pub(super) type GenerationStartHook =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 const MAX_RESULT_TOKENS: usize = 8_000;
 const ACP_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -64,6 +69,7 @@ struct QueuedMessage {
     trigger_turn: bool,
     submission_id: Option<String>,
     ready_to_start: bool,
+    on_started: Option<GenerationStartHook>,
 }
 
 pub(super) struct ExternalMessageSubmission {
@@ -99,12 +105,34 @@ impl ExternalMessageSubmission {
         )
     }
 
-    pub(super) fn start(mut self) {
+    pub(super) fn starts_generation_now(&self) -> bool {
+        matches!(
+            self.action.as_ref(),
+            Some(ExternalMessageSubmissionAction::StartTurn { .. })
+        )
+    }
+
+    pub(super) fn defer_start_hook(&self, hook: GenerationStartHook) {
+        let mut runtime = self
+            .agent
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(message) = runtime
+            .queued_messages
+            .iter_mut()
+            .find(|message| message.submission_id.as_deref() == Some(self.submission_id.as_str()))
+        {
+            message.on_started = Some(hook);
+        }
+    }
+
+    pub(super) fn start(mut self) -> Option<PendingGenerationStart> {
         let Some(action) = self.action.take() else {
-            return;
+            return None;
         };
         match action {
-            ExternalMessageSubmissionAction::QueueOnly => {}
+            ExternalMessageSubmissionAction::QueueOnly => None,
             ExternalMessageSubmissionAction::StartTurn {
                 mut queued_messages,
                 content,
@@ -112,11 +140,44 @@ impl ExternalMessageSubmission {
             } => {
                 let prompt = prepend_queued_messages(&mut queued_messages, content);
                 start_turn(Arc::clone(&self.agent), prompt, generation);
+                None
             }
             ExternalMessageSubmissionAction::ReleaseQueuedTurn { submission_id } => {
-                release_queued_turn(Arc::clone(&self.agent), &submission_id);
+                release_queued_turn(Arc::clone(&self.agent), &submission_id)
             }
         }
+    }
+}
+
+pub(super) struct PendingGenerationStart {
+    agent: Arc<ExternalAgent>,
+    prompt: String,
+    generation: u64,
+    on_started: Option<GenerationStartHook>,
+    started: bool,
+}
+
+impl PendingGenerationStart {
+    pub(super) async fn start(mut self) {
+        if let Some(hook) = self.on_started.take() {
+            hook().await;
+        }
+        self.started = true;
+        start_turn(
+            Arc::clone(&self.agent),
+            self.prompt.clone(),
+            self.generation,
+        );
+    }
+}
+
+impl Drop for PendingGenerationStart {
+    fn drop(&mut self) {
+        if self.started {
+            return;
+        }
+        let _ = self.on_started.take();
+        rollback_reserved_turn(Arc::clone(&self.agent), VecDeque::new(), self.generation);
     }
 }
 
@@ -275,6 +336,27 @@ impl ExternalAgentManager {
         }
     }
 
+    pub(super) fn take_ready_pending_start(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<PendingGenerationStart> {
+        let agent = self.agent(agent_id)?;
+        let turn = {
+            let mut runtime = agent
+                .runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            take_ready_queued_turn(&mut runtime)
+        };
+        turn.map(|(prompt, generation, on_started)| PendingGenerationStart {
+            agent,
+            prompt,
+            generation,
+            on_started,
+            started: false,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn queued_message_contents_for_tests(&self, agent_id: ThreadId) -> Vec<String> {
         self.agent(agent_id)
@@ -317,6 +399,7 @@ impl ExternalAgentManager {
                     trigger_turn,
                     submission_id: None,
                     ready_to_start: true,
+                    on_started: None,
                 });
                 ExternalMessageSubmissionAction::QueueOnly
             } else if runtime.running
@@ -330,6 +413,7 @@ impl ExternalAgentManager {
                     trigger_turn,
                     submission_id: Some(submission_id.clone()),
                     ready_to_start: false,
+                    on_started: None,
                 });
                 ExternalMessageSubmissionAction::ReleaseQueuedTurn {
                     submission_id: submission_id.clone(),
@@ -391,7 +475,9 @@ fn prepend_queued_messages(queue: &mut VecDeque<QueuedMessage>, content: String)
     messages.join("\n\n")
 }
 
-fn take_ready_queued_turn(runtime: &mut ExternalAgentRuntime) -> Option<(String, u64)> {
+fn take_ready_queued_turn(
+    runtime: &mut ExternalAgentRuntime,
+) -> Option<(String, u64, Option<GenerationStartHook>)> {
     if runtime.running
         || !runtime
             .queued_messages
@@ -406,18 +492,25 @@ fn take_ready_queued_turn(runtime: &mut ExternalAgentRuntime) -> Option<(String,
     }
     runtime.running = true;
     runtime.generation = runtime.generation.wrapping_add(1);
-    Some((
-        runtime
-            .queued_messages
-            .drain(..)
-            .map(|message| message.content)
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        runtime.generation,
-    ))
+    let mut on_started = None;
+    let prompt = runtime
+        .queued_messages
+        .drain(..)
+        .map(|message| {
+            if on_started.is_none() {
+                on_started = message.on_started;
+            }
+            message.content
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some((prompt, runtime.generation, on_started))
 }
 
-fn release_queued_turn(agent: Arc<ExternalAgent>, submission_id: &str) {
+fn release_queued_turn(
+    agent: Arc<ExternalAgent>,
+    submission_id: &str,
+) -> Option<PendingGenerationStart> {
     let turn = {
         let mut runtime = agent
             .runtime
@@ -432,13 +525,17 @@ fn release_queued_turn(agent: Arc<ExternalAgent>, submission_id: &str) {
         }
         take_ready_queued_turn(&mut runtime)
     };
-    if let Some((prompt, generation)) = turn {
-        start_turn(agent, prompt, generation);
-    }
+    turn.map(|(prompt, generation, on_started)| PendingGenerationStart {
+        agent,
+        prompt,
+        generation,
+        on_started,
+        started: false,
+    })
 }
 
 fn rollback_queued_turn(agent: Arc<ExternalAgent>, submission_id: &str) {
-    let turn = {
+    let pending = {
         let mut runtime = agent
             .runtime
             .lock()
@@ -450,10 +547,20 @@ fn rollback_queued_turn(agent: Arc<ExternalAgent>, submission_id: &str) {
         {
             runtime.queued_messages.remove(position);
         }
-        take_ready_queued_turn(&mut runtime)
+        take_ready_queued_turn(&mut runtime).map(|(prompt, generation, on_started)| {
+            PendingGenerationStart {
+                agent: Arc::clone(&agent),
+                prompt,
+                generation,
+                on_started,
+                started: false,
+            }
+        })
     };
-    if let Some((prompt, generation)) = turn {
-        start_turn(agent, prompt, generation);
+    if let Some(pending) = pending {
+        tokio::spawn(async move {
+            pending.start().await;
+        });
     }
 }
 
@@ -472,10 +579,20 @@ fn rollback_reserved_turn(
             queued_messages.append(&mut runtime.queued_messages);
             runtime.queued_messages = queued_messages;
         }
-        take_ready_queued_turn(&mut runtime)
+        take_ready_queued_turn(&mut runtime).map(|(prompt, generation, on_started)| {
+            PendingGenerationStart {
+                agent: Arc::clone(&agent),
+                prompt,
+                generation,
+                on_started,
+                started: false,
+            }
+        })
     };
-    if let Some((prompt, generation)) = turn {
-        start_turn(agent, prompt, generation);
+    if let Some(pending) = turn {
+        tokio::spawn(async move {
+            pending.start().await;
+        });
     }
 }
 
@@ -522,27 +639,18 @@ fn start_turn(agent: Arc<ExternalAgent>, prompt: String, generation: u64) {
 }
 
 fn finish_turn(agent: Arc<ExternalAgent>, generation: u64, status: AgentStatus) {
-    let next_turn = {
-        let mut runtime = agent
-            .runtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if runtime.generation != generation {
-            return;
-        }
-        runtime.running = false;
-        runtime.active_task = None;
-        let next_turn = take_ready_queued_turn(&mut runtime);
-        if next_turn.is_none() {
-            // Publish the terminal status while holding the lifecycle lock so a newly reserved
-            // turn cannot publish Running and then be overwritten by this older generation.
-            agent.status_tx.send_replace(status);
-        }
-        next_turn
-    };
-    if let Some((prompt, generation)) = next_turn {
-        start_turn(agent, prompt, generation);
+    let mut runtime = agent
+        .runtime
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if runtime.generation != generation {
+        return;
     }
+    runtime.running = false;
+    runtime.active_task = None;
+    // 次generationを始める前に、このgenerationの終端を先に公開する。
+    // Stop が先に届き、次の Start は次generationのものになる。
+    agent.status_tx.send_replace(status);
 }
 
 async fn run_acp_agent(

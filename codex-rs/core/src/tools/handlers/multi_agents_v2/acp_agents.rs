@@ -666,6 +666,8 @@ async fn deliver(
         harness,
         model,
     };
+    let start_session = Arc::clone(&session);
+    let start_turn = Arc::clone(turn);
     let (_, requests_turn) = session
         .services
         .agent_control
@@ -673,9 +675,9 @@ async fn deliver(
             agent_id,
             communication,
             AgentCommunicationContext::new(mode.communication_kind(), session.thread_id),
-            || async {
-                run_external_subagent_start_hook(&session, turn, start_identity).await;
-                emit_sub_agent_activity(&session, turn, started_activity).await;
+            move || async move {
+                run_external_subagent_start_hook(&start_session, &start_turn, start_identity).await;
+                emit_sub_agent_activity(&start_session, &start_turn, started_activity).await;
             },
         )
         .await
