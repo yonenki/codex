@@ -2,6 +2,7 @@ use super::multi_agents_common::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
 use super::multi_agents_common::model_supports_multi_agent_backend;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_tools::AdditionalProperties;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -625,6 +626,10 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
                 SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
+        (
+            "metadata".to_string(),
+            spawn_observer_metadata_schema(),
+        ),
     ])
 }
 
@@ -669,7 +674,24 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
                 SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
+        (
+            "metadata".to_string(),
+            spawn_observer_metadata_schema(),
+        ),
     ])
+}
+
+pub(crate) fn spawn_observer_metadata_schema() -> JsonSchema {
+    let mut schema = JsonSchema::object(
+        BTreeMap::new(),
+        None,
+        Some(AdditionalProperties::from(JsonSchema::string(None))),
+    );
+    schema.description = Some(
+        "Optional observer-facing operational labels as a string map. Not for secrets. Follow-ups inherit the spawn map."
+            .to_string(),
+    );
+    schema
 }
 
 fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {

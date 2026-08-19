@@ -85,6 +85,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) root_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
     pub(crate) multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
+    pub(crate) metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1000,6 +1001,7 @@ impl AgentControl {
             agent_path,
             agent_nickname,
             agent_role,
+            metadata: None,
         })
     }
 

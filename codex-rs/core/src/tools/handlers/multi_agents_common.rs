@@ -25,13 +25,66 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use serde::Serialize;
+use serde_json::Map;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 pub(crate) const MAX_SPAWN_AGENT_MODEL_OVERRIDES: usize = 5;
+pub(crate) const MAX_SPAWN_METADATA_ENTRIES: usize = 16;
+pub(crate) const MAX_SPAWN_METADATA_KEY_CHARS: usize = 64;
+pub(crate) const MAX_SPAWN_METADATA_VALUE_CHARS: usize = 512;
+
+/// 起動時metadataをobserver向けラベルとして受理する。secretやprompt注入には使わない。
+pub(crate) fn parse_spawn_observer_metadata(
+    raw: Option<JsonValue>,
+) -> Result<Option<BTreeMap<String, String>>, FunctionCallError> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let JsonValue::Object(map) = value else {
+        return Err(FunctionCallError::RespondToModel(
+            "metadata must be an object of string keys and string values".to_string(),
+        ));
+    };
+    normalize_spawn_observer_metadata(map)
+}
+
+fn normalize_spawn_observer_metadata(
+    map: Map<String, JsonValue>,
+) -> Result<Option<BTreeMap<String, String>>, FunctionCallError> {
+    if map.is_empty() {
+        return Ok(None);
+    }
+    if map.len() > MAX_SPAWN_METADATA_ENTRIES {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "metadata supports at most {MAX_SPAWN_METADATA_ENTRIES} entries"
+        )));
+    }
+    let mut metadata = BTreeMap::new();
+    for (key, value) in map {
+        if key.is_empty() || key.chars().count() > MAX_SPAWN_METADATA_KEY_CHARS {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "metadata keys must be 1-{MAX_SPAWN_METADATA_KEY_CHARS} characters"
+            )));
+        }
+        let JsonValue::String(text) = value else {
+            return Err(FunctionCallError::RespondToModel(
+                "metadata values must be strings".to_string(),
+            ));
+        };
+        if text.chars().count() > MAX_SPAWN_METADATA_VALUE_CHARS {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "metadata values must be at most {MAX_SPAWN_METADATA_VALUE_CHARS} characters"
+            )));
+        }
+        metadata.insert(key, text);
+    }
+    Ok(Some(metadata))
+}
 
 pub(crate) fn model_supports_multi_agent_backend(
     model: &ModelPreset,
@@ -475,4 +528,64 @@ fn validate_spawn_agent_reasoning_effort(
     Err(FunctionCallError::RespondToModel(format!(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn omitted_or_empty_metadata_is_absent() {
+        assert_eq!(parse_spawn_observer_metadata(None).expect("omit"), None);
+        assert_eq!(
+            parse_spawn_observer_metadata(Some(json!({}))).expect("empty"),
+            None
+        );
+    }
+
+    #[test]
+    fn string_map_is_accepted() {
+        let parsed = parse_spawn_observer_metadata(Some(json!({
+            "issue": "3360",
+            "note": "",
+        })))
+        .expect("valid metadata");
+        assert_eq!(
+            parsed,
+            Some(BTreeMap::from([
+                ("issue".to_string(), "3360".to_string()),
+                ("note".to_string(), String::new()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn non_object_or_non_string_metadata_is_rejected() {
+        assert!(parse_spawn_observer_metadata(Some(json!("x"))).is_err());
+        assert!(parse_spawn_observer_metadata(Some(json!(["a"]))).is_err());
+        assert!(parse_spawn_observer_metadata(Some(json!({"a": 1}))).is_err());
+    }
+
+    #[test]
+    fn metadata_limits_are_rejected() {
+        assert!(parse_spawn_observer_metadata(Some(json!({"": "x"}))).is_err());
+        assert!(
+            parse_spawn_observer_metadata(Some(json!({
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "x"
+            })))
+            .is_err()
+        );
+        assert!(
+            parse_spawn_observer_metadata(Some(json!({
+                "a": "x".repeat(MAX_SPAWN_METADATA_VALUE_CHARS + 1)
+            })))
+            .is_err()
+        );
+        let too_many = (0..=MAX_SPAWN_METADATA_ENTRIES)
+            .map(|index| (format!("k{index}"), json!("v")))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(parse_spawn_observer_metadata(Some(JsonValue::Object(too_many))).is_err());
+    }
 }

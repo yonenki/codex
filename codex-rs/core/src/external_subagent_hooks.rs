@@ -19,6 +19,7 @@ pub(crate) struct ExternalSubagentHookIdentity {
     pub agent_type: String,
     pub harness: String,
     pub model: Option<String>,
+    pub metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl ExternalSubagentHookIdentity {
@@ -48,6 +49,7 @@ pub(crate) async fn run_external_subagent_start_hook(
             agent_id: identity.agent_id.to_string(),
             agent_type: identity.agent_type,
             backend: Some(backend),
+            metadata: identity.metadata,
         },
     };
     let hooks = session.hooks();

@@ -549,6 +549,8 @@ pub(crate) struct SubagentStartCommandInput {
     pub agent_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<SubagentBackendIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

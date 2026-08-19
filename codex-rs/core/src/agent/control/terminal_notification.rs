@@ -105,6 +105,7 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
                 .unwrap_or_else(|| ACP_ROLE_NAME.to_string()),
             harness: identity.harness.clone(),
             model: identity.model.clone(),
+            metadata: None,
         });
 
     let event = Event {

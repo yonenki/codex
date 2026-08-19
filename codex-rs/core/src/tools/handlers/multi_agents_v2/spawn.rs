@@ -6,6 +6,7 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::session::multi_agents::resolve_usage_hints;
+use crate::tools::handlers::multi_agents_common::parse_spawn_observer_metadata;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
@@ -52,6 +53,7 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+    let observer_metadata = parse_spawn_observer_metadata(args.metadata.clone())?;
     let fork_mode = args.fork_mode()?;
     let message = message_content(args.message)?;
     let role_name = args
@@ -164,6 +166,7 @@ async fn handle_spawn_agent(
                     root_turn_id: turn.turn_metadata_state.root_turn_id(),
                     environments: Some(step_context.environments.to_selections()),
                     multi_agent_v2_usage_hints,
+                    metadata: observer_metadata,
                 },
             ),
     )
@@ -228,6 +231,7 @@ struct SpawnAgentArgs {
     service_tier: Option<String>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
+    metadata: Option<serde_json::Value>,
 }
 
 impl SpawnAgentArgs {

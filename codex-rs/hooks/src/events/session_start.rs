@@ -60,6 +60,7 @@ pub enum StartHookTarget {
         agent_id: String,
         agent_type: String,
         backend: Option<SubagentBackendIdentity>,
+        metadata: Option<std::collections::BTreeMap<String, String>>,
     },
 }
 
@@ -155,6 +156,7 @@ pub(crate) async fn run(
             agent_id,
             agent_type,
             backend,
+            metadata,
         } => {
             let input = SubagentStartCommandInput {
                 session_id: request.session_id.to_string(),
@@ -167,6 +169,7 @@ pub(crate) async fn run(
                 agent_id,
                 agent_type,
                 backend,
+                metadata,
             };
             let input_json = match serde_json::to_string(&input) {
                 Ok(input_json) => input_json,

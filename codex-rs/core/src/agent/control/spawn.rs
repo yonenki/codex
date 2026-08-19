@@ -265,6 +265,7 @@ impl AgentControl {
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         session_source: SessionSource,
+        metadata: Option<std::collections::BTreeMap<String, String>>,
         on_started: F,
     ) -> CodexResult<LiveAgent>
     where
@@ -296,6 +297,7 @@ impl AgentControl {
             agent_role,
             /*preferred_agent_nickname*/ None,
         )?;
+        agent_metadata.metadata = metadata;
         let agent_id = self.generate_thread_id();
         let mut env = create_env(&config.permissions.shell_environment_policy, Some(agent_id));
         inject_session_id_env(&mut env, self.session_id());
@@ -577,6 +579,7 @@ impl AgentControl {
             }
             other => (other, AgentMetadata::default()),
         };
+        agent_metadata.metadata = options.metadata.clone();
         let notification_source = session_source.clone();
 
         // The same `AgentControl` is sent to spawn the thread.

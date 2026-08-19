@@ -40,6 +40,8 @@ pub(crate) struct AgentMetadata {
     pub(crate) agent_path: Option<AgentPath>,
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
+    /// 起動時に渡したobserver向けラベル。follow-up generationでも継承する。
+    pub(crate) metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
 fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {

@@ -125,6 +125,11 @@ pub(crate) async fn run_pending_session_start_hooks(
                     agent_id: context.agent_id,
                     agent_type: context.agent_type,
                     backend: None,
+                    metadata: sess
+                        .services
+                        .agent_control
+                        .get_agent_metadata(sess.thread_id)
+                        .and_then(|metadata| metadata.metadata),
                 }
             }
             SessionSource::SubAgent(_) => return false,

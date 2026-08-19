@@ -256,6 +256,23 @@ async fn spawn_agent_rejects_empty_message() {
 }
 
 #[tokio::test]
+async fn spawn_agent_rejects_non_string_metadata() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({"message": "hello", "metadata": {"a": 1}})),
+    );
+    let Err(err) = SpawnAgentHandler::default().handle(invocation).await else {
+        panic!("non-string metadata should be rejected");
+    };
+    assert!(
+        matches!(err, FunctionCallError::RespondToModel(message) if message.contains("metadata"))
+    );
+}
+
+#[tokio::test]
 async fn spawn_agent_rejects_when_message_and_items_are_both_set() {
     let (session, turn) = make_session_and_context().await;
     let invocation = invocation(

@@ -285,6 +285,7 @@ fn register_test_agent_metadata(
         agent_path: Some(agent_path),
         agent_nickname: Some(agent_nickname.to_string()),
         agent_role: Some(agent_role.to_string()),
+        metadata: None,
     });
 }
 

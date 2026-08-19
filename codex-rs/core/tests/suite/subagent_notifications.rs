@@ -557,6 +557,7 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
         "message": CHILD_PROMPT,
         "task_name": "child",
         "agent_type": "worker",
+        "metadata": { "lane": "review" },
     }))?;
 
     mount_sse_once_match(
@@ -628,6 +629,7 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
     .await?;
     assert_eq!(start_inputs.len(), 1);
     assert_eq!(start_inputs[0]["agent_type"].as_str(), Some("worker"));
+    assert_eq!(start_inputs[0]["metadata"], json!({ "lane": "review" }));
     assert!(
         start_inputs[0].get("backend").is_none(),
         "native SubagentStart must not invent an ACP backend identity: {}",
@@ -1949,6 +1951,7 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         "message": "independent ACP task",
         "task_name": "grok",
         "agent_type": "external_worker",
+        "metadata": { "lane": "impl" },
     }))?;
     mount_sse_once_match(
         &server,
@@ -2124,6 +2127,11 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
             Some("koffing"),
             "top-level hook model remains the parent session model"
         );
+        if entry["event"] == "SubagentStart" {
+            assert_eq!(entry["payload"]["metadata"], json!({ "lane": "impl" }));
+        } else {
+            assert!(entry["payload"].get("metadata").is_none());
+        }
     }
 
     let followup_call_id = "followup-acp-call";
@@ -2220,6 +2228,18 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
         entry["payload"]["agent_id"].as_str() == Some(first_agent_id)
             && entry["payload"]["backend"] == json!({"harness": "grok-build", "model": "grok-test"})
     }));
+    assert!(
+        lifecycle
+            .iter()
+            .filter(|entry| entry["event"] == "SubagentStart")
+            .all(|entry| entry["payload"]["metadata"] == json!({ "lane": "impl" }))
+    );
+    assert!(
+        lifecycle
+            .iter()
+            .filter(|entry| entry["event"] == "SubagentStop")
+            .all(|entry| entry["payload"].get("metadata").is_none())
+    );
 
     let fallback_call_id = "fallback-acp-call";
     let fallback_prompt = "retry the ACP role without backend names";

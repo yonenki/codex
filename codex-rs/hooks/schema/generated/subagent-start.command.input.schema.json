@@ -41,6 +41,12 @@
       "const": "SubagentStart",
       "type": "string"
     },
+    "metadata": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
     "model": {
       "type": "string"
     },
