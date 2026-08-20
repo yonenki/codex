@@ -5363,3 +5363,466 @@ async fn tool_plan_hides_team_tools_in_v1_and_exposes_team_tools_in_v2() {
     assert!(team_function_names.contains(&"start_team"));
     assert!(team_function_names.contains(&"get_team_status"));
 }
+
+#[tokio::test]
+async fn v1_target_ops_follow_target_team_binding_authority_from_different_caller_team() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    let target_b = ThreadId::new();
+
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller to team A");
+
+    let target_pending = team
+        .pending_binding_for_node(&team_b, "worker")
+        .await
+        .expect("target pending");
+    team.bind_agent_before_start(target_b.to_string(), target_pending)
+        .await
+        .expect("bind target to team B");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let target_b_str = target_b.to_string();
+
+    // 1. send_input targeting B from caller in A -> authority must be Team B
+    let send_err = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": target_b_str.clone(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "send_input A->B",
+    );
+    let FunctionCallError::RespondToModel(msg) = send_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_b}")),
+        "send_input must reference target's team_b: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "send_input must not reference caller's team_a: {msg}"
+    );
+    assert!(msg.contains("multi_agent_v1.send_input"));
+    assert!(msg.contains("unbound root coordinator"));
+    assert!(msg.contains("multi_agent_v2"));
+
+    // 2. wait_agent targeting B from caller in A -> authority must be Team B
+    let wait_err = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [target_b_str.clone()]
+                })),
+            ))
+            .await,
+        "wait_agent A->B",
+    );
+    let FunctionCallError::RespondToModel(msg) = wait_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_b}")),
+        "wait_agent must reference target's team_b: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "wait_agent must not reference caller's team_a: {msg}"
+    );
+    assert!(msg.contains("multi_agent_v1.wait_agent"));
+
+    // 3. close_agent targeting B from caller in A -> authority must be Team B and state no equivalent
+    let close_err = expect_model_err(
+        CloseAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "close_agent",
+                function_payload(json!({
+                    "target": target_b_str.clone()
+                })),
+            ))
+            .await,
+        "close_agent A->B",
+    );
+    let FunctionCallError::RespondToModel(msg) = close_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_b}")),
+        "close_agent must reference target's team_b: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "close_agent must not reference caller's team_a: {msg}"
+    );
+    assert!(msg.contains("has no equivalent Team operation"));
+    assert!(msg.contains("multi_agent_v1.close_agent"));
+
+    // 4. resume_agent targeting B from caller in A -> authority must be Team B and state no equivalent
+    let resume_err = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "resume_agent",
+                function_payload(json!({
+                    "id": target_b_str
+                })),
+            ))
+            .await,
+        "resume_agent A->B",
+    );
+    let FunctionCallError::RespondToModel(msg) = resume_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_b}")),
+        "resume_agent must reference target's team_b: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "resume_agent must not reference caller's team_a: {msg}"
+    );
+    assert!(msg.contains("has no equivalent Team operation"));
+    assert!(msg.contains("multi_agent_v1.resume_agent"));
+}
+
+#[tokio::test]
+async fn v1_wait_splits_multi_team_targets_with_explicit_stable_ids() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_1 = start_sample_team(&session).await;
+    let team_2 = start_sample_team(&session).await;
+    let target_1 = ThreadId::new();
+    let target_2 = ThreadId::new();
+
+    let team = session.services.agent_control.team();
+    let pending_1 = team
+        .pending_binding_for_node(&team_1, "worker")
+        .await
+        .expect("pending 1");
+    team.bind_agent_before_start(target_1.to_string(), pending_1)
+        .await
+        .expect("bind target 1");
+
+    let pending_2 = team
+        .pending_binding_for_node(&team_2, "worker")
+        .await
+        .expect("pending 2");
+    team.bind_agent_before_start(target_2.to_string(), pending_2)
+        .await
+        .expect("bind target 2");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let mut sorted_teams = vec![team_1.clone(), team_2.clone()];
+    sorted_teams.sort();
+
+    let multi_wait = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [target_2.to_string(), target_1.to_string()]
+                })),
+            ))
+            .await,
+        "multi-team wait_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = multi_wait else {
+        panic!("expected model err");
+    };
+
+    assert!(
+        msg.contains("splitting targets per Team"),
+        "multi-team wait must guide splitting targets per Team: {msg}"
+    );
+    assert!(
+        msg.contains("multi_agent_v2"),
+        "multi-team wait must mention multi_agent_v2: {msg}"
+    );
+    assert!(
+        msg.contains("unbound root coordinator"),
+        "multi-team wait must mention unbound root coordinator: {msg}"
+    );
+    assert!(
+        msg.contains("multi_agent_v1.wait_agent"),
+        "multi-team wait must mention multi_agent_v1.wait_agent: {msg}"
+    );
+    let expected_guidance = format!(
+        "team_session_id={}, team_session_id={}",
+        sorted_teams[0], sorted_teams[1]
+    );
+    assert!(
+        msg.contains(&expected_guidance),
+        "multi-team wait must list explicit IDs in stable sorted order: expected '{expected_guidance}', got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn v1_bound_caller_to_unbound_target_guides_to_unbound_root_raw_without_fabricated_team_id() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let unbound_target = ThreadId::new().to_string();
+
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    // 1. send_input: bound caller -> unbound target
+    let send_err = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": unbound_target.clone(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "bound caller to unbound send_input",
+    );
+    let FunctionCallError::RespondToModel(msg) = send_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("Delegate non-Team raw operations to an unbound root coordinator using multi_agent_v1.send_input"),
+        "guidance should route to unbound root raw without fabricating team id: {msg}"
+    );
+    assert!(
+        !msg.contains("team_session_id"),
+        "must not fabricate team_session_id for unbound target: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "must not attribute unbound target to caller's team_a: {msg}"
+    );
+
+    // 2. wait_agent: bound caller -> unbound target
+    let wait_err = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [unbound_target.clone()]
+                })),
+            ))
+            .await,
+        "bound caller to unbound wait_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = wait_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("Delegate non-Team raw operations to an unbound root coordinator using multi_agent_v1.wait_agent"),
+        "guidance should route to unbound root raw without fabricating team id: {msg}"
+    );
+    assert!(
+        !msg.contains("team_session_id"),
+        "must not fabricate team_session_id for unbound target: {msg}"
+    );
+
+    // 3. close_agent: bound caller -> unbound target (unbound is root raw possible)
+    let close_err = expect_model_err(
+        CloseAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "close_agent",
+                function_payload(json!({
+                    "target": unbound_target.clone()
+                })),
+            ))
+            .await,
+        "bound caller to unbound close_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = close_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("Delegate non-Team raw operations to an unbound root coordinator using multi_agent_v1.close_agent"),
+        "unbound close should route to root raw operation: {msg}"
+    );
+    assert!(
+        !msg.contains("team_session_id"),
+        "must not fabricate team_session_id for unbound target: {msg}"
+    );
+
+    // 4. resume_agent: bound caller -> unbound target (unbound is root raw possible)
+    let resume_err = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "resume_agent",
+                function_payload(json!({
+                    "id": unbound_target
+                })),
+            ))
+            .await,
+        "bound caller to unbound resume_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = resume_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("Delegate non-Team raw operations to an unbound root coordinator using multi_agent_v1.resume_agent"),
+        "unbound resume should route to root raw operation: {msg}"
+    );
+    assert!(
+        !msg.contains("team_session_id"),
+        "must not fabricate team_session_id for unbound target: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn v1_mixed_targets_split_into_team_managed_and_unbound_raw() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let bound_target = ThreadId::new();
+    let unbound_target = ThreadId::new();
+
+    let team = session.services.agent_control.team();
+    let pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("pending");
+    team.bind_agent_before_start(bound_target.to_string(), pending)
+        .await
+        .expect("bind target");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let mixed_wait = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [bound_target.to_string(), unbound_target.to_string()]
+                })),
+            ))
+            .await,
+        "mixed targets wait_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = mixed_wait else {
+        panic!("expected model err");
+    };
+
+    assert!(
+        msg.contains(
+            "splitting into Team-managed operations using multi_agent_v2 Team tools with explicit"
+        ),
+        "mixed wait must guide splitting into Team-managed and unbound raw: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("team_session_id={team_a}")),
+        "mixed wait must include bound target's team_a: {msg}"
+    );
+    assert!(
+        msg.contains("unbound raw operations using multi_agent_v1.wait_agent"),
+        "mixed wait must include unbound raw guidance: {msg}"
+    );
+    assert!(
+        msg.contains("unbound root coordinator"),
+        "mixed wait must mention unbound root coordinator: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn v1_spawn_guidance_uses_caller_team_id_when_bound_and_open_team_when_unbound() {
+    // 1. Bound caller spawn -> uses caller's team_session_id
+    let (bound_session, bound_turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&bound_session).await;
+    let team = bound_session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(bound_session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller");
+
+    let bound_spawn = expect_model_err(
+        SpawnAgentHandler::default()
+            .handle(invocation(
+                Arc::new(bound_session),
+                Arc::new(bound_turn),
+                "spawn_agent",
+                function_payload(json!({"message": "do work"})),
+            ))
+            .await,
+        "bound spawn_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = bound_spawn else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_a}")),
+        "bound spawn must use caller's team_session_id: {msg}"
+    );
+    assert!(msg.contains("multi_agent_v1.spawn_agent"));
+    assert!(msg.contains("unbound root coordinator"));
+    assert!(msg.contains("multi_agent_v2"));
+
+    // 2. Unbound caller with open Team -> uses open team guard
+    let (unbound_session, unbound_turn, _manager) = prepare_v1_session().await;
+    let _open_team = start_sample_team(&unbound_session).await;
+    let open_spawn = expect_model_err(
+        SpawnAgentHandler::default()
+            .handle(invocation(
+                Arc::new(unbound_session),
+                Arc::new(unbound_turn),
+                "spawn_agent",
+                function_payload(json!({"message": "do work"})),
+            ))
+            .await,
+        "unbound spawn with open team",
+    );
+    let FunctionCallError::RespondToModel(msg) = open_spawn else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("open Team sessions require delegating to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id"),
+        "open team spawn must give open team delegation guidance: {msg}"
+    );
+    assert!(
+        msg.contains("multi_agent_v1.spawn_agent cannot infer Team identity"),
+        "open team spawn must note that v1 spawn cannot infer Team identity: {msg}"
+    );
+}

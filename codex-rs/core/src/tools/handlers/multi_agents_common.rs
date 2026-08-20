@@ -28,6 +28,7 @@ use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
@@ -196,27 +197,104 @@ pub(crate) fn reject_team_bound_raw_collaboration_v1(
 ) -> Result<(), FunctionCallError> {
     let team = session.services.agent_control.team();
     let caller_binding = team.binding_snapshot(caller_thread_id);
-    let target_binding = target_thread_ids
-        .iter()
-        .copied()
-        .find_map(|target| team.binding_snapshot(target));
-    let Some(binding) = caller_binding.as_ref().or(target_binding.as_ref()) else {
-        return Ok(());
-    };
-    let message = if op.has_no_equivalent_team_op() {
-        format!(
-            "Team-bound {} has no equivalent Team operation. Delegate Team operations to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id={}. {} cannot be used when the caller or any target is bound to a Team.",
-            op.raw_tool(),
-            binding.team_session_id,
-            op.raw_tool(),
-        )
-    } else {
-        format!(
+
+    // Spawn has no targets; authority comes from the caller.
+    if target_thread_ids.is_empty() {
+        let Some(binding) = caller_binding else {
+            return Ok(());
+        };
+        let message = format!(
             "Team-bound {} is unsupported. Delegate Team operations to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id={}. {} cannot be used when the caller or any target is bound to a Team.",
             op.raw_tool(),
             binding.team_session_id,
             op.raw_tool(),
+        );
+        return Err(FunctionCallError::RespondToModel(message));
+    }
+
+    let mut bound_team_ids = BTreeSet::new();
+    let mut has_unbound_target = false;
+
+    for target in target_thread_ids {
+        if let Some(binding) = team.binding_snapshot(target) {
+            bound_team_ids.insert(binding.team_session_id);
+        } else {
+            has_unbound_target = true;
+        }
+    }
+
+    if caller_binding.is_none() && bound_team_ids.is_empty() {
+        return Ok(());
+    }
+
+    let ids_guidance = bound_team_ids
+        .iter()
+        .map(|id| format!("team_session_id={id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let message = if bound_team_ids.is_empty() {
+        // Caller is bound, but all targets are unbound. Guide to unbound root non-Team raw op without fabricating a team_session_id.
+        format!(
+            "Team-bound {} is unsupported. Delegate non-Team raw operations to an unbound root coordinator using {}. {} cannot be used when the caller or any target is bound to a Team.",
+            op.raw_tool(),
+            op.raw_tool(),
+            op.raw_tool(),
         )
+    } else if has_unbound_target {
+        // Mixed targets: some bound, some unbound. Split into Team-managed per Team + unbound raw.
+        if op.has_no_equivalent_team_op() {
+            format!(
+                "Team-bound {} has no equivalent Team operation. Delegate operations to an unbound root coordinator by splitting into Team-managed operations using multi_agent_v2 Team tools with explicit {} and unbound raw operations using {}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                ids_guidance,
+                op.raw_tool(),
+                op.raw_tool(),
+            )
+        } else {
+            format!(
+                "Team-bound {} is unsupported. Delegate operations to an unbound root coordinator by splitting into Team-managed operations using multi_agent_v2 Team tools with explicit {} and unbound raw operations using {}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                ids_guidance,
+                op.raw_tool(),
+                op.raw_tool(),
+            )
+        }
+    } else if bound_team_ids.len() > 1 {
+        // Multi-Team targets: split per Team with explicit IDs in stable order.
+        if op.has_no_equivalent_team_op() {
+            format!(
+                "Team-bound {} has no equivalent Team operation. Delegate Team operations to an unbound root coordinator by splitting targets per Team using multi_agent_v2 Team tools with explicit {}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                ids_guidance,
+                op.raw_tool(),
+            )
+        } else {
+            format!(
+                "Team-bound {} is unsupported. Delegate Team operations to an unbound root coordinator by splitting targets per Team using multi_agent_v2 Team tools with explicit {}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                ids_guidance,
+                op.raw_tool(),
+            )
+        }
+    } else {
+        // Single Team target(s). Target binding authority.
+        let team_id = bound_team_ids.iter().next().unwrap();
+        if op.has_no_equivalent_team_op() {
+            format!(
+                "Team-bound {} has no equivalent Team operation. Delegate Team operations to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id={}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                team_id,
+                op.raw_tool(),
+            )
+        } else {
+            format!(
+                "Team-bound {} is unsupported. Delegate Team operations to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id={}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                team_id,
+                op.raw_tool(),
+            )
+        }
     };
     Err(FunctionCallError::RespondToModel(message))
 }
