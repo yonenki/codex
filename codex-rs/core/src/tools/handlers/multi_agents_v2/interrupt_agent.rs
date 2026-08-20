@@ -43,7 +43,8 @@ async fn handle_interrupt_agent(
         &caller_thread_id,
         &[target_thread.as_str()],
         RawCollaborationOp::Interrupt,
-    )?;
+    )
+    .await?;
     let receiver_agent = session
         .services
         .agent_control
@@ -106,6 +107,10 @@ async fn handle_interrupt_agent(
 }
 
 impl CoreToolRuntime for Handler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

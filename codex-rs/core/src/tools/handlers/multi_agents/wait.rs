@@ -87,7 +87,8 @@ impl Handler {
                 &caller_thread_id,
                 &target_refs,
                 V1RawOp::Wait,
-            )?;
+            )
+            .await?;
         }
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
@@ -291,6 +292,10 @@ fn wait_receiver_agents(
 }
 
 impl CoreToolRuntime for Handler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

@@ -60,12 +60,14 @@ async fn handle_spawn_agent(
         &caller_thread_id,
         &[],
         RawCollaborationOp::Spawn,
-    )?;
+    )
+    .await?;
     reject_unbound_raw_spawn_when_teams_open(
         &session,
         &caller_thread_id,
         "collaboration.spawn_agent",
-    )?;
+    )
+    .await?;
     let fork_mode = args.fork_mode()?;
     let message = message_content(args.message)?;
     let role_name = args
@@ -228,6 +230,10 @@ async fn handle_spawn_agent(
 }
 
 impl CoreToolRuntime for Handler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

@@ -72,7 +72,8 @@ async fn handle_resume_agent(
         &caller_thread_id,
         &[target.as_str()],
         V1RawOp::Resume,
-    )?;
+    )
+    .await?;
     let receiver_agent = session
         .services
         .agent_control
@@ -175,6 +176,10 @@ async fn handle_resume_agent(
 }
 
 impl CoreToolRuntime for Handler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

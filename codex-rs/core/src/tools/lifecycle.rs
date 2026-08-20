@@ -10,21 +10,27 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
+use crate::tools::registry::TeamLifecycleRouting;
 
-pub(crate) async fn notify_tool_start(invocation: &ToolInvocation) {
-    let _ = invocation
-        .session
-        .services
-        .agent_control
-        .team()
-        .record_tool_operation(
-            &invocation.session.thread_id.to_string(),
-            &invocation.tool_name.to_string(),
-            &invocation.call_id,
-            codex_team_runtime::TeamEventKind::ToolOperationStarted,
-            None,
-        )
-        .await;
+pub(crate) async fn notify_tool_start(
+    invocation: &ToolInvocation,
+    team_lifecycle_routing: TeamLifecycleRouting,
+) {
+    if team_lifecycle_routing == TeamLifecycleRouting::CallerBound {
+        let _ = invocation
+            .session
+            .services
+            .agent_control
+            .team()
+            .record_tool_operation(
+                &invocation.session.thread_id.to_string(),
+                &invocation.tool_name.to_string(),
+                &invocation.call_id,
+                codex_team_runtime::TeamEventKind::ToolOperationStarted,
+                None,
+            )
+            .await;
+    }
     let contributors = invocation
         .session
         .services
@@ -53,7 +59,11 @@ pub(crate) async fn notify_tool_start(invocation: &ToolInvocation) {
     }
 }
 
-pub(crate) async fn notify_tool_finish(invocation: &ToolInvocation, outcome: ToolCallOutcome) {
+pub(crate) async fn notify_tool_finish(
+    invocation: &ToolInvocation,
+    outcome: ToolCallOutcome,
+    team_lifecycle_routing: TeamLifecycleRouting,
+) {
     notify_tool_finish_parts(
         invocation.session.as_ref(),
         invocation.turn.as_ref(),
@@ -61,6 +71,7 @@ pub(crate) async fn notify_tool_finish(invocation: &ToolInvocation, outcome: Too
         &invocation.tool_name,
         invocation.source.clone(),
         outcome,
+        team_lifecycle_routing,
     )
     .await;
 }
@@ -71,6 +82,7 @@ pub(crate) async fn notify_tool_aborted(
     call_id: &str,
     tool_name: &ToolName,
     source: ToolCallSource,
+    team_lifecycle_routing: TeamLifecycleRouting,
 ) {
     notify_tool_finish_parts(
         session,
@@ -79,6 +91,7 @@ pub(crate) async fn notify_tool_aborted(
         tool_name,
         source,
         ToolCallOutcome::Aborted,
+        team_lifecycle_routing,
     )
     .await;
 }
@@ -90,6 +103,7 @@ async fn notify_tool_finish_parts(
     tool_name: &ToolName,
     source: ToolCallSource,
     outcome: ToolCallOutcome,
+    team_lifecycle_routing: TeamLifecycleRouting,
 ) {
     let kind = match outcome {
         ToolCallOutcome::Completed { success: true } => {
@@ -100,18 +114,20 @@ async fn notify_tool_finish_parts(
         | ToolCallOutcome::Failed { .. }
         | ToolCallOutcome::Aborted => codex_team_runtime::TeamEventKind::ToolOperationFailed,
     };
-    let _ = session
-        .services
-        .agent_control
-        .team()
-        .record_tool_operation(
-            &session.thread_id.to_string(),
-            &tool_name.to_string(),
-            call_id,
-            kind,
-            None,
-        )
-        .await;
+    if team_lifecycle_routing == TeamLifecycleRouting::CallerBound {
+        let _ = session
+            .services
+            .agent_control
+            .team()
+            .record_tool_operation(
+                &session.thread_id.to_string(),
+                &tool_name.to_string(),
+                call_id,
+                kind,
+                None,
+            )
+            .await;
+    }
     for contributor in session.services.extensions.tool_lifecycle_contributors() {
         contributor
             .on_tool_finish(ToolFinishInput {

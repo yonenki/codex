@@ -699,6 +699,22 @@ impl TeamControl {
         Ok(self.binding_for(agent_thread_id).await)
     }
 
+    /// Resolve multiple bindings from one restored authority snapshot.
+    pub async fn bindings_for_checked(
+        &self,
+        agent_thread_ids: &[&str],
+    ) -> TeamRuntimeResult<Vec<Option<TeamAgentBinding>>> {
+        self.ensure_restored().await?;
+        let surface = self
+            .surface
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(agent_thread_ids
+            .iter()
+            .map(|agent_thread_id| surface.bindings.get(*agent_thread_id).cloned())
+            .collect())
+    }
+
     pub async fn require_same_team(
         &self,
         team_session_id: &TeamSessionId,
@@ -862,16 +878,42 @@ impl TeamControl {
         kind: TeamEventKind,
         coverage: Option<&str>,
     ) -> TeamRuntimeResult<()> {
-        let Some(binding) = self.binding_for(agent_thread_id).await else {
+        let Some(binding) = self.binding_for_checked(agent_thread_id).await? else {
             return Ok(());
         };
+        self.record_tool_operation_for_team(
+            &binding.team_session_id,
+            agent_thread_id,
+            tool_name,
+            call_id,
+            kind,
+            coverage,
+        )
+        .await
+    }
+
+    pub async fn record_tool_operation_for_team(
+        &self,
+        team_session_id: &TeamSessionId,
+        agent_thread_id: &str,
+        tool_name: &str,
+        call_id: &str,
+        kind: TeamEventKind,
+        coverage: Option<&str>,
+    ) -> TeamRuntimeResult<()> {
+        let binding = self
+            .binding_for_checked(agent_thread_id)
+            .await?
+            .filter(|binding| binding.team_session_id == *team_session_id);
         if kind != crate::event::TeamEventKind::ToolCoverageUnreported {
-            self.tool_reporting_agents
-                .lock()
-                .await
-                .insert(agent_thread_id.to_string());
+            if binding.is_some() {
+                self.tool_reporting_agents
+                    .lock()
+                    .await
+                    .insert(agent_thread_id.to_string());
+            }
         }
-        self.mutate_without_cas(binding.team_session_id, |state| {
+        self.mutate_without_cas(team_session_id.clone(), |state| {
             Ok(TeamEvent {
                 event_id: crate::ids::EventId::generate(),
                 team_session_id: state.team_session_id.clone(),
@@ -881,11 +923,22 @@ impl TeamControl {
                 graph_name: state.graph.name.clone(),
                 graph_version: state.graph.version.clone(),
                 graph_hash: state.graph_hash.clone(),
-                node_id: Some(binding.node_id.clone()),
-                node_run_id: Some(binding.node_run_id.clone()),
+                node_id: binding
+                    .as_ref()
+                    .map(|binding| binding.node_id.clone())
+                    .or_else(|| Some(state.current_node_id.clone())),
+                node_run_id: binding
+                    .as_ref()
+                    .map(|binding| binding.node_run_id.clone())
+                    .or_else(|| {
+                        state
+                            .current_node_run
+                            .as_ref()
+                            .map(|run| run.node_run_id.clone())
+                    }),
                 attempt: None,
-                agent_thread_id: Some(binding.agent_thread_id.clone()),
-                role: Some(binding.role.clone()),
+                agent_thread_id: Some(agent_thread_id.to_string()),
+                role: binding.as_ref().map(|binding| binding.role.clone()),
                 payload: TeamEventPayload::ToolOperation {
                     tool_name: tool_name.to_string(),
                     call_id: call_id.to_string(),

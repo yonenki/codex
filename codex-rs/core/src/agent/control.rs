@@ -200,6 +200,11 @@ impl AgentControl {
         control
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_team_for_tests(team: Arc<codex_team_runtime::TeamControl>) -> Self {
+        Self::with_team(Weak::default(), default_thread_id_generator(), None, team)
+    }
+
     pub(crate) fn with_session_id(mut self, session_id: SessionId, max_threads: usize) -> Self {
         self.session_id = session_id;
         self.agent_execution_limiter.initialize(max_threads);
@@ -629,7 +634,9 @@ impl AgentControl {
         }
         if self
             .team()
-            .binding_snapshot(&agent_id.to_string())
+            .binding_for_checked(&agent_id.to_string())
+            .await
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?
             .is_some()
         {
             return Ok(true);

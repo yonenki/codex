@@ -189,14 +189,22 @@ impl V1RawOp {
 }
 
 /// caller またはいずれかの target が Team-bound なら legacy v1 raw collaboration を拒否する。
-pub(crate) fn reject_team_bound_raw_collaboration_v1(
+pub(crate) async fn reject_team_bound_raw_collaboration_v1(
     session: &Session,
     caller_thread_id: &str,
     target_thread_ids: &[&str],
     op: V1RawOp,
 ) -> Result<(), FunctionCallError> {
     let team = session.services.agent_control.team();
-    let caller_binding = team.binding_snapshot(caller_thread_id);
+    let mut subjects = Vec::with_capacity(target_thread_ids.len() + 1);
+    subjects.push(caller_thread_id);
+    subjects.extend_from_slice(target_thread_ids);
+    let mut bindings = team
+        .bindings_for_checked(&subjects)
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .into_iter();
+    let caller_binding = bindings.next().flatten();
 
     // Spawn has no targets; authority comes from the caller.
     if target_thread_ids.is_empty() {
@@ -215,8 +223,8 @@ pub(crate) fn reject_team_bound_raw_collaboration_v1(
     let mut bound_team_ids = BTreeSet::new();
     let mut has_unbound_target = false;
 
-    for target in target_thread_ids {
-        if let Some(binding) = team.binding_snapshot(target) {
+    for binding in bindings {
+        if let Some(binding) = binding {
             bound_team_ids.insert(binding.team_session_id);
         } else {
             has_unbound_target = true;
@@ -300,12 +308,18 @@ pub(crate) fn reject_team_bound_raw_collaboration_v1(
 }
 
 /// 未所属 root が open Team ありのまま legacy v1 raw spawn すると帰属を推測できない。
-pub(crate) fn reject_unbound_raw_spawn_when_teams_open_v1(
+pub(crate) async fn reject_unbound_raw_spawn_when_teams_open_v1(
     session: &Session,
     caller_thread_id: &str,
 ) -> Result<(), FunctionCallError> {
     let team = session.services.agent_control.team();
-    if team.binding_snapshot(caller_thread_id).is_none() && team.open_team_count() > 0 {
+    if team
+        .binding_for_checked(caller_thread_id)
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .is_none()
+        && team.open_team_count() > 0
+    {
         return Err(FunctionCallError::RespondToModel(
             "open Team sessions require delegating to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id. multi_agent_v1.spawn_agent cannot infer Team identity.".to_string(),
         ));
@@ -345,18 +359,23 @@ impl RawCollaborationOp {
 }
 
 /// caller またはいずれかの target が Team-bound なら raw collaboration を拒否する。
-pub(crate) fn reject_team_bound_raw_collaboration(
+pub(crate) async fn reject_team_bound_raw_collaboration(
     session: &Session,
     caller_thread_id: &str,
     target_thread_ids: &[&str],
     op: RawCollaborationOp,
 ) -> Result<(), FunctionCallError> {
     let team = session.services.agent_control.team();
-    let caller_binding = team.binding_snapshot(caller_thread_id);
-    let target_binding = target_thread_ids
-        .iter()
-        .copied()
-        .find_map(|target| team.binding_snapshot(target));
+    let mut subjects = Vec::with_capacity(target_thread_ids.len() + 1);
+    subjects.push(caller_thread_id);
+    subjects.extend_from_slice(target_thread_ids);
+    let mut bindings = team
+        .bindings_for_checked(&subjects)
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .into_iter();
+    let caller_binding = bindings.next().flatten();
+    let target_binding = bindings.flatten().next();
     let Some(binding) = caller_binding.as_ref().or(target_binding.as_ref()) else {
         return Ok(());
     };
@@ -370,13 +389,19 @@ pub(crate) fn reject_team_bound_raw_collaboration(
 }
 
 /// 未所属 root が open Team ありのまま raw spawn すると帰属を推測できない。
-pub(crate) fn reject_unbound_raw_spawn_when_teams_open(
+pub(crate) async fn reject_unbound_raw_spawn_when_teams_open(
     session: &Session,
     caller_thread_id: &str,
     spawn_tool: &str,
 ) -> Result<(), FunctionCallError> {
     let team = session.services.agent_control.team();
-    if team.binding_snapshot(caller_thread_id).is_none() && team.open_team_count() > 0 {
+    if team
+        .binding_for_checked(caller_thread_id)
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .is_none()
+        && team.open_team_count() > 0
+    {
         return Err(FunctionCallError::RespondToModel(format!(
             "open Team sessions require team.spawn_agent(team_session_id, ...). {spawn_tool} cannot infer Team identity."
         )));

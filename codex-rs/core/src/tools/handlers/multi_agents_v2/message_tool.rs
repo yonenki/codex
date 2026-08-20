@@ -76,7 +76,8 @@ pub(crate) async fn handle_message_string_tool(
         &caller_thread_id,
         &[receiver_thread.as_str()],
         op,
-    )?;
+    )
+    .await?;
     let receiver_agent = session
         .services
         .agent_control

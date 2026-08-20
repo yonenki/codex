@@ -4843,6 +4843,129 @@ async fn prepare_v2_session() -> (crate::session::session::Session, TurnContext,
     (session, turn, manager)
 }
 
+async fn prepare_registry_v2_session() -> (
+    crate::session::session::Session,
+    TurnContext,
+    codex_team_runtime::RecordingSink,
+) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    set_turn_config(&mut turn, config);
+    let sink = codex_team_runtime::RecordingSink::default();
+    let team = Arc::new(codex_team_runtime::TeamControl::with_memory_store(
+        sample_team_catalog(),
+        sink.clone(),
+    ));
+    session.services.agent_control = crate::agent::control::AgentControl::with_team_for_tests(team);
+    (session, turn, sink)
+}
+
+fn build_registry_router(
+    session: &crate::session::session::Session,
+    turn: Arc<TurnContext>,
+) -> (
+    crate::tools::router::ToolRouter,
+    Arc<crate::session::step_context::StepContext>,
+) {
+    let step_context = StepContext::for_test(turn);
+    let step_store = codex_extension_api::ExtensionData::new("team-registry-test");
+    let router = crate::tools::spec_plan::build_tool_router(
+        session,
+        step_context.turn.as_ref(),
+        &step_context.environments,
+        &step_context.mcp,
+        false,
+        &step_store,
+        None,
+    )
+    .expect("build Team registry");
+    (router, step_context)
+}
+
+async fn dispatch_registry_tool(
+    router: &crate::tools::router::ToolRouter,
+    session: Arc<crate::session::session::Session>,
+    step_context: Arc<StepContext>,
+    tool_name: codex_tools::ToolName,
+    call_id: &str,
+    payload: ToolPayload,
+) -> Result<crate::tools::registry::AnyToolResult, FunctionCallError> {
+    router
+        .dispatch_tool_call_with_code_mode_result(
+            session,
+            step_context,
+            CancellationToken::new(),
+            Arc::new(Mutex::new(TurnDiffTracker::default())),
+            crate::tools::router::ToolCall {
+                tool_name,
+                call_id: call_id.to_string(),
+                payload,
+                encrypted_function_args: None,
+            },
+            crate::tools::context::ToolCallSource::Direct,
+        )
+        .await
+}
+
+fn operation_events<'a>(
+    events: &'a [codex_team_runtime::TeamEventEnvelope],
+    call_id: &str,
+) -> Vec<&'a codex_team_runtime::TeamEventEnvelope> {
+    events
+        .iter()
+        .filter(|event| {
+            event
+                .payload
+                .get("call_id")
+                .and_then(|value| value.as_str())
+                == Some(call_id)
+        })
+        .collect()
+}
+
+fn expect_registry_err(
+    result: Result<crate::tools::registry::AnyToolResult, FunctionCallError>,
+    context: &str,
+) -> FunctionCallError {
+    match result {
+        Ok(_) => panic!("{context}: expected registry dispatch error"),
+        Err(error) => error,
+    }
+}
+
+struct RegistryGenericTeamTraceHandler;
+
+impl crate::tools::registry::ToolExecutor<ToolInvocation> for RegistryGenericTeamTraceHandler {
+    fn tool_name(&self) -> codex_tools::ToolName {
+        codex_tools::ToolName::plain("registry_generic_probe")
+    }
+
+    fn spec(&self) -> codex_tools::ToolSpec {
+        codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: "registry_generic_probe".to_string(),
+            description: "Registry lifecycle probe.".to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::default(),
+            output_schema: None,
+        })
+    }
+
+    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async {
+            Ok(boxed_tool_output(
+                crate::tools::context::FunctionToolOutput::from_text("ok".to_string(), Some(true)),
+            ))
+        })
+    }
+}
+
+impl crate::tools::registry::CoreToolRuntime for RegistryGenericTeamTraceHandler {}
+
 async fn start_sample_team(
     session: &crate::session::session::Session,
 ) -> codex_team_runtime::TeamSessionId {
@@ -5057,8 +5180,10 @@ async fn raw_collaboration_allows_unbound_caller_and_target() {
     let (session, _turn, _manager) = prepare_v2_session().await;
     let caller = session.thread_id.to_string();
     reject_unbound_raw_spawn_when_teams_open(&session, &caller, "collaboration.spawn_agent")
+        .await
         .expect("no open Team");
     reject_team_bound_raw_collaboration(&session, &caller, &[], RawCollaborationOp::Spawn)
+        .await
         .expect("unbound spawn");
     reject_team_bound_raw_collaboration(
         &session,
@@ -5066,7 +5191,121 @@ async fn raw_collaboration_allows_unbound_caller_and_target() {
         &[caller.as_str()],
         RawCollaborationOp::SendMessage,
     )
+    .await
     .expect("unbound send");
+}
+
+#[tokio::test]
+async fn raw_delivery_checks_persisted_binding_before_any_mutation() {
+    let dir = tempfile::tempdir().expect("Team store tempdir");
+    let target = ThreadId::new();
+    let seed = codex_team_runtime::TeamControl::for_codex_home(
+        dir.path(),
+        codex_team_runtime::RecordingSink::default(),
+    );
+    seed.replace_catalog(sample_team_catalog()).await;
+    let started = seed
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("persistent-raw-guard".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("seed Team");
+    seed.start_node(codex_team_runtime::StartNodeCommand {
+        team_session_id: started.team_session_id.clone(),
+        node_id: None,
+        expected_revision: started.revision,
+    })
+    .await
+    .expect("seed node");
+    let pending = seed
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("seed binding");
+    seed.bind_agent_before_start(target.to_string(), pending)
+        .await
+        .expect("persist target binding");
+    drop(seed);
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    set_turn_config(&mut turn, config);
+    let restored = Arc::new(codex_team_runtime::TeamControl::for_codex_home(
+        dir.path(),
+        codex_team_runtime::RecordingSink::default(),
+    ));
+    restored.replace_catalog(sample_team_catalog()).await;
+    let control = crate::agent::control::AgentControl::with_team_for_tests(restored);
+    control.register_external_agent_for_tests(
+        target,
+        AgentPath::root()
+            .join("persisted_target")
+            .expect("target path"),
+    );
+    session.services.agent_control = control;
+    let session = Arc::new(session);
+    let result = SendMessageHandlerV2
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::new(turn),
+            "send_message",
+            function_payload(json!({
+                "target": "persisted_target",
+                "message": "must not queue",
+            })),
+        ))
+        .await;
+    let error = expect_model_err(result, "persisted target binding");
+    assert_v2_team_tool_guidance(error, "team.send_message");
+    assert!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target)
+            .is_empty(),
+        "checked restore must reject before queue mutation"
+    );
+}
+
+#[tokio::test]
+async fn raw_guard_propagates_restore_failure_instead_of_treating_caller_as_unbound() {
+    let dir = tempfile::tempdir().expect("Team store tempdir");
+    let blocked_home = dir.path().join("not-a-directory");
+    std::fs::write(&blocked_home, b"blocks sqlite parent").expect("create blocking file");
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    set_turn_config(&mut turn, config);
+    let team = Arc::new(codex_team_runtime::TeamControl::for_codex_home(
+        &blocked_home,
+        codex_team_runtime::RecordingSink::default(),
+    ));
+    session.services.agent_control = crate::agent::control::AgentControl::with_team_for_tests(team);
+
+    let error = expect_model_err(
+        WaitAgentHandlerV2::default()
+            .handle(invocation(
+                Arc::new(session),
+                Arc::new(turn),
+                "wait_agent",
+                function_payload(json!({"timeout_ms": 0})),
+            ))
+            .await,
+        "restore failure",
+    );
+    assert!(
+        error.to_string().contains("team store failed"),
+        "restore error must remain authoritative: {error}"
+    );
 }
 
 #[tokio::test]
@@ -5378,6 +5617,257 @@ async fn team_delivery_enforces_bound_caller_team_before_external_mutation() {
             .agent_control
             .external_lifecycle_status_for_tests(target_b_followup),
         Some(b_followup_before)
+    );
+}
+
+#[tokio::test]
+async fn registry_routes_team_lifecycle_after_semantic_authority_and_keeps_generic_tools() {
+    use codex_team_graph::ToolCapability;
+
+    let (session, turn, sink) = prepare_registry_v2_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    let target_a = register_external_target(&session, "registry_target_a");
+    let target_b_send = register_external_target(&session, "registry_target_b_send");
+    let target_b_followup = register_external_target(&session, "registry_target_b_followup");
+    bind_agent_to_team(&session, &team_a, target_a).await;
+    bind_agent_to_team(&session, &team_b, target_b_send).await;
+    bind_agent_to_team(&session, &team_b, target_b_followup).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let (router, step_context) = build_registry_router(session.as_ref(), Arc::clone(&turn));
+
+    dispatch_registry_tool(
+        &router,
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        codex_tools::ToolName::namespaced("team", ToolCapability::SendMessage.as_str()),
+        "root-send-b",
+        function_payload(json!({
+            "team_session_id": team_b,
+            "target": target_b_send.to_string(),
+            "message": "root queue",
+        })),
+    )
+    .await
+    .expect("unbound root Team B send through registry");
+    dispatch_registry_tool(
+        &router,
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        codex_tools::ToolName::namespaced("team", ToolCapability::FollowupAgent.as_str()),
+        "root-followup-b",
+        function_payload(json!({
+            "team_session_id": team_b,
+            "target": target_b_followup.to_string(),
+            "message": "root activate",
+        })),
+    )
+    .await
+    .expect("unbound root Team B followup through registry");
+
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_b_send),
+        vec!["root queue".to_string()]
+    );
+    let (_, generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target_b_followup)
+        .expect("followup target lifecycle");
+    assert_eq!(generation, 1);
+    for call_id in ["root-send-b", "root-followup-b"] {
+        let events = sink.envelopes();
+        let operation = operation_events(&events, call_id);
+        assert_eq!(
+            operation
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_operation_started", "tool_operation_completed"]
+        );
+        assert!(
+            operation
+                .iter()
+                .all(|event| event.team_session_id == team_b)
+        );
+        assert!(operation[0].sequence < operation[1].sequence);
+    }
+
+    let failure = expect_registry_err(
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            codex_tools::ToolName::namespaced("team", ToolCapability::SendMessage.as_str()),
+            "root-send-b-failed",
+            function_payload(json!({
+                "team_session_id": team_b,
+                "target": "missing-registry-target",
+                "message": "fail after authority",
+            })),
+        )
+        .await,
+        "unknown target fails after Team authority",
+    );
+    assert!(!failure.to_string().is_empty());
+    let events = sink.envelopes();
+    let failure_events = operation_events(&events, "root-send-b-failed");
+    assert_eq!(
+        failure_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tool_operation_started", "tool_operation_failed"]
+    );
+    assert!(
+        failure_events
+            .iter()
+            .all(|event| event.team_session_id == team_b)
+    );
+
+    bind_agent_to_team(&session, &team_a, session.thread_id).await;
+    dispatch_registry_tool(
+        &router,
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        codex_tools::ToolName::namespaced("team", ToolCapability::SendMessage.as_str()),
+        "bound-send-a",
+        function_payload(json!({
+            "team_session_id": team_a,
+            "target": target_a.to_string(),
+            "message": "same Team",
+        })),
+    )
+    .await
+    .expect("bound Team A send");
+    let events = sink.envelopes();
+    let same_team_events = operation_events(&events, "bound-send-a");
+    assert_eq!(same_team_events.len(), 2);
+    assert!(
+        same_team_events
+            .iter()
+            .all(|event| event.team_session_id == team_a)
+    );
+
+    let before_cross = sink.envelopes();
+    expect_registry_err(
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            codex_tools::ToolName::namespaced("team", ToolCapability::SendMessage.as_str()),
+            "cross-send-b",
+            function_payload(json!({
+                "team_session_id": team_b,
+                "target": target_b_send.to_string(),
+                "message": "must reject",
+            })),
+        )
+        .await,
+        "bound Team A cannot select Team B",
+    );
+    let after_cross = sink.envelopes();
+    assert!(operation_events(&after_cross, "cross-send-b").is_empty());
+    assert_eq!(before_cross.len(), after_cross.len());
+
+    let before_raw = sink.envelopes();
+    expect_registry_err(
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            codex_tools::ToolName::namespaced("collaboration", "send_message"),
+            "raw-bound-send",
+            function_payload(json!({
+                "target": target_b_send.to_string(),
+                "message": "must reject raw",
+            })),
+        )
+        .await,
+        "raw collaboration rejects Team-bound caller and target",
+    );
+    let after_raw = sink.envelopes();
+    assert!(operation_events(&after_raw, "raw-bound-send").is_empty());
+    assert_eq!(before_raw.len(), after_raw.len());
+
+    for (call_id, tool_name, payload) in [
+        (
+            "catalog-read",
+            codex_tools::ToolName::namespaced("team", ToolCapability::ListTeamGraphs.as_str()),
+            function_payload(json!({})),
+        ),
+        (
+            "team-list",
+            codex_tools::ToolName::namespaced("team", ToolCapability::ListTeams.as_str()),
+            function_payload(json!({})),
+        ),
+    ] {
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            tool_name,
+            call_id,
+            payload,
+        )
+        .await
+        .expect("non-scoped Team read");
+        let events = sink.envelopes();
+        assert!(operation_events(&events, call_id).is_empty());
+    }
+    expect_registry_err(
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            codex_tools::ToolName::namespaced("team", ToolCapability::StartTeam.as_str()),
+            "bound-start-rejected",
+            function_payload(json!({"graph_name": "sample"})),
+        )
+        .await,
+        "bound caller cannot start Team",
+    );
+    let events = sink.envelopes();
+    assert!(operation_events(&events, "bound-start-rejected").is_empty());
+
+    let generic_registry =
+        crate::tools::registry::ToolRegistry::from_tools([
+            Arc::new(RegistryGenericTeamTraceHandler)
+                as Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        ]);
+    generic_registry
+        .dispatch_any_with_terminal_outcome(
+            ToolInvocation {
+                call_id: "generic-bound-tool".to_string(),
+                tool_name: codex_tools::ToolName::plain("registry_generic_probe"),
+                ..invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "registry_generic_probe",
+                    function_payload(json!({})),
+                )
+            },
+            None,
+        )
+        .await
+        .expect("ordinary caller-bound tool keeps generic Team trace");
+    let events = sink.envelopes();
+    let generic_events = operation_events(&events, "generic-bound-tool");
+    assert_eq!(
+        generic_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tool_operation_started", "tool_operation_completed"]
+    );
+    assert!(
+        generic_events
+            .iter()
+            .all(|event| event.team_session_id == team_a)
     );
 }
 
@@ -5887,8 +6377,11 @@ async fn v1_wait_rejects_bound_caller_and_bound_target() {
 async fn v1_raw_ops_keep_unknown_target_and_allow_unbound_success_path() {
     let (session, turn, _manager) = prepare_v1_session().await;
     let caller = session.thread_id.to_string();
-    reject_unbound_raw_spawn_when_teams_open_v1(&session, &caller).expect("no open Team");
+    reject_unbound_raw_spawn_when_teams_open_v1(&session, &caller)
+        .await
+        .expect("no open Team");
     reject_team_bound_raw_collaboration_v1(&session, &caller, &[], V1RawOp::Spawn)
+        .await
         .expect("unbound spawn");
     reject_team_bound_raw_collaboration_v1(
         &session,
@@ -5896,10 +6389,13 @@ async fn v1_raw_ops_keep_unknown_target_and_allow_unbound_success_path() {
         &[caller.as_str()],
         V1RawOp::SendInput,
     )
+    .await
     .expect("unbound send");
     reject_team_bound_raw_collaboration_v1(&session, &caller, &[caller.as_str()], V1RawOp::Close)
+        .await
         .expect("unbound close");
     reject_team_bound_raw_collaboration_v1(&session, &caller, &[caller.as_str()], V1RawOp::Resume)
+        .await
         .expect("unbound resume");
 
     let session = Arc::new(session);

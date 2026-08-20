@@ -120,22 +120,22 @@ impl DeliveryMode {
     }
 }
 
-fn reject_team_bound_external_delivery(
+async fn reject_team_bound_external_delivery(
     session: &crate::session::session::Session,
     caller_thread_id: &str,
     target_thread_id: &str,
     mode: DeliveryMode,
 ) -> Result<(), FunctionCallError> {
     let team = session.services.agent_control.team();
-    let caller_binding = team.binding_snapshot(caller_thread_id);
-    let target_binding = team.binding_snapshot(target_thread_id);
+    let bindings = team
+        .bindings_for_checked(&[caller_thread_id, target_thread_id])
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let caller_binding = bindings[0].as_ref();
+    let target_binding = bindings[1].as_ref();
     if let Some(message) = team_bound_external_delivery_guidance(
-        caller_binding
-            .as_ref()
-            .map(|binding| &binding.team_session_id),
-        target_binding
-            .as_ref()
-            .map(|binding| &binding.team_session_id),
+        caller_binding.map(|binding| &binding.team_session_id),
+        target_binding.map(|binding| &binding.team_session_id),
         mode,
     ) {
         return Err(FunctionCallError::RespondToModel(message));
@@ -313,6 +313,10 @@ impl ToolExecutor<ToolInvocation> for SpawnHandler {
 }
 
 impl CoreToolRuntime for SpawnHandler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -340,6 +344,10 @@ impl ToolExecutor<ToolInvocation> for MessageHandler {
 }
 
 impl CoreToolRuntime for MessageHandler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -367,6 +375,10 @@ impl ToolExecutor<ToolInvocation> for FollowupHandler {
 }
 
 impl CoreToolRuntime for FollowupHandler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -389,8 +401,9 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         &caller_thread_id,
         &[],
         RawCollaborationOp::Spawn,
-    )?;
-    reject_unbound_raw_spawn_when_teams_open(&session, &caller_thread_id, "acp.spawn")?;
+    )
+    .await?;
+    reject_unbound_raw_spawn_when_teams_open(&session, &caller_thread_id, "acp.spawn").await?;
     let message = message_content(args.message)?;
     let explicit_backend = explicit_backend(args.harness, args.model, args.effort)?;
     let mut config = build_agent_spawn_config(
@@ -718,7 +731,8 @@ async fn deliver(
         .map_err(|error| collab_agent_error(agent_id, error))?;
     let caller_thread_id = session.thread_id.to_string();
     let target_thread_id = agent_id.to_string();
-    reject_team_bound_external_delivery(&session, &caller_thread_id, &target_thread_id, mode)?;
+    reject_team_bound_external_delivery(&session, &caller_thread_id, &target_thread_id, mode)
+        .await?;
     let agent_path = known.agent_path.ok_or_else(|| {
         FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
     })?;

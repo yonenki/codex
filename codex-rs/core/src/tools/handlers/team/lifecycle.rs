@@ -33,16 +33,19 @@ impl ToolExecutor<ToolInvocation> for TeamLifecycleToolHandler {
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         let capability = self.capability;
         Box::pin(async move {
-            let authority = authorize_team_tool(&invocation, capability).await?;
-            maybe_record_deviation(&invocation, capability).await;
-            handle_lifecycle(capability, invocation, authority)
-                .await
-                .map(boxed_tool_output)
+            run_authorized_team_tool(invocation, capability, |invocation, authority| {
+                handle_lifecycle(capability, invocation, authority)
+            })
+            .await
         })
     }
 }
 
 impl CoreToolRuntime for TeamLifecycleToolHandler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

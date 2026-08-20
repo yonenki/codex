@@ -1435,6 +1435,10 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
 }
 
 impl CoreToolRuntime for MultiAgentV2NamespaceOverride {
+    fn team_lifecycle_routing(&self) -> crate::tools::registry::TeamLifecycleRouting {
+        self.handler.team_lifecycle_routing()
+    }
+
     fn wait_until_ready<'a>(&'a self, session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
         self.handler.wait_until_ready(session)
     }

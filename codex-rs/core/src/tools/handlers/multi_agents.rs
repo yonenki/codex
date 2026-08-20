@@ -16,6 +16,7 @@ pub(crate) use crate::tools::handlers::multi_agents_common::*;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::TeamLifecycleRouting;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;

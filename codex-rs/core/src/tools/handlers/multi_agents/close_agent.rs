@@ -58,7 +58,8 @@ async fn handle_close_agent(
         &caller_thread_id,
         &[target.as_str()],
         V1RawOp::Close,
-    )?;
+    )
+    .await?;
     let receiver_agent = session.services.agent_control.get_agent_metadata(agent_id);
     let known_agent = receiver_agent.is_some();
     let receiver_agent = receiver_agent.unwrap_or_default();
@@ -150,6 +151,10 @@ async fn handle_close_agent(
 }
 
 impl CoreToolRuntime for Handler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
