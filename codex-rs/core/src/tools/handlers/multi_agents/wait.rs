@@ -71,9 +71,14 @@ impl Handler {
         let target_refs: Vec<&str> = target_ids.iter().map(String::as_str).collect();
         let mut all_targets_known = true;
         for id in &receiver_thread_ids {
-            if !session.services.agent_control.is_agent_known(*id).await {
+            if !session
+                .services
+                .agent_control
+                .is_agent_known(*id)
+                .await
+                .map_err(|err| collab_agent_error(*id, err))?
+            {
                 all_targets_known = false;
-                break;
             }
         }
         if all_targets_known {

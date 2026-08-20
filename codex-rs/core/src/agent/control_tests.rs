@@ -1536,6 +1536,178 @@ async fn resume_agent_errors_when_manager_dropped() {
 }
 
 #[tokio::test]
+async fn existence_authority_preserves_manager_upgrade_failure() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+
+    for error in [
+        control
+            .is_agent_known(agent_id)
+            .await
+            .expect_err("live existence lookup should preserve manager failure"),
+        control
+            .is_agent_known_or_resumable(agent_id)
+            .await
+            .expect_err("resumable existence lookup should preserve manager failure"),
+    ] {
+        assert_eq!(
+            error.to_string(),
+            "unsupported operation: thread manager dropped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_active_agent() {
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, _) = harness.start_thread().await;
+
+    assert!(
+        harness
+            .control
+            .is_agent_known(agent_id)
+            .await
+            .expect("active lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_external_agent_without_manager() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+
+    assert!(
+        control
+            .is_agent_known(agent_id)
+            .await
+            .expect("external lookup should not require the thread manager")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_agent_metadata_without_manager() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    register_test_agent_metadata(
+        &control,
+        agent_id,
+        AgentPath::root().join("worker").expect("agent path"),
+        "Luna",
+        "worker",
+    );
+
+    assert!(
+        control
+            .is_agent_known(agent_id)
+            .await
+            .expect("metadata lookup should not require the thread manager")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_reports_normal_unknown() {
+    let harness = AgentControlHarness::new().await;
+    let agent_id = ThreadId::new();
+
+    assert!(
+        !harness
+            .control
+            .is_agent_known(agent_id)
+            .await
+            .expect("live unknown lookup should succeed")
+    );
+    assert!(
+        !harness
+            .control
+            .is_agent_known_or_resumable(agent_id)
+            .await
+            .expect("stored unknown lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_stored_resumable_agent() {
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, thread) = harness.start_thread().await;
+    persist_thread_for_tree_resume(&thread, "stored context").await;
+    harness
+        .control
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown stored thread");
+
+    assert!(
+        harness
+            .control
+            .is_agent_known_or_resumable(agent_id)
+            .await
+            .expect("stored resumable lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_preserves_stored_thread_read_failure() {
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, thread) = harness.start_thread().await;
+    persist_thread_for_tree_resume(&thread, "stored context").await;
+    let rollout_path = thread
+        .rollout_path()
+        .expect("stored thread should have rollout path");
+    harness
+        .control
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown stored thread");
+    std::fs::write(&rollout_path, [0xff]).expect("corrupt stored thread metadata");
+
+    let error = harness
+        .control
+        .is_agent_known_or_resumable(agent_id)
+        .await
+        .expect_err("stored thread read failure must not become unknown");
+    assert_matches!(error.details(), CodexErrorDetails::Fatal(_));
+    assert!(error.to_string().contains("failed to read stored thread"));
+}
+
+#[tokio::test]
+async fn existence_authority_preserves_history_read_failure() {
+    use std::io::Write;
+
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, thread) = harness.start_thread().await;
+    persist_thread_for_tree_resume(&thread, "stored context").await;
+    let rollout_path = thread
+        .rollout_path()
+        .expect("stored thread should have rollout path");
+    harness
+        .control
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown stored thread");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .expect("open rollout for corruption")
+        .write_all(&[0xff])
+        .expect("corrupt stored history");
+
+    let error = harness
+        .control
+        .is_agent_known_or_resumable(agent_id)
+        .await
+        .expect_err("history read failure must not become unknown");
+    assert_matches!(error.details(), CodexErrorDetails::Fatal(_));
+    assert!(error.to_string().contains("failed to read stored thread"));
+}
+
+#[tokio::test]
 async fn send_input_errors_when_thread_missing() {
     let harness = AgentControlHarness::new().await;
     let thread_id = ThreadId::new();
@@ -5427,6 +5599,60 @@ async fn team_spawn_binds_native_agent_before_first_turn() {
         let bindings_exist = harness.control.team().open_team_count() > 0;
         assert!(bindings_exist);
     }
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_team_binding_without_other_authority() {
+    let harness = AgentControlHarness::new().await;
+    harness
+        .control
+        .team()
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([
+            sample_team_graph(),
+        ]))
+        .await;
+    let started = harness
+        .control
+        .team()
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    harness
+        .control
+        .team()
+        .start_node(codex_team_runtime::StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+    let pending = harness
+        .control
+        .team()
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending binding");
+    let agent_id = ThreadId::new();
+    harness
+        .control
+        .team()
+        .bind_agent_before_start(agent_id.to_string(), pending)
+        .await
+        .expect("bind synthetic agent");
+
+    assert!(
+        harness
+            .control
+            .is_agent_known(agent_id)
+            .await
+            .expect("Team binding lookup should not require another authority")
+    );
 }
 
 #[tokio::test]

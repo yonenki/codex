@@ -46,6 +46,7 @@ async fn handle_close_agent(
         .agent_control
         .is_agent_known(agent_id)
         .await
+        .map_err(|err| collab_agent_error(agent_id, err))?
     {
         return Err(collab_agent_error(
             agent_id,

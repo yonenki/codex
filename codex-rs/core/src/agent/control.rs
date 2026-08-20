@@ -574,53 +574,77 @@ impl AgentControl {
             .ok_or_else(|| CodexErr::ThreadNotFound(agent_id))
     }
 
-    pub(crate) async fn is_agent_known(&self, agent_id: ThreadId) -> bool {
+    pub(crate) async fn is_agent_known(&self, agent_id: ThreadId) -> CodexResult<bool> {
         if self.external_agents.contains(agent_id) {
-            return true;
+            return Ok(true);
         }
         if self.state.agent_metadata_for_thread(agent_id).is_some() {
-            return true;
+            return Ok(true);
         }
         if self
             .team()
             .binding_snapshot(&agent_id.to_string())
             .is_some()
         {
-            return true;
+            return Ok(true);
         }
-        if let Ok(state) = self.upgrade() {
-            if state.get_thread(agent_id).await.is_ok() {
-                return true;
+        let state = self.upgrade()?;
+        match state.get_thread(agent_id).await {
+            Ok(_) => Ok(true),
+            Err(err)
+                if matches!(
+                    err.details(),
+                    CodexErrorDetails::ThreadNotFound(id) if *id == agent_id
+                ) =>
+            {
+                Ok(false)
             }
+            Err(err) => Err(err),
         }
-        false
     }
 
-    pub(crate) async fn is_agent_known_or_resumable(&self, agent_id: ThreadId) -> bool {
-        if self.is_agent_known(agent_id).await {
-            return true;
+    pub(crate) async fn is_agent_known_or_resumable(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<bool> {
+        if self.is_agent_known(agent_id).await? {
+            return Ok(true);
         }
-        if let Ok(state) = self.upgrade() {
-            let stored = state
-                .read_stored_thread(ReadThreadParams {
-                    thread_id: agent_id,
-                    include_archived: true,
-                    include_history: false,
-                })
-                .await;
-            if let Ok(stored_thread) = stored {
-                if let Ok(Some(_)) = self::spawn::load_agent_model_context(
-                    &state,
-                    agent_id,
-                    stored_thread.history_mode,
-                )
-                .await
-                {
-                    return true;
-                }
+        let state = self.upgrade()?;
+        let stored_thread = match state
+            .read_stored_thread(ReadThreadParams {
+                thread_id: agent_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+        {
+            Ok(stored_thread) => stored_thread,
+            Err(err)
+                if matches!(
+                    err.details(),
+                    CodexErrorDetails::ThreadNotFound(id) if *id == agent_id
+                ) =>
+            {
+                return Ok(false);
             }
+            Err(err) => return Err(err),
+        };
+        match self::spawn::load_agent_model_context(&state, agent_id, stored_thread.history_mode)
+            .await
+        {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(err)
+                if matches!(
+                    err.details(),
+                    CodexErrorDetails::ThreadNotFound(id) if *id == agent_id
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err),
         }
-        false
     }
 
     pub(crate) async fn list_live_agent_subtree_thread_ids(

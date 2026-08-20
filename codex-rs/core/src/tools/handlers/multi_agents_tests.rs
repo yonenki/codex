@@ -2591,6 +2591,71 @@ async fn send_input_reports_missing_agent() {
 }
 
 #[tokio::test]
+async fn v1_handlers_preserve_manager_failure_before_operation_or_team_guidance() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let agent_id = ThreadId::new();
+
+    let errors = [
+        expect_model_err(
+            SendInputHandler
+                .handle(invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "send_input",
+                    function_payload(json!({
+                        "target": agent_id.to_string(),
+                        "message": "hello"
+                    })),
+                ))
+                .await,
+            "send_input manager failure",
+        ),
+        expect_model_err(
+            CloseAgentHandler
+                .handle(invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "close_agent",
+                    function_payload(json!({"target": agent_id.to_string()})),
+                ))
+                .await,
+            "close_agent manager failure",
+        ),
+        expect_model_err(
+            ResumeAgentHandler
+                .handle(invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "resume_agent",
+                    function_payload(json!({"id": agent_id.to_string()})),
+                ))
+                .await,
+            "resume_agent manager failure",
+        ),
+        expect_model_err(
+            WaitAgentHandler::default()
+                .handle(invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "wait_agent",
+                    function_payload(json!({"targets": [agent_id.to_string()]})),
+                ))
+                .await,
+            "wait_agent manager failure",
+        ),
+    ];
+
+    for error in errors {
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel("collab manager unavailable".to_string())
+        );
+    }
+}
+
+#[tokio::test]
 async fn send_input_interrupts_before_prompt() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -2725,6 +2790,83 @@ async fn resume_agent_reports_missing_agent() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(format!("agent with id {agent_id} not found"))
+    );
+}
+
+#[tokio::test]
+async fn resume_agent_preserves_stored_history_failure() {
+    use std::io::Write;
+
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let thread = manager
+        .resume_thread_with_history(
+            turn.config.as_ref().clone(),
+            InitialHistory::Forked(vec![RolloutItem::ResponseItem(
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "materialized".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            )]),
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+        )
+        .await
+        .expect("start stored thread");
+    let agent_id = thread.thread_id;
+    let rollout_path = thread
+        .thread
+        .rollout_path()
+        .expect("stored thread should have rollout path");
+    manager
+        .agent_control()
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown stored thread");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(rollout_path)
+        .expect("open rollout for corruption")
+        .write_all(&[0xff])
+        .expect("corrupt stored history");
+
+    let error = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::new(session),
+                Arc::new(turn),
+                "resume_agent",
+                function_payload(json!({"id": agent_id.to_string()})),
+            ))
+            .await,
+        "resume_agent history failure",
+    );
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("expected model error");
+    };
+    assert!(
+        message.starts_with("collab tool failed: Fatal error:"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("failed to read stored thread"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !message.contains("not found"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !message.contains("team_session_id"),
+        "unexpected error: {message}"
     );
 }
 

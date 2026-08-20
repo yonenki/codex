@@ -60,6 +60,7 @@ async fn handle_resume_agent(
         .agent_control
         .is_agent_known_or_resumable(receiver_thread_id)
         .await
+        .map_err(|err| collab_agent_error(receiver_thread_id, err))?
     {
         return Err(collab_agent_error(
             receiver_thread_id,
