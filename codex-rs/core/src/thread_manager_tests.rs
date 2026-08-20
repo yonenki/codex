@@ -730,6 +730,12 @@ async fn code_mode_session_provider_is_shared_across_threads() {
             completed,
             submit_failed: Vec::new(),
             timed_out: Vec::new(),
+            runtime_producers: codex_team_runtime::RuntimeProducerSnapshot {
+                accepting: true,
+                generation: 1,
+                in_flight_count: 0,
+            },
+            terminal_retries: codex_team_runtime::TerminalRetrySnapshot::default(),
         }
     );
 }

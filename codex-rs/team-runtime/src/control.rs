@@ -44,11 +44,14 @@ pub struct TeamControl {
     surface: std::sync::RwLock<SurfaceSnapshot>,
     tool_reporting_agents: Mutex<std::collections::HashSet<String>>,
     restored: tokio::sync::OnceCell<()>,
+    runtime_producers: Arc<RuntimeProducerState>,
     terminal_retries: Arc<TerminalRetryState>,
     #[cfg(any(test, feature = "test-support"))]
     bind_persist_hold: BindPersistHold,
     #[cfg(any(test, feature = "test-support"))]
     fail_terminal_persist: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    fail_orphan_recovery: AtomicUsize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +81,63 @@ pub enum TerminalPersistenceOutcome {
 pub struct TerminalRetrySnapshot {
     pub pending_count: usize,
     pub worker_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeProducerSnapshot {
+    pub accepting: bool,
+    pub generation: u64,
+    pub in_flight_count: usize,
+}
+
+struct RuntimeProducerGate {
+    accepting: bool,
+    generation: u64,
+    in_flight_count: usize,
+}
+
+struct RuntimeProducerState {
+    gate: std::sync::Mutex<RuntimeProducerGate>,
+    changed: tokio::sync::Notify,
+}
+
+impl Default for RuntimeProducerState {
+    fn default() -> Self {
+        Self {
+            gate: std::sync::Mutex::new(RuntimeProducerGate {
+                accepting: true,
+                generation: 0,
+                in_flight_count: 0,
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+/// Ownership token for work that may enqueue a managed terminal transition.
+///
+/// Shutdown closes admission before waiting for every token from the current generation. This
+/// makes a zero terminal-retry snapshot authoritative: no pre-shutdown producer can enqueue after
+/// the snapshot is taken.
+pub struct RuntimeProducerPermit {
+    state: Arc<RuntimeProducerState>,
+    generation: u64,
+}
+
+impl Drop for RuntimeProducerPermit {
+    fn drop(&mut self) {
+        let mut gate = self
+            .state
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate.in_flight_count = gate
+            .in_flight_count
+            .checked_sub(1)
+            .expect("runtime producer permit count cannot underflow");
+        drop(gate);
+        self.state.changed.notify_waiters();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -382,11 +442,14 @@ impl TeamControl {
             surface: std::sync::RwLock::new(SurfaceSnapshot::default()),
             tool_reporting_agents: Mutex::new(std::collections::HashSet::new()),
             restored: tokio::sync::OnceCell::const_new(),
+            runtime_producers: Arc::default(),
             terminal_retries: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             bind_persist_hold: BindPersistHold::default(),
             #[cfg(any(test, feature = "test-support"))]
             fail_terminal_persist: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_orphan_recovery: AtomicUsize::new(0),
         }
     }
 
@@ -400,6 +463,89 @@ impl TeamControl {
         TerminalRetrySnapshot {
             pending_count,
             worker_count: self.terminal_retries.worker_count.load(Ordering::SeqCst),
+        }
+    }
+
+    pub fn begin_runtime_producer(&self) -> TeamRuntimeResult<RuntimeProducerPermit> {
+        let mut gate = self
+            .runtime_producers
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !gate.accepting {
+            return Err(TeamRuntimeError::invalid(
+                "Team runtime is shutting down and is not accepting new producers",
+            ));
+        }
+        let generation = gate.generation;
+        gate.in_flight_count = gate.in_flight_count.saturating_add(1);
+        Ok(RuntimeProducerPermit {
+            state: Arc::clone(&self.runtime_producers),
+            generation,
+        })
+    }
+
+    pub fn close_runtime_producers(&self) -> RuntimeProducerSnapshot {
+        let mut gate = self
+            .runtime_producers
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate.accepting = false;
+        RuntimeProducerSnapshot {
+            accepting: gate.accepting,
+            generation: gate.generation,
+            in_flight_count: gate.in_flight_count,
+        }
+    }
+
+    pub fn reopen_runtime_producers(&self, generation: u64) -> TeamRuntimeResult<()> {
+        let mut gate = self
+            .runtime_producers
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gate.generation != generation || gate.in_flight_count != 0 {
+            return Err(TeamRuntimeError::invalid(
+                "Team runtime producer generation is not quiescent",
+            ));
+        }
+        gate.generation = gate.generation.saturating_add(1);
+        gate.accepting = true;
+        Ok(())
+    }
+
+    pub fn runtime_producer_snapshot(&self) -> RuntimeProducerSnapshot {
+        let gate = self
+            .runtime_producers
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        RuntimeProducerSnapshot {
+            accepting: gate.accepting,
+            generation: gate.generation,
+            in_flight_count: gate.in_flight_count,
+        }
+    }
+
+    pub async fn wait_runtime_producers_bounded(
+        &self,
+        timeout: Duration,
+    ) -> RuntimeProducerSnapshot {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let snapshot = self.runtime_producer_snapshot();
+            if snapshot.in_flight_count == 0 {
+                return snapshot;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return snapshot;
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {}
+                () = self.runtime_producers.changed.notified() => {}
+            }
         }
     }
 
@@ -1124,6 +1270,11 @@ impl TeamControl {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_orphan_recovery_for_test(&self) {
+        self.fail_orphan_recovery.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn fail_terminal_persist_times_for_test(&self, failures: usize) {
         self.fail_terminal_persist.store(failures, Ordering::SeqCst);
     }
@@ -1163,9 +1314,23 @@ impl TeamControl {
     /// one pending transition and one worker.
     pub async fn record_agent_terminal_managed(
         self: &Arc<Self>,
+        producer: &RuntimeProducerPermit,
         agent_thread_id: &str,
         status: AgentTerminalStatus,
     ) -> TeamRuntimeResult<TerminalPersistenceOutcome> {
+        let producer_is_current = Arc::ptr_eq(&producer.state, &self.runtime_producers)
+            && producer.generation
+                == self
+                    .runtime_producers
+                    .gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .generation;
+        if !producer_is_current {
+            return Err(TeamRuntimeError::invalid(
+                "terminal producer permit belongs to another Team runtime",
+            ));
+        }
         let Some(binding) = self.binding_for_checked(agent_thread_id).await? else {
             return Ok(TerminalPersistenceOutcome::Persisted);
         };
@@ -1185,6 +1350,19 @@ impl TeamControl {
     /// Recover process-loss intent before the first runtime is registered in a new manager.
     /// At this startup boundary every durable active binding is necessarily orphaned.
     pub async fn recover_orphaned_active_agents(self: &Arc<Self>) -> TeamRuntimeResult<usize> {
+        let producer = self.begin_runtime_producer()?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .fail_orphan_recovery
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                (remaining != 0).then(|| remaining - 1)
+            })
+            .is_ok()
+        {
+            return Err(TeamRuntimeError::Store(
+                "injected startup orphan recovery failure".to_string(),
+            ));
+        }
         self.ensure_restored().await?;
         let active_agent_ids = {
             let teams = self.teams.lock().await;
@@ -1195,7 +1373,11 @@ impl TeamControl {
         };
         for agent_thread_id in &active_agent_ids {
             let _ = self
-                .record_agent_terminal_managed(agent_thread_id, AgentTerminalStatus::Interrupted)
+                .record_agent_terminal_managed(
+                    &producer,
+                    agent_thread_id,
+                    AgentTerminalStatus::Interrupted,
+                )
                 .await?;
         }
         Ok(active_agent_ids.len())

@@ -1065,11 +1065,20 @@ async fn managed_terminal_retry_deduplicates_by_team_agent_and_drains_with_one_w
     let first = bind_named_sample_worker(&control, "agent-a").await;
     let second = bind_named_sample_worker(&control, "agent-b").await;
     control.fail_terminal_persist_times_for_test(100);
+    let producer = control.begin_runtime_producer().expect("runtime producer");
 
     let (first_request, duplicate_request, isolated_request) = tokio::join!(
-        control.record_agent_terminal_managed("agent-a", AgentTerminalStatus::Interrupted),
-        control.record_agent_terminal_managed("agent-a", AgentTerminalStatus::Errored),
-        control.record_agent_terminal_managed("agent-b", AgentTerminalStatus::Interrupted),
+        control.record_agent_terminal_managed(
+            &producer,
+            "agent-a",
+            AgentTerminalStatus::Interrupted
+        ),
+        control.record_agent_terminal_managed(&producer, "agent-a", AgentTerminalStatus::Errored),
+        control.record_agent_terminal_managed(
+            &producer,
+            "agent-b",
+            AgentTerminalStatus::Interrupted
+        ),
     );
     assert!(matches!(
         first_request.expect("first request"),
@@ -1124,6 +1133,35 @@ async fn managed_terminal_retry_deduplicates_by_team_agent_and_drains_with_one_w
 }
 
 #[tokio::test]
+async fn runtime_producer_barrier_rejects_late_work_and_reports_in_flight_generation() {
+    let control = TeamControl::memory(TeamGraphCatalog::new([sample_graph()]));
+    let producer = control.begin_runtime_producer().expect("runtime producer");
+    let closing = control.close_runtime_producers();
+    assert!(!closing.accepting);
+    assert_eq!(closing.generation, 0);
+    assert_eq!(closing.in_flight_count, 1);
+    assert!(control.begin_runtime_producer().is_err());
+
+    let timed_out = control
+        .wait_runtime_producers_bounded(std::time::Duration::from_millis(1))
+        .await;
+    assert_eq!(timed_out.in_flight_count, 1);
+    assert!(!timed_out.accepting);
+
+    drop(producer);
+    let quiescent = control
+        .wait_runtime_producers_bounded(std::time::Duration::from_secs(1))
+        .await;
+    assert_eq!(quiescent.in_flight_count, 0);
+    control
+        .reopen_runtime_producers(quiescent.generation)
+        .expect("reopen next producer generation");
+    let reopened = control.runtime_producer_snapshot();
+    assert!(reopened.accepting);
+    assert_eq!(reopened.generation, 1);
+}
+
+#[tokio::test]
 async fn startup_recovery_terminalizes_durable_orphan_once_without_scanning_new_live_agent() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("terminal-recovery.sqlite");
@@ -1134,8 +1172,13 @@ async fn startup_recovery_terminalizes_durable_orphan_once_without_scanning_new_
     ));
     let orphaned = bind_named_sample_worker(&initial, "orphaned-agent").await;
     initial.fail_terminal_persist_times_for_test(100);
+    let producer = initial.begin_runtime_producer().expect("runtime producer");
     let outcome = initial
-        .record_agent_terminal_managed("orphaned-agent", AgentTerminalStatus::Interrupted)
+        .record_agent_terminal_managed(
+            &producer,
+            "orphaned-agent",
+            AgentTerminalStatus::Interrupted,
+        )
         .await
         .expect("managed terminal");
     assert!(matches!(

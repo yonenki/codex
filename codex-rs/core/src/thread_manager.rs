@@ -203,6 +203,8 @@ pub struct ThreadShutdownReport {
     pub completed: Vec<ThreadId>,
     pub submit_failed: Vec<ThreadId>,
     pub timed_out: Vec<ThreadId>,
+    pub runtime_producers: codex_team_runtime::RuntimeProducerSnapshot,
+    pub terminal_retries: codex_team_runtime::TerminalRetrySnapshot,
 }
 
 enum ShutdownOutcome {
@@ -1122,6 +1124,12 @@ impl ThreadManager {
     /// remain tracked so callers can retry or inspect them later.
     pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
         let shutdown_started = tokio::time::Instant::now();
+        let producer_generation = self.state.team.close_runtime_producers().generation;
+        let runtime_producers = self
+            .state
+            .team
+            .wait_runtime_producers_bounded(timeout)
+            .await;
         let threads = {
             let threads = self.state.threads.read().await;
             threads
@@ -1130,19 +1138,23 @@ impl ThreadManager {
                 .collect::<Vec<_>>()
         };
 
+        let thread_timeout = timeout.saturating_sub(shutdown_started.elapsed());
         let mut shutdowns = threads
             .into_iter()
             .map(|(thread_id, thread)| async move {
-                let outcome = match tokio::time::timeout(timeout, thread.shutdown_and_wait()).await
-                {
-                    Ok(Ok(())) => ShutdownOutcome::Complete,
-                    Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
-                    Err(_) => ShutdownOutcome::TimedOut,
-                };
+                let outcome =
+                    match tokio::time::timeout(thread_timeout, thread.shutdown_and_wait()).await {
+                        Ok(Ok(())) => ShutdownOutcome::Complete,
+                        Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
+                        Err(_) => ShutdownOutcome::TimedOut,
+                    };
                 (thread_id, outcome)
             })
             .collect::<FuturesUnordered<_>>();
-        let mut report = ThreadShutdownReport::default();
+        let mut report = ThreadShutdownReport {
+            runtime_producers,
+            ..ThreadShutdownReport::default()
+        };
 
         while let Some((thread_id, outcome)) = shutdowns.next().await {
             match outcome {
@@ -1152,9 +1164,11 @@ impl ThreadManager {
             }
         }
 
-        let mut tracked_threads = self.state.threads.write().await;
-        for thread_id in &report.completed {
-            tracked_threads.remove(thread_id);
+        {
+            let mut tracked_threads = self.state.threads.write().await;
+            for thread_id in &report.completed {
+                tracked_threads.remove(thread_id);
+            }
         }
 
         report
@@ -1167,11 +1181,22 @@ impl ThreadManager {
             .timed_out
             .sort_by_key(std::string::ToString::to_string);
         let remaining = timeout.saturating_sub(shutdown_started.elapsed());
-        let terminal_retries = self
-            .state
-            .team
-            .drain_terminal_retries_bounded(remaining)
-            .await;
+        let terminal_retries = if report.runtime_producers.in_flight_count == 0 {
+            self.state
+                .team
+                .drain_terminal_retries_bounded(remaining)
+                .await
+        } else {
+            self.state.team.terminal_retry_snapshot()
+        };
+        report.terminal_retries = terminal_retries;
+        if report.runtime_producers.in_flight_count != 0 {
+            warn!(
+                producers = report.runtime_producers.in_flight_count,
+                generation = report.runtime_producers.generation,
+                "runtime shutdown deadline elapsed with terminal producers still in flight"
+            );
+        }
         if terminal_retries.pending_count != 0 {
             warn!(
                 pending = terminal_retries.pending_count,
@@ -1179,6 +1204,21 @@ impl ThreadManager {
                 "terminal persistence retries remain durable after bounded runtime shutdown"
             );
         }
+        let shutdown_complete = report.runtime_producers.in_flight_count == 0
+            && report.terminal_retries.pending_count == 0
+            && report.terminal_retries.worker_count == 0
+            && report.submit_failed.is_empty()
+            && report.timed_out.is_empty();
+        if shutdown_complete {
+            if let Err(error) = self
+                .state
+                .team
+                .reopen_runtime_producers(producer_generation)
+            {
+                warn!(%error, "failed to reopen quiescent Team runtime producer admission");
+            }
+        }
+        report.runtime_producers = self.state.team.runtime_producer_snapshot();
         report
     }
 
@@ -1796,22 +1836,30 @@ impl ThreadManagerState {
 
     /// Spawn a new thread with optional history and register it with the manager.
     async fn spawn_thread(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        let _runtime_producer = self
+            .team
+            .begin_runtime_producer()
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
         self.team_orphan_recovery
-            .get_or_init(|| async {
-                match self.team.recover_orphaned_active_agents().await {
-                    Ok(recovered) if recovered != 0 => {
-                        warn!(
-                            recovered,
-                            "recovered orphaned active Team agents at startup"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        warn!(%error, "failed to recover orphaned active Team agents at startup");
-                    }
+            .get_or_try_init(|| async {
+                let recovered =
+                    self.team
+                        .recover_orphaned_active_agents()
+                        .await
+                        .map_err(|error| {
+                            CodexErr::Fatal(format!(
+                                "failed to recover orphaned active Team agents at startup: {error}"
+                            ))
+                        })?;
+                if recovered != 0 {
+                    warn!(
+                        recovered,
+                        "recovered orphaned active Team agents at startup"
+                    );
                 }
+                Ok::<(), CodexErr>(())
             })
-            .await;
+            .await?;
         let ThreadSpawnRequest {
             options,
             auth_manager,

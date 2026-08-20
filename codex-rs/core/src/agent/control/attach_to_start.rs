@@ -5,6 +5,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_team_runtime::AgentTerminalStatus;
 use codex_team_runtime::BindAttemptHandle;
 use codex_team_runtime::BindAttemptOutcome;
+use codex_team_runtime::RuntimeProducerPermit;
 use codex_team_runtime::TerminalPersistenceOutcome;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -24,6 +25,7 @@ pub(super) struct AttachToStartOwner {
     committed: Arc<AtomicBool>,
     disarmed: Arc<AtomicBool>,
     flight: Arc<Mutex<Option<BindFlight>>>,
+    producer: Arc<RuntimeProducerPermit>,
     wakeup: Option<oneshot::Sender<()>>,
 }
 
@@ -39,6 +41,8 @@ pub(super) struct AttachToStartTestControl {
     fail_native_shutdown_before_send: AtomicBool,
     hold: StdMutex<Option<oneshot::Receiver<()>>>,
     entered: StdMutex<Option<oneshot::Sender<()>>>,
+    cleanup_hold: StdMutex<Option<oneshot::Receiver<()>>>,
+    cleanup_entered: StdMutex<Option<oneshot::Sender<()>>>,
 }
 
 #[derive(Debug)]
@@ -79,7 +83,12 @@ impl AttachCleanupOutcome {
 }
 
 impl AttachToStartOwner {
-    fn arm(control: AgentControl, agent_thread_id: ThreadId, cleanup_external: bool) -> Self {
+    fn arm(
+        control: AgentControl,
+        agent_thread_id: ThreadId,
+        cleanup_external: bool,
+        producer: RuntimeProducerPermit,
+    ) -> Self {
         let committed = Arc::new(AtomicBool::new(false));
         let disarmed = Arc::new(AtomicBool::new(false));
         let flight = Arc::new(Mutex::new(None));
@@ -88,6 +97,8 @@ impl AttachToStartOwner {
         let committed_task = Arc::clone(&committed);
         let disarmed_task = Arc::clone(&disarmed);
         let flight_task = Arc::clone(&flight);
+        let producer = Arc::new(producer);
+        let producer_task = Arc::clone(&producer);
         tokio::spawn(async move {
             let _ = parked.await;
             if disarmed_task.load(Ordering::SeqCst) {
@@ -99,6 +110,7 @@ impl AttachToStartOwner {
                     cleanup_external,
                     committed_task.load(Ordering::SeqCst),
                     flight_task.lock().await.take(),
+                    &producer_task,
                 )
                 .await;
         });
@@ -109,6 +121,7 @@ impl AttachToStartOwner {
             committed,
             disarmed,
             flight,
+            producer,
             wakeup: Some(wakeup),
         }
     }
@@ -190,7 +203,11 @@ impl AttachToStartOwner {
             .await;
         let terminal = self
             .control
-            .record_attach_terminal(self.agent_thread_id, AgentTerminalStatus::Errored)
+            .record_attach_terminal(
+                &self.producer,
+                self.agent_thread_id,
+                AgentTerminalStatus::Errored,
+            )
             .await;
         AttachCleanupOutcome {
             resource_error,
@@ -248,8 +265,9 @@ impl AgentControl {
         &self,
         agent_thread_id: ThreadId,
         cleanup_external: bool,
+        producer: RuntimeProducerPermit,
     ) -> AttachToStartOwner {
-        AttachToStartOwner::arm(self.clone(), agent_thread_id, cleanup_external)
+        AttachToStartOwner::arm(self.clone(), agent_thread_id, cleanup_external, producer)
     }
 
     async fn cleanup_bind_attempt_resources(
@@ -263,6 +281,8 @@ impl AgentControl {
             self.state.release_spawned_thread(agent_thread_id);
             None
         } else {
+            #[cfg(test)]
+            self.apply_cleanup_before_registry_test_probe().await;
             self.shutdown_live_agent(agent_thread_id)
                 .await
                 .err()
@@ -272,12 +292,13 @@ impl AgentControl {
 
     async fn record_attach_terminal(
         &self,
+        producer: &RuntimeProducerPermit,
         agent_thread_id: ThreadId,
         status: AgentTerminalStatus,
     ) -> TerminalCleanupOutcome {
         match self
             .team_handle()
-            .record_agent_terminal_managed(&agent_thread_id.to_string(), status)
+            .record_agent_terminal_managed(producer, &agent_thread_id.to_string(), status)
             .await
         {
             Ok(TerminalPersistenceOutcome::Persisted) => TerminalCleanupOutcome::Persisted,
@@ -296,6 +317,7 @@ impl AgentControl {
         cleanup_external: bool,
         committed: bool,
         flight: Option<BindFlight>,
+        producer: &RuntimeProducerPermit,
     ) {
         let outcome = if let Some(mut flight) = flight {
             if let Some(cancel) = flight.cancel.take() {
@@ -319,7 +341,7 @@ impl AgentControl {
         };
         if attached {
             let terminal = self
-                .record_attach_terminal(agent_thread_id, AgentTerminalStatus::Interrupted)
+                .record_attach_terminal(producer, agent_thread_id, AgentTerminalStatus::Interrupted)
                 .await;
             AttachCleanupOutcome {
                 resource_error,
@@ -331,7 +353,7 @@ impl AgentControl {
         if outcome.is_some() && !matches!(outcome, Some(BindAttemptOutcome::Uncommitted)) {
             // settle 報告が失敗でも、正規の terminal mutation で active なら一度記録する。
             let terminal = self
-                .record_attach_terminal(agent_thread_id, AgentTerminalStatus::Interrupted)
+                .record_attach_terminal(producer, agent_thread_id, AgentTerminalStatus::Interrupted)
                 .await;
             AttachCleanupOutcome {
                 resource_error,
@@ -385,6 +407,47 @@ impl AgentControl {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entered_tx);
         (release_tx, entered_rx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_cleanup_before_registry(
+        &self,
+    ) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
+        let (release_tx, release_rx) = oneshot::channel();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        *self
+            .attach_to_start_test
+            .cleanup_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release_rx);
+        *self
+            .attach_to_start_test
+            .cleanup_entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entered_tx);
+        (release_tx, entered_rx)
+    }
+
+    #[cfg(test)]
+    async fn apply_cleanup_before_registry_test_probe(&self) {
+        let hold = self
+            .attach_to_start_test
+            .cleanup_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let entered = self
+            .attach_to_start_test
+            .cleanup_entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(entered) = entered {
+            let _ = entered.send(());
+        }
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
     }
 
     #[cfg(test)]

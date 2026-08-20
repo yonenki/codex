@@ -28,6 +28,8 @@ pub use control::EndTeamCommand;
 pub use control::EvidenceCommand;
 pub use control::ExternalWaitCommand;
 pub use control::RecordResultCommand;
+pub use control::RuntimeProducerPermit;
+pub use control::RuntimeProducerSnapshot;
 pub use control::StartNodeCommand;
 pub use control::StartTeamCommand;
 pub use control::TeamControl;

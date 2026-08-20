@@ -5996,6 +5996,84 @@ async fn seed_sample_team(
     (started, pending)
 }
 
+#[tokio::test]
+async fn first_spawn_retries_failed_orphan_recovery_without_rescanning_live_agents() {
+    Box::pin(async {
+        let harness = AgentControlHarness::new().await;
+        let (started, pending) = seed_sample_team(&harness).await;
+        let orphaned_agent = ThreadId::new();
+        harness
+            .control
+            .team()
+            .bind_agent_before_start(orphaned_agent.to_string(), pending.clone())
+            .await
+            .expect("bind durable orphan");
+        harness.control.team().fail_next_orphan_recovery_for_test();
+
+        let first = harness
+            .manager
+            .start_thread(StartThreadOptions::new(harness.config.clone()))
+            .await;
+        match first {
+            Err(error) => match error.details() {
+                CodexErrorDetails::Fatal(message) => {
+                    assert!(message.contains("failed to recover orphaned active Team agents"));
+                }
+                _ => panic!("first spawn must return a typed fatal recovery failure"),
+            },
+            _ => panic!("first spawn must stop on typed recovery failure"),
+        }
+        assert!(harness.manager.list_thread_ids().await.is_empty());
+
+        let recovered_spawn = harness
+            .manager
+            .start_thread(StartThreadOptions::new(harness.config.clone()))
+            .await
+            .expect("next spawn retries recovery");
+        assert_eq!(
+            terminal_statuses(&load_team_events(&harness, &started.team_session_id).await),
+            ["interrupted"]
+        );
+
+        let live_agent = ThreadId::new();
+        harness
+            .control
+            .team()
+            .bind_agent_before_start(live_agent.to_string(), pending)
+            .await
+            .expect("bind post-recovery live agent");
+        let later_spawn = harness
+            .manager
+            .start_thread(StartThreadOptions::new(harness.config.clone()))
+            .await
+            .expect("post-recovery spawn");
+        assert!(
+            harness
+                .control
+                .team()
+                .status(&started.team_session_id)
+                .await
+                .expect("team status")
+                .agents
+                .iter()
+                .any(|agent| agent.agent_thread_id == live_agent.to_string()),
+            "Once authority must not rescan a live agent after successful recovery"
+        );
+
+        recovered_spawn
+            .thread
+            .shutdown_and_wait()
+            .await
+            .expect("shutdown recovered spawn");
+        later_spawn
+            .thread
+            .shutdown_and_wait()
+            .await
+            .expect("shutdown later spawn");
+    })
+    .await;
+}
+
 async fn load_team_events(
     harness: &AgentControlHarness,
     team_session_id: &codex_team_runtime::TeamSessionId,
@@ -6907,12 +6985,28 @@ async fn native_cancel_retries_terminal_after_cleanup_failure_and_releases_resou
     let child = ThreadId::from_string(&agent_thread_id).expect("thread id");
     harness.control.team().fail_next_terminal_persist_for_test();
     harness.control.fail_next_native_shutdown_before_send();
+    let (cleanup_release, cleanup_entered) = harness.control.hold_next_cleanup_before_registry();
     task.abort();
     let join = timeout(Duration::from_secs(5), task)
         .await
         .expect("cancelled spawn should not wait indefinitely");
     assert!(join.is_err(), "spawn future must keep the cancel outcome");
     drop(hold);
+    timeout(Duration::from_secs(5), cleanup_entered)
+        .await
+        .expect("cleanup must reach the registry boundary")
+        .expect("cleanup registry boundary entered");
+    let incomplete = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_millis(20))
+        .await;
+    assert!(
+        incomplete.runtime_producers.in_flight_count >= 1,
+        "shutdown must report the cleanup producer blocked before registry cleanup"
+    );
+    assert!(!incomplete.runtime_producers.accepting);
+    assert_eq!(incomplete.terminal_retries.pending_count, 0);
+    drop(cleanup_release);
 
     wait_until_thread_gone(&harness, child).await;
     assert!(
@@ -6940,6 +7034,13 @@ async fn native_cancel_retries_terminal_after_cleanup_failure_and_releases_resou
             .is_empty(),
         "terminal retry must clear durable active state"
     );
+    let completed = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert_eq!(completed.runtime_producers.in_flight_count, 0);
+    assert_eq!(completed.terminal_retries.pending_count, 0);
+    assert!(completed.runtime_producers.accepting);
 }
 
 #[tokio::test]
