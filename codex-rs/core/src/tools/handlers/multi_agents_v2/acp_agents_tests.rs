@@ -171,6 +171,35 @@ fn spawn_spec_accepts_observer_metadata_string_map() {
 }
 
 #[test]
+fn reserved_acp_delivery_specs_keep_their_model_visible_contract() {
+    for (name, description) in [
+        (
+            "send_message",
+            "Queue a plain-text message for an existing ACP agent without starting a turn.",
+        ),
+        (
+            "followup_task",
+            "Send a plain-text follow-up to an existing ACP agent and start its next turn when idle.",
+        ),
+    ] {
+        let ToolSpec::Function(spec) = message_spec(name, description) else {
+            panic!("{name} must remain a function tool");
+        };
+        assert_eq!(spec.name, name);
+        assert_eq!(spec.description, description);
+        let properties = spec.parameters.properties.as_ref().expect("parameters");
+        assert_eq!(
+            properties.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["message", "target"]
+        );
+        assert_eq!(
+            spec.parameters.required.as_ref(),
+            Some(&vec!["target".to_string(), "message".to_string()])
+        );
+    }
+}
+
+#[test]
 fn spawn_output_reports_first_fallback_explicit_and_default_model() {
     let path = AgentPath::try_from("/root/worker").expect("agent path");
     let pool = [

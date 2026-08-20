@@ -14,9 +14,11 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents_v2::FollowupAcpAgentHandler;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
+use crate::tools::handlers::multi_agents_v2::MessageAcpAgentHandler;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
@@ -4863,6 +4865,56 @@ async fn start_sample_team(
     started.team_session_id
 }
 
+fn register_external_target(
+    session: &crate::session::session::Session,
+    task_name: &str,
+) -> ThreadId {
+    let agent_id = ThreadId::new();
+    let agent_path = AgentPath::root()
+        .join(task_name)
+        .expect("external agent path");
+    session
+        .services
+        .agent_control
+        .register_external_agent_for_tests(agent_id, agent_path);
+    agent_id
+}
+
+async fn bind_agent_to_team(
+    session: &crate::session::session::Session,
+    team_session_id: &codex_team_runtime::TeamSessionId,
+    agent_id: ThreadId,
+) {
+    let team = session.services.agent_control.team();
+    let pending = team
+        .pending_binding_for_node(team_session_id, "worker")
+        .await
+        .expect("pending Team binding");
+    team.bind_agent_before_start(agent_id.to_string(), pending)
+        .await
+        .expect("bind Team agent");
+}
+
+async fn invoke_acp_delivery(
+    session: Arc<crate::session::session::Session>,
+    turn: Arc<TurnContext>,
+    tool_name: &str,
+    target: &str,
+    message: &str,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    let invocation = invocation(
+        session,
+        turn,
+        tool_name,
+        function_payload(json!({"target": target, "message": message})),
+    );
+    match tool_name {
+        "send_message" => MessageAcpAgentHandler.handle(invocation).await,
+        "followup_task" => FollowupAcpAgentHandler.handle(invocation).await,
+        _ => panic!("unsupported ACP delivery tool"),
+    }
+}
+
 fn assert_v2_team_tool_guidance(err: FunctionCallError, team_tool: &str) {
     let FunctionCallError::RespondToModel(message) = err else {
         panic!("expected model-facing error");
@@ -4991,6 +5043,181 @@ async fn raw_collaboration_allows_unbound_caller_and_target() {
         RawCollaborationOp::SendMessage,
     )
     .expect("unbound send");
+}
+
+#[tokio::test]
+async fn acp_delivery_allows_unbound_agents_and_preserves_send_and_followup_semantics() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let send_target = register_external_target(&session, "send_target");
+    let followup_target = register_external_target(&session, "followup_target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    invoke_acp_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "send_message",
+        &send_target.to_string(),
+        "queued payload",
+    )
+    .await
+    .expect("unbound ACP send");
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(send_target),
+        vec!["queued payload".to_string()]
+    );
+
+    invoke_acp_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "followup_task",
+        &followup_target.to_string(),
+        "activate payload",
+    )
+    .await
+    .expect("unbound ACP followup");
+    let (_, generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(followup_target)
+        .expect("followup target lifecycle");
+    assert_eq!(generation, 1, "followup must activate one generation");
+}
+
+#[tokio::test]
+async fn acp_delivery_rejects_bound_caller_for_unbound_target_without_mutation() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let target = register_external_target(&session, "unbound_target");
+    bind_agent_to_team(&session, &team_session_id, session.thread_id).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    for tool_name in ["send_message", "followup_task"] {
+        let err = expect_model_err(
+            invoke_acp_delivery(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                tool_name,
+                &target.to_string(),
+                "must reject",
+            )
+            .await,
+            "bound caller must not use raw ACP delivery",
+        );
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected model-facing Team boundary error");
+        };
+        assert!(message.contains("unbound root coordinator"), "{message}");
+        assert!(message.contains(&format!("acp.{tool_name}")), "{message}");
+        assert!(!message.contains("team_session_id="), "{message}");
+    }
+    assert!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target)
+            .is_empty()
+    );
+    let (_, generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target)
+        .expect("target lifecycle");
+    assert_eq!(generation, 0, "rejection must not activate the target");
+}
+
+#[tokio::test]
+async fn acp_delivery_uses_target_team_authority_for_bound_same_and_cross_team_targets() {
+    for cross_team in [false, true] {
+        let (session, turn, _manager) = prepare_v2_session().await;
+        let caller_team = start_sample_team(&session).await;
+        let target_team = if cross_team {
+            start_sample_team(&session).await
+        } else {
+            caller_team.clone()
+        };
+        let target = register_external_target(&session, "bound_target");
+        bind_agent_to_team(&session, &caller_team, session.thread_id).await;
+        bind_agent_to_team(&session, &target_team, target).await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+
+        for (tool_name, team_tool) in [
+            ("send_message", "team.send_message"),
+            ("followup_task", "team.followup_agent"),
+        ] {
+            let err = expect_model_err(
+                invoke_acp_delivery(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    tool_name,
+                    &target.to_string(),
+                    "must reject",
+                )
+                .await,
+                "Team-bound target must reject raw ACP delivery",
+            );
+            let FunctionCallError::RespondToModel(message) = err else {
+                panic!("expected model-facing Team boundary error");
+            };
+            assert!(message.contains(team_tool), "{message}");
+            assert!(
+                message.contains(&format!("team_session_id={target_team}")),
+                "target Team must own the operation: {message}"
+            );
+            if cross_team {
+                assert!(
+                    !message.contains(&format!("team_session_id={caller_team}")),
+                    "caller Team must not override target authority: {message}"
+                );
+            }
+        }
+        assert!(
+            session
+                .services
+                .agent_control
+                .external_queued_message_contents_for_tests(target)
+                .is_empty()
+        );
+        let (_, generation) = session
+            .services
+            .agent_control
+            .external_lifecycle_status_for_tests(target)
+            .expect("target lifecycle");
+        assert_eq!(generation, 0, "rejection must not activate the target");
+    }
+}
+
+#[tokio::test]
+async fn acp_delivery_keeps_unknown_target_lookup_error_ahead_of_team_guidance() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    bind_agent_to_team(&session, &team_session_id, session.thread_id).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    for tool_name in ["send_message", "followup_task"] {
+        let err = expect_model_err(
+            invoke_acp_delivery(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                tool_name,
+                "missing-external-agent",
+                "must keep lookup error",
+            )
+            .await,
+            "unknown target must fail lookup",
+        );
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("lookup should stay model-facing");
+        };
+        assert!(!message.contains("team."), "{message}");
+        assert!(!message.contains("unbound root coordinator"), "{message}");
+    }
 }
 
 #[tokio::test]

@@ -574,6 +574,52 @@ impl AgentControl {
             .ok_or_else(|| CodexErr::ThreadNotFound(agent_id))
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_external_agent_for_tests(
+        &self,
+        agent_id: ThreadId,
+        agent_path: AgentPath,
+    ) {
+        let mut reservation = self
+            .state
+            .reserve_spawn_slot(None)
+            .expect("reserve test external agent slot");
+        reservation
+            .reserve_agent_path(&agent_path)
+            .expect("reserve test external agent path");
+        reservation.commit(AgentMetadata {
+            agent_id: Some(agent_id),
+            agent_path: Some(agent_path),
+            agent_nickname: None,
+            agent_role: Some("worker".to_string()),
+            metadata: None,
+        });
+        self.external_agents.register_for_tests(
+            agent_id,
+            external::ExternalAgentIdentity {
+                harness: "test-harness".to_string(),
+                model: Some("test-model".to_string()),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_queued_message_contents_for_tests(
+        &self,
+        agent_id: ThreadId,
+    ) -> Vec<String> {
+        self.external_agents
+            .queued_message_contents_for_tests(agent_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_lifecycle_status_for_tests(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<(AgentStatus, u64)> {
+        self.external_agents.lifecycle_status(agent_id)
+    }
+
     pub(crate) async fn is_agent_known(&self, agent_id: ThreadId) -> CodexResult<bool> {
         if self.external_agents.contains(agent_id) {
             return Ok(true);

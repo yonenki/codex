@@ -104,6 +104,46 @@ impl DeliveryMode {
             Self::TriggerTurn => AgentCommunicationKind::Followup,
         }
     }
+
+    fn team_tool(self) -> &'static str {
+        match self {
+            Self::QueueOnly => "team.send_message",
+            Self::TriggerTurn => "team.followup_agent",
+        }
+    }
+
+    fn raw_tool(self) -> &'static str {
+        match self {
+            Self::QueueOnly => "acp.send_message",
+            Self::TriggerTurn => "acp.followup_task",
+        }
+    }
+}
+
+fn reject_team_bound_external_delivery(
+    session: &crate::session::session::Session,
+    caller_thread_id: &str,
+    target_thread_id: &str,
+    mode: DeliveryMode,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    if let Some(target_binding) = team.binding_snapshot(target_thread_id) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "Team-bound ACP delivery must use {}(team_session_id={}, ...). {} cannot be used when the caller or target is bound to a Team.",
+            mode.team_tool(),
+            target_binding.team_session_id,
+            mode.raw_tool(),
+        )));
+    }
+    if team.binding_snapshot(caller_thread_id).is_some() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "Team-bound {} is unsupported for an unbound target. Delegate the non-Team raw operation to an unbound root coordinator using {}. {} cannot be used when the caller or target is bound to a Team.",
+            mode.raw_tool(),
+            mode.raw_tool(),
+            mode.raw_tool(),
+        )));
+    }
+    Ok(())
 }
 
 fn spawn_spec() -> ToolSpec {
@@ -646,6 +686,9 @@ async fn deliver(
         .agent_control
         .ensure_agent_known(agent_id)
         .map_err(|error| collab_agent_error(agent_id, error))?;
+    let caller_thread_id = session.thread_id.to_string();
+    let target_thread_id = agent_id.to_string();
+    reject_team_bound_external_delivery(&session, &caller_thread_id, &target_thread_id, mode)?;
     let agent_path = known.agent_path.ok_or_else(|| {
         FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
     })?;
