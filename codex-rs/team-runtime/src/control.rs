@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 pub struct TeamControl {
     catalog: Mutex<TeamGraphCatalog>,
     store: Arc<dyn StoreHandle>,
-    sink: Arc<dyn ErasedSink>,
+    sink: std::sync::RwLock<Arc<dyn ErasedSink>>,
     teams: Mutex<BTreeMap<TeamSessionId, TeamSessionState>>,
     bindings: Mutex<BTreeMap<String, TeamAgentBinding>>,
     surface: std::sync::RwLock<SurfaceSnapshot>,
@@ -248,7 +248,7 @@ impl TeamControl {
         Self {
             catalog: Mutex::new(catalog),
             store,
-            sink,
+            sink: std::sync::RwLock::new(sink),
             teams: Mutex::new(BTreeMap::new()),
             bindings: Mutex::new(BTreeMap::new()),
             surface: std::sync::RwLock::new(SurfaceSnapshot::default()),
@@ -779,6 +779,18 @@ impl TeamControl {
         agent_thread_id: impl Into<String>,
         pending: PendingTeamBinding,
     ) -> TeamRuntimeResult<TeamAgentBinding> {
+        self.bind_agent_before_start_on_persist(agent_thread_id, pending, |_| {})
+            .await
+    }
+
+    /// agent_attached と active state を永続化した直後、同期 outbox publish の前に `on_persisted` を呼ぶ。
+    /// persist が成功しなかった場合は呼び出さない。
+    pub async fn bind_agent_before_start_on_persist(
+        &self,
+        agent_thread_id: impl Into<String>,
+        pending: PendingTeamBinding,
+        on_persisted: impl FnOnce(&TeamAgentBinding),
+    ) -> TeamRuntimeResult<TeamAgentBinding> {
         let agent_thread_id = agent_thread_id.into();
         let backend_fallback = pending.backend_fallback;
         let attach_metadata = pending.attach_metadata.clone();
@@ -812,39 +824,54 @@ impl TeamControl {
             let mut bindings = self.bindings.lock().await;
             bindings.insert(agent_thread_id.clone(), binding.clone());
         }
-        self.mutate_without_cas(binding.team_session_id.clone(), |state| {
-            if state.node_run(&binding.node_run_id).is_none() {
-                return Err(TeamRuntimeError::CrossTeamRef {
-                    team: state.team_session_id.clone(),
-                    subject: binding.node_run_id.to_string(),
-                });
-            }
-            Ok(TeamEvent {
-                event_id: crate::ids::EventId::generate(),
-                team_session_id: state.team_session_id.clone(),
-                sequence: state.next_sequence,
-                kind: TeamEventKind::AgentAttached,
-                occurred_at: Utc::now(),
-                graph_name: state.graph.name.clone(),
-                graph_version: state.graph.version.clone(),
-                graph_hash: state.graph_hash.clone(),
-                node_id: Some(binding.node_id.clone()),
-                node_run_id: Some(binding.node_run_id.clone()),
-                attempt: state.current_node_run.as_ref().map(|run| run.attempt),
-                agent_thread_id: Some(agent_thread_id),
-                role: Some(binding.role.clone()),
-                payload: TeamEventPayload::AgentAttached {
-                    role: binding.role.clone(),
-                    backend_fallback: backend_fallback.then_some(true),
-                    backend,
-                    harness,
-                    model,
-                    delegation_message,
-                },
-            })
-        })
-        .await?;
+        self.ensure_restored().await?;
+        let mut teams = self.teams.lock().await;
+        let state = teams
+            .get_mut(&binding.team_session_id)
+            .ok_or_else(|| TeamRuntimeError::TeamNotFound(binding.team_session_id.clone()))?;
+        if state.node_run(&binding.node_run_id).is_none() {
+            return Err(TeamRuntimeError::CrossTeamRef {
+                team: state.team_session_id.clone(),
+                subject: binding.node_run_id.to_string(),
+            });
+        }
+        let event = TeamEvent {
+            event_id: crate::ids::EventId::generate(),
+            team_session_id: state.team_session_id.clone(),
+            sequence: state.next_sequence,
+            kind: TeamEventKind::AgentAttached,
+            occurred_at: Utc::now(),
+            graph_name: state.graph.name.clone(),
+            graph_version: state.graph.version.clone(),
+            graph_hash: state.graph_hash.clone(),
+            node_id: Some(binding.node_id.clone()),
+            node_run_id: Some(binding.node_run_id.clone()),
+            attempt: state.current_node_run.as_ref().map(|run| run.attempt),
+            agent_thread_id: Some(agent_thread_id),
+            role: Some(binding.role.clone()),
+            payload: TeamEventPayload::AgentAttached {
+                role: binding.role.clone(),
+                backend_fallback: backend_fallback.then_some(true),
+                backend,
+                harness,
+                model,
+                delegation_message,
+            },
+        };
+        self.persist_committed_event(state, event).await?;
+        on_persisted(&binding);
+        self.flush_committed_outbox().await?;
+        drop(teams);
+        self.refresh_surface().await;
         Ok(binding)
+    }
+
+    /// 以後の outbox publish 先を差し替える。
+    pub fn replace_event_sink(&self, sink: impl TeamEventSink + 'static) {
+        *self
+            .sink
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(sink);
     }
 
     pub async fn record_agent_terminal(
@@ -1146,8 +1173,13 @@ impl TeamControl {
         if pending.is_empty() {
             return Ok(());
         }
+        let sink = self
+            .sink
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         for chunk in pending.chunks(crate::TEAM_EVENTS_MAX_BATCH) {
-            self.sink.publish(chunk.to_vec()).await?;
+            sink.publish(chunk.to_vec()).await?;
             let ids = chunk.iter().map(|event| event.event_id.clone()).collect();
             self.store.mark_outbox_sent(ids).await?;
         }
@@ -1232,7 +1264,7 @@ impl TeamControl {
         Ok(Some(view))
     }
 
-    async fn commit(
+    async fn persist_committed_event(
         &self,
         state: &mut TeamSessionState,
         event: TeamEvent,
@@ -1247,10 +1279,23 @@ impl TeamControl {
             .persist_event(next.clone(), event.clone())
             .await?;
         *state = next;
+        Ok(())
+    }
+
+    async fn flush_committed_outbox(&self) -> TeamRuntimeResult<()> {
         match self.flush_outbox().await {
             Ok(()) | Err(TeamRuntimeError::Sink(_)) => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    async fn commit(
+        &self,
+        state: &mut TeamSessionState,
+        event: TeamEvent,
+    ) -> TeamRuntimeResult<()> {
+        self.persist_committed_event(state, event).await?;
+        self.flush_committed_outbox().await
     }
 
     async fn refresh_surface(&self) {

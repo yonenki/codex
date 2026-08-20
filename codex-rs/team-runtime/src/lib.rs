@@ -42,6 +42,7 @@ pub use ids::TeamSessionId;
 pub use reducer::reduce;
 pub use sink::EnvTeamEventSink;
 pub use sink::FailingSink;
+pub use sink::HoldNextPublishSink;
 pub use sink::HttpTeamEventSink;
 pub use sink::RecordingSink;
 pub use sink::TeamEventSink;

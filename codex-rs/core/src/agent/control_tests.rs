@@ -6400,6 +6400,177 @@ async fn acp_spawn_cancel_after_attach_records_one_interrupted_terminal() {
     );
 }
 
+fn hold_next_team_event_publish(
+    harness: &AgentControlHarness,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let sink = codex_team_runtime::HoldNextPublishSink::default();
+    let (release, entered) = sink.hold_next();
+    harness.control.team().replace_event_sink(sink);
+    (release, entered)
+}
+
+#[tokio::test]
+async fn native_spawn_cancel_during_attach_publish_records_one_interrupted_terminal() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = hold_next_team_event_publish(&harness);
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should block on attach publish")
+        .expect("attach publish hold entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must keep the cancel outcome");
+    drop(hold);
+
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    harness
+        .control
+        .team()
+        .record_agent_terminal(&agent_thread_id, "errored")
+        .await
+        .expect("duplicate terminal is ignored");
+    assert_eq!(
+        terminal_statuses(&load_team_events(&harness, &started.team_session_id).await),
+        ["interrupted"]
+    );
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn acp_spawn_cancel_during_attach_publish_records_one_interrupted_terminal() {
+    let harness = acp_spawn_harness().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = hold_next_team_event_publish(&harness);
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_external_agent_with_communication(
+                config,
+                crate::agent::role::ExternalAgentBackend {
+                    harness: "cursor".into(),
+                    model: Some("cursor-model".into()),
+                    effort: None,
+                },
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker_acp").expect("path"),
+                    Vec::new(),
+                    "ACP delegation".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                thread_spawn_source(parent_thread_id, "worker", "/root/worker_acp"),
+                None,
+                Some(pending),
+                |_| async {},
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("ACP spawn should block on attach publish")
+        .expect("attach publish hold entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled ACP spawn should not wait indefinitely");
+    assert!(
+        join.is_err(),
+        "ACP spawn future must keep the cancel outcome"
+    );
+    drop(hold);
+
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    let thread_id = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if !harness.control.is_external_agent(thread_id) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled ACP agent must be removed");
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn successful_native_team_spawn_does_not_emit_premature_terminal() {
     let harness = AgentControlHarness::new().await;

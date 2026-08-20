@@ -1091,3 +1091,190 @@ async fn sqlite_reopen_restores_authority_before_recording_first_terminal() {
         .collect();
     assert_eq!(terminals.len(), 1);
 }
+
+struct PersistGateStore {
+    inner: crate::MemoryTeamStore,
+    fail_events: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PersistGateStore {
+    fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let fail_events = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self {
+                inner: crate::MemoryTeamStore::default(),
+                fail_events: std::sync::Arc::clone(&fail_events),
+            },
+            fail_events,
+        )
+    }
+}
+
+impl crate::TeamStore for PersistGateStore {
+    async fn persist_event(
+        &self,
+        state: &crate::TeamSessionState,
+        event: &crate::TeamEvent,
+    ) -> crate::TeamRuntimeResult<()> {
+        if self.fail_events.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(TeamRuntimeError::Store(
+                "forced attach persist failure".to_string(),
+            ));
+        }
+        crate::TeamStore::persist_event(&self.inner, state, event).await
+    }
+
+    async fn load_teams(&self) -> crate::TeamRuntimeResult<Vec<crate::TeamSessionState>> {
+        crate::TeamStore::load_teams(&self.inner).await
+    }
+
+    async fn load_events(
+        &self,
+        team_session_id: &TeamSessionId,
+    ) -> crate::TeamRuntimeResult<Vec<crate::TeamEvent>> {
+        crate::TeamStore::load_events(&self.inner, team_session_id).await
+    }
+
+    async fn pending_outbox(&self) -> crate::TeamRuntimeResult<Vec<crate::TeamEvent>> {
+        crate::TeamStore::pending_outbox(&self.inner).await
+    }
+
+    async fn mark_outbox_sent(
+        &self,
+        event_ids: &[crate::ids::EventId],
+    ) -> crate::TeamRuntimeResult<()> {
+        crate::TeamStore::mark_outbox_sent(&self.inner, event_ids).await
+    }
+
+    async fn persist_binding(
+        &self,
+        binding: &crate::TeamAgentBinding,
+    ) -> crate::TeamRuntimeResult<()> {
+        crate::TeamStore::persist_binding(&self.inner, binding).await
+    }
+
+    async fn load_bindings(&self) -> crate::TeamRuntimeResult<Vec<crate::TeamAgentBinding>> {
+        crate::TeamStore::load_bindings(&self.inner).await
+    }
+}
+
+#[tokio::test]
+async fn bind_invokes_persist_callback_before_outbox_publish() {
+    let control = std::sync::Arc::new(TeamControl::with_memory_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        crate::RecordingSink::default(),
+    ));
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+
+    let sink = crate::HoldNextPublishSink::default();
+    let (release, entered) = sink.hold_next();
+    control.replace_event_sink(sink);
+    let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bind_control = std::sync::Arc::clone(&control);
+    let persisted_flag = std::sync::Arc::clone(&persisted);
+    let task = tokio::spawn(async move {
+        bind_control
+            .bind_agent_before_start_on_persist("agent-a", pending, |_| {
+                persisted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .expect("publish should wait after persist")
+        .expect("hold entered");
+    assert!(
+        persisted.load(std::sync::atomic::Ordering::SeqCst),
+        "owner arm must observe persist success before outbox publish"
+    );
+    drop(release);
+    task.await
+        .expect("bind task")
+        .expect("bind should complete after publish");
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status after bind");
+    assert_eq!(status.agents.len(), 1);
+}
+
+#[tokio::test]
+async fn attach_persist_failure_does_not_record_terminal_or_invoke_callback() {
+    let (store, fail_events) = PersistGateStore::new();
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_store(TeamGraphCatalog::new([sample_graph()]), store, sink.clone());
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+
+    fail_events.store(true, std::sync::atomic::Ordering::SeqCst);
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let called_flag = std::sync::Arc::clone(&called);
+    let error = control
+        .bind_agent_before_start_on_persist("unpersisted-agent", pending, |_| {
+            called_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .expect_err("attach persist failure");
+    assert!(matches!(error, TeamRuntimeError::Store(_)));
+    assert!(
+        !called.load(std::sync::atomic::Ordering::SeqCst),
+        "persist failure must not arm terminal ownership"
+    );
+    control
+        .record_agent_terminal("unpersisted-agent", "interrupted")
+        .await
+        .expect("terminal without attach is ignored");
+    assert!(
+        sink.envelopes()
+            .into_iter()
+            .all(|event| event.kind != "agent_attached"
+                && event.kind != "agent_completed"
+                && event.kind != "agent_interrupted")
+    );
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status");
+    assert!(status.agents.is_empty());
+}

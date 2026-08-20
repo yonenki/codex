@@ -1,4 +1,4 @@
-#[cfg(test)]
+use super::attach_to_start::AttachToStartOwner;
 use super::attach_to_start::abort_attach_to_start;
 use super::attach_to_start::settle_attach_to_start;
 use super::residency::is_v2_resident_session_source;
@@ -14,6 +14,7 @@ use crate::exec_env::create_env;
 use crate::exec_env::inject_session_id_env;
 use crate::session::multi_agents::resolve_usage_hints;
 use codex_extension_api::ExtensionDataInit;
+use std::sync::Arc;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
 
@@ -366,16 +367,8 @@ impl AgentControl {
                     model: backend_identity.1,
                 });
             }
-            if let Err(err) = self
-                .team
-                .bind_agent_before_start(agent_id.to_string(), pending)
-                .await
-            {
-                // attach できなければ未追跡の ACP 実行体を残さない。
-                self.external_agents.remove(agent_id);
-                return Err(CodexErr::InvalidRequest(err.to_string()));
-            }
-            attach_to_start = Some(self.arm_attach_to_start(agent_id, true));
+            attach_to_start =
+                Box::pin(self.bind_team_agent_for_start(agent_id, pending, true)).await?;
         }
         #[cfg(test)]
         if let Err(error) = self.apply_attach_to_start_test_probe().await {
@@ -550,6 +543,34 @@ impl AgentControl {
                     return Ok(());
                 }
                 Err(err)
+            }
+        }
+    }
+
+    async fn bind_team_agent_for_start(
+        &self,
+        agent_thread_id: ThreadId,
+        pending: codex_team_runtime::PendingTeamBinding,
+        cleanup_external: bool,
+    ) -> CodexResult<Option<AttachToStartOwner>> {
+        let mut owner = None;
+        let team = Arc::clone(&self.team);
+        let bind_result = Box::pin(team.bind_agent_before_start_on_persist(
+            agent_thread_id.to_string(),
+            pending,
+            |_| {
+                owner = Some(self.arm_attach_to_start(agent_thread_id, cleanup_external));
+            },
+        ))
+        .await;
+        match bind_result {
+            Ok(_) => Ok(owner),
+            Err(err) => {
+                if cleanup_external {
+                    // persist 前失敗では owner が無いため、ここで ACP 実行体を外す。
+                    self.external_agents.remove(agent_thread_id);
+                }
+                Err(abort_attach_to_start(owner, CodexErr::InvalidRequest(err.to_string())).await)
             }
         }
     }
@@ -735,11 +756,9 @@ impl AgentControl {
                     model: new_thread.thread.config_snapshot().await.model,
                 });
             }
-            self.team
-                .bind_agent_before_start(new_thread.thread_id.to_string(), pending)
-                .await
-                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
-            attach_to_start = Some(self.arm_attach_to_start(new_thread.thread_id, false));
+            attach_to_start =
+                Box::pin(self.bind_team_agent_for_start(new_thread.thread_id, pending, false))
+                    .await?;
         }
 
         #[cfg(test)]

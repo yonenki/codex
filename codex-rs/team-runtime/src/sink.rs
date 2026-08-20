@@ -82,6 +82,57 @@ impl TeamEventSink for FailingSink {
     }
 }
 
+/// 次の publish を保留する。attach 永続化後の同期 outbox 待ちを再現する。
+#[derive(Default)]
+pub struct HoldNextPublishSink {
+    hold: Mutex<HoldNextPublish>,
+}
+
+#[derive(Default)]
+struct HoldNextPublish {
+    release: Option<tokio::sync::oneshot::Receiver<()>>,
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl HoldNextPublishSink {
+    pub fn hold_next(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        *self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HoldNextPublish {
+            release: Some(release_rx),
+            entered: Some(entered_tx),
+        };
+        (release_tx, entered_rx)
+    }
+}
+
+impl TeamEventSink for HoldNextPublishSink {
+    async fn publish(&self, _events: &[TeamEvent]) -> TeamRuntimeResult<()> {
+        let (release, entered) = {
+            let mut hold = self
+                .hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (hold.release.take(), hold.entered.take())
+        };
+        if let Some(entered) = entered {
+            let _ = entered.send(());
+        }
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        Ok(())
+    }
+}
+
 pub struct HttpTeamEventSink {
     client: reqwest::Client,
     server_url: String,

@@ -1,6 +1,7 @@
 use super::AgentControl;
 use super::external::ExternalAgentManager;
 use codex_protocol::ThreadId;
+use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -8,11 +9,9 @@ use std::sync::atomic::Ordering;
 use tokio::sync::oneshot;
 
 #[cfg(test)]
-use codex_protocol::error::CodexErr;
-#[cfg(test)]
 use std::sync::Mutex;
 
-/// bind 成功後から初回入力または start hook 成功までの Team 終端所有権。
+/// agent_attached の永続 commit 後から初回入力または start hook 成功までの Team 終端所有権。
 /// 解除せずに破棄されたときは interrupted として終端する。
 pub(super) struct AttachToStartOwner {
     team: Arc<codex_team_runtime::TeamControl>,
@@ -112,7 +111,6 @@ pub(super) async fn settle_attach_to_start<T>(
     }
 }
 
-#[cfg(test)]
 pub(super) async fn abort_attach_to_start(
     owner: Option<AttachToStartOwner>,
     error: CodexErr,
