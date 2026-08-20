@@ -63,6 +63,7 @@ pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
 use self::residency::V2Residency;
 
+mod attach_to_start;
 mod execution;
 mod external;
 mod legacy;
@@ -135,6 +136,8 @@ pub(crate) struct AgentControl {
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
     rollout_budget: Arc<RolloutBudget>,
     team: Arc<codex_team_runtime::TeamControl>,
+    #[cfg(test)]
+    attach_to_start_test: Arc<attach_to_start::AttachToStartTestControl>,
 }
 
 impl Default for AgentControl {
@@ -193,6 +196,8 @@ impl AgentControl {
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
             team,
+            #[cfg(test)]
+            attach_to_start_test: Arc::default(),
         };
         if let Some(rollout_budget) = rollout_budget {
             control.rollout_budget.configure(rollout_budget);

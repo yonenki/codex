@@ -855,6 +855,16 @@ impl TeamControl {
         let Some(binding) = self.binding_for(agent_thread_id).await else {
             return Ok(());
         };
+        self.ensure_restored().await?;
+        {
+            let teams = self.teams.lock().await;
+            let already_terminal = !teams
+                .get(&binding.team_session_id)
+                .is_some_and(|state| state.agents.contains_key(agent_thread_id));
+            if already_terminal {
+                return Ok(());
+            }
+        }
         let reported = self
             .tool_reporting_agents
             .lock()
@@ -876,8 +886,17 @@ impl TeamControl {
         } else {
             TeamEventKind::AgentCompleted
         };
-        self.mutate_without_cas(binding.team_session_id, |state| {
-            Ok(TeamEvent {
+        let node_id = binding.node_id.clone();
+        let node_run_id = binding.node_run_id.clone();
+        let role = binding.role.clone();
+        let bound_agent_thread_id = binding.agent_thread_id.clone();
+        let status = status.to_string();
+        // 活性エージェント状態を同一 mutation で見て、終端イベントを一度だけ積む。
+        self.mutate_without_cas_optional(binding.team_session_id, move |state| {
+            if !state.agents.contains_key(&bound_agent_thread_id) {
+                return Ok(None);
+            }
+            Ok(Some(TeamEvent {
                 event_id: crate::ids::EventId::generate(),
                 team_session_id: state.team_session_id.clone(),
                 sequence: state.next_sequence,
@@ -886,15 +905,13 @@ impl TeamControl {
                 graph_name: state.graph.name.clone(),
                 graph_version: state.graph.version.clone(),
                 graph_hash: state.graph_hash.clone(),
-                node_id: Some(binding.node_id.clone()),
-                node_run_id: Some(binding.node_run_id.clone()),
+                node_id: Some(node_id),
+                node_run_id: Some(node_run_id),
                 attempt: None,
-                agent_thread_id: Some(binding.agent_thread_id.clone()),
-                role: Some(binding.role.clone()),
-                payload: TeamEventPayload::AgentTerminal {
-                    status: status.to_string(),
-                },
-            })
+                agent_thread_id: Some(bound_agent_thread_id.clone()),
+                role: Some(role),
+                payload: TeamEventPayload::AgentTerminal { status },
+            }))
         })
         .await?;
         Ok(())
@@ -1191,17 +1208,29 @@ impl TeamControl {
         team_session_id: TeamSessionId,
         build: impl FnOnce(&mut TeamSessionState) -> TeamRuntimeResult<TeamEvent>,
     ) -> TeamRuntimeResult<TeamView> {
+        self.mutate_without_cas_optional(team_session_id, |state| build(state).map(Some))
+            .await?
+            .ok_or_else(|| TeamRuntimeError::invalid("expected a Team event"))
+    }
+
+    async fn mutate_without_cas_optional(
+        &self,
+        team_session_id: TeamSessionId,
+        build: impl FnOnce(&mut TeamSessionState) -> TeamRuntimeResult<Option<TeamEvent>>,
+    ) -> TeamRuntimeResult<Option<TeamView>> {
         self.ensure_restored().await?;
         let mut teams = self.teams.lock().await;
         let state = teams
             .get_mut(&team_session_id)
             .ok_or_else(|| TeamRuntimeError::TeamNotFound(team_session_id.clone()))?;
-        let event = build(state)?;
+        let Some(event) = build(state)? else {
+            return Ok(None);
+        };
         self.commit(state, event).await?;
         let view = view_from_state(state);
         drop(teams);
         self.refresh_surface().await;
-        Ok(view)
+        Ok(Some(view))
     }
 
     async fn commit(

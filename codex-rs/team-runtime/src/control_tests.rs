@@ -939,3 +939,147 @@ async fn transition_copies_graph_metric_effects_and_ignores_caller_injection() {
         "tool caller cannot inject metric_effects"
     );
 }
+
+async fn bind_sample_worker(control: &TeamControl) -> crate::TeamView {
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    control
+        .bind_agent_before_start("agent-a", pending)
+        .await
+        .expect("bind");
+    control
+        .status(&started.team_session_id)
+        .await
+        .expect("status")
+}
+
+fn terminal_statuses(sink: &crate::RecordingSink) -> Vec<String> {
+    sink.envelopes()
+        .into_iter()
+        .filter(|envelope| {
+            envelope.kind == "agent_completed" || envelope.kind == "agent_interrupted"
+        })
+        .map(|envelope| {
+            envelope.payload["status"]
+                .as_str()
+                .expect("terminal status")
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn record_agent_terminal_is_idempotent_against_active_agent_state() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = bind_sample_worker(&control).await;
+    assert_eq!(started.agents.len(), 1);
+
+    control
+        .record_agent_terminal("agent-a", "errored")
+        .await
+        .expect("first terminal");
+    control
+        .record_agent_terminal("agent-a", "completed")
+        .await
+        .expect("duplicate completed");
+    control
+        .record_agent_terminal("agent-a", "interrupted")
+        .await
+        .expect("duplicate interrupted");
+
+    assert_eq!(terminal_statuses(&sink), vec!["errored".to_string()]);
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status after terminal");
+    assert!(status.agents.is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_record_agent_terminal_appends_at_most_one_event() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = bind_sample_worker(&control).await;
+
+    let (first, second, third) = tokio::join!(
+        control.record_agent_terminal("agent-a", "completed"),
+        control.record_agent_terminal("agent-a", "errored"),
+        control.record_agent_terminal("agent-a", "interrupted"),
+    );
+    first.expect("first");
+    second.expect("second");
+    third.expect("third");
+
+    assert_eq!(terminal_statuses(&sink).len(), 1);
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status after concurrent terminal");
+    assert!(status.agents.is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_reopen_has_no_active_agent_after_pre_start_terminal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("terminal.sqlite");
+    let store = crate::SqliteTeamStore::open(&path).await.expect("open");
+    let control = TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        store,
+        crate::RecordingSink::default(),
+    );
+    let started = bind_sample_worker(&control).await;
+    control
+        .record_agent_terminal("agent-a", "interrupted")
+        .await
+        .expect("terminal");
+    drop(control);
+
+    let restored_store = crate::SqliteTeamStore::open(&path).await.expect("reopen");
+    let restored = TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        restored_store,
+        crate::RecordingSink::default(),
+    );
+    restored.restore().await.expect("restore");
+    let status = restored
+        .status(&started.team_session_id)
+        .await
+        .expect("restored status");
+    assert!(status.agents.is_empty());
+    let events = crate::TeamStore::load_events(
+        &crate::SqliteTeamStore::open(&path)
+            .await
+            .expect("events store"),
+        &started.team_session_id,
+    )
+    .await
+    .expect("load events");
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.payload, crate::TeamEventPayload::AgentTerminal { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1);
+}

@@ -1,3 +1,6 @@
+#[cfg(test)]
+use super::attach_to_start::abort_attach_to_start;
+use super::attach_to_start::settle_attach_to_start;
 use super::residency::is_v2_resident_session_source;
 use super::*;
 use crate::agent::role::ExternalAgentBackend;
@@ -355,6 +358,7 @@ impl AgentControl {
                 .await
                 .map(|binding| binding.to_pending())
         };
+        let mut attach_to_start = None;
         if let Some(mut pending) = pending_team_binding {
             if let Some(metadata) = pending.attach_metadata.as_mut() {
                 metadata.identity = Some(codex_team_runtime::AgentBackendIdentity::Acp {
@@ -362,20 +366,32 @@ impl AgentControl {
                     model: backend_identity.1,
                 });
             }
-            self.team
+            if let Err(err) = self
+                .team
                 .bind_agent_before_start(agent_id.to_string(), pending)
                 .await
-                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+            {
+                // attach できなければ未追跡の ACP 実行体を残さない。
+                self.external_agents.remove(agent_id);
+                return Err(CodexErr::InvalidRequest(err.to_string()));
+            }
+            attach_to_start = Some(self.arm_attach_to_start(agent_id, true));
         }
-        if let Err(error) = self
+        #[cfg(test)]
+        if let Err(error) = self.apply_attach_to_start_test_probe().await {
+            let error = abort_attach_to_start(attach_to_start, error).await;
+            self.external_agents.remove(agent_id);
+            return Err(error);
+        }
+        let start_result = self
             .send_external_inter_agent_communication_with_start_hook(
                 agent_id,
                 communication,
                 context,
                 move || on_started(agent_id),
             )
-            .await
-        {
+            .await;
+        if let Err(error) = settle_attach_to_start(attach_to_start, start_result).await {
             self.external_agents.remove(agent_id);
             return Err(error);
         }
@@ -712,6 +728,7 @@ impl AgentControl {
         } else {
             None
         };
+        let mut attach_to_start = None;
         if let Some(mut pending) = pending_team_binding {
             if let Some(metadata) = pending.attach_metadata.as_mut() {
                 metadata.identity = Some(codex_team_runtime::AgentBackendIdentity::Native {
@@ -722,20 +739,25 @@ impl AgentControl {
                 .bind_agent_before_start(new_thread.thread_id.to_string(), pending)
                 .await
                 .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+            attach_to_start = Some(self.arm_attach_to_start(new_thread.thread_id, false));
         }
 
-        match initial_input {
-            SpawnInitialInput::UserInput(input) => {
-                self.send_input(
+        #[cfg(test)]
+        if let Err(error) = self.apply_attach_to_start_test_probe().await {
+            return Err(abort_attach_to_start(attach_to_start, error).await);
+        }
+        let start_result = match initial_input {
+            SpawnInitialInput::UserInput(input) => self
+                .send_input(
                     new_thread.thread_id,
                     input,
                     options.parent_turn_id,
                     options.root_turn_id,
                 )
-                .await?;
-            }
-            SpawnInitialInput::InterAgentCommunication(communication, context) => {
-                self.send_inter_agent_communication_after_capacity_check(
+                .await
+                .map(|_| ()),
+            SpawnInitialInput::InterAgentCommunication(communication, context) => self
+                .send_inter_agent_communication_after_capacity_check(
                     new_thread.thread_id,
                     &state,
                     communication,
@@ -743,9 +765,10 @@ impl AgentControl {
                     options.parent_turn_id,
                     options.root_turn_id,
                 )
-                .await?;
-            }
-        }
+                .await
+                .map(|_| ()),
+        };
+        settle_attach_to_start(attach_to_start, start_result).await?;
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path

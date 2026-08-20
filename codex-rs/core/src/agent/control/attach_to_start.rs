@@ -1,0 +1,198 @@
+use super::AgentControl;
+use super::external::ExternalAgentManager;
+use codex_protocol::ThreadId;
+use codex_protocol::error::Result as CodexResult;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use tokio::sync::oneshot;
+
+#[cfg(test)]
+use codex_protocol::error::CodexErr;
+#[cfg(test)]
+use std::sync::Mutex;
+
+/// bind 成功後から初回入力または start hook 成功までの Team 終端所有権。
+/// 解除せずに破棄されたときは interrupted として終端する。
+pub(super) struct AttachToStartOwner {
+    team: Arc<codex_team_runtime::TeamControl>,
+    agent_thread_id: String,
+    disarmed: Arc<AtomicBool>,
+    wakeup: Option<oneshot::Sender<()>>,
+    external: Option<(Arc<ExternalAgentManager>, ThreadId)>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct AttachToStartTestControl {
+    fail_initial_delivery: AtomicBool,
+    hold: Mutex<Option<oneshot::Receiver<()>>>,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl AttachToStartOwner {
+    fn arm(
+        team: Arc<codex_team_runtime::TeamControl>,
+        agent_thread_id: impl Into<String>,
+        external: Option<(Arc<ExternalAgentManager>, ThreadId)>,
+    ) -> Self {
+        let agent_thread_id = agent_thread_id.into();
+        let disarmed = Arc::new(AtomicBool::new(false));
+        let (wakeup, parked) = oneshot::channel();
+        let team_task = Arc::clone(&team);
+        let agent_task = agent_thread_id.clone();
+        let disarmed_task = Arc::clone(&disarmed);
+        let external_task = external.clone();
+        tokio::spawn(async move {
+            let _ = parked.await;
+            if disarmed_task.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some((manager, agent_id)) = external_task {
+                manager.remove(agent_id);
+            }
+            let _ = team_task
+                .record_agent_terminal(&agent_task, "interrupted")
+                .await;
+        });
+        Self {
+            team,
+            agent_thread_id,
+            disarmed,
+            wakeup: Some(wakeup),
+            external,
+        }
+    }
+
+    pub(super) fn disarm(mut self) {
+        self.release(true);
+    }
+
+    pub(super) async fn fail_errored(mut self) {
+        if let Some((manager, agent_id)) = self.external.take() {
+            manager.remove(agent_id);
+        }
+        let _ = self
+            .team
+            .record_agent_terminal(&self.agent_thread_id, "errored")
+            .await;
+        self.release(true);
+    }
+
+    fn release(&mut self, disarmed: bool) {
+        if disarmed {
+            self.disarmed.store(true, Ordering::SeqCst);
+        }
+        let _ = self.wakeup.take();
+    }
+}
+
+impl Drop for AttachToStartOwner {
+    fn drop(&mut self) {
+        self.release(false);
+    }
+}
+
+pub(super) async fn settle_attach_to_start<T>(
+    owner: Option<AttachToStartOwner>,
+    result: CodexResult<T>,
+) -> CodexResult<T> {
+    match owner {
+        Some(owner) => match result {
+            Ok(value) => {
+                owner.disarm();
+                Ok(value)
+            }
+            Err(err) => {
+                owner.fail_errored().await;
+                Err(err)
+            }
+        },
+        None => result,
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn abort_attach_to_start(
+    owner: Option<AttachToStartOwner>,
+    error: CodexErr,
+) -> CodexErr {
+    match settle_attach_to_start::<()>(owner, Err(error)).await {
+        Err(error) => error,
+        Ok(_) => CodexErr::Fatal("attach-to-start failure cannot succeed".to_string()),
+    }
+}
+
+impl AgentControl {
+    pub(super) fn arm_attach_to_start(
+        &self,
+        agent_thread_id: ThreadId,
+        cleanup_external: bool,
+    ) -> AttachToStartOwner {
+        let external =
+            cleanup_external.then(|| (Arc::clone(&self.external_agents), agent_thread_id));
+        AttachToStartOwner::arm(
+            Arc::clone(&self.team),
+            agent_thread_id.to_string(),
+            external,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_spawn_initial_delivery(&self) {
+        self.attach_to_start_test
+            .fail_initial_delivery
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_spawn_after_attach(
+        &self,
+    ) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
+        let (release_tx, release_rx) = oneshot::channel();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        *self
+            .attach_to_start_test
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release_rx);
+        *self
+            .attach_to_start_test
+            .entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entered_tx);
+        (release_tx, entered_rx)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn apply_attach_to_start_test_probe(&self) -> CodexResult<()> {
+        let hold = self
+            .attach_to_start_test
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let entered = self
+            .attach_to_start_test
+            .entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(entered) = entered {
+            let _ = entered.send(());
+        }
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
+        if self
+            .attach_to_start_test
+            .fail_initial_delivery
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(CodexErr::InvalidRequest(
+                "forced spawn initial delivery failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
