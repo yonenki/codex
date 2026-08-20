@@ -354,6 +354,7 @@ pub(crate) struct ThreadManagerState {
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
     team: Arc<codex_team_runtime::TeamControl>,
+    team_orphan_recovery: tokio::sync::OnceCell<()>,
 }
 
 pub fn build_models_manager(
@@ -510,6 +511,7 @@ impl ThreadManager {
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
                 team,
+                team_orphan_recovery: tokio::sync::OnceCell::const_new(),
             }),
             _test_codex_home_guard: None,
         }
@@ -660,6 +662,7 @@ impl ThreadManager {
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
                 team: persistent_team_control(&codex_home),
+                team_orphan_recovery: tokio::sync::OnceCell::const_new(),
             }),
             _test_codex_home_guard: None,
         }
@@ -1118,6 +1121,7 @@ impl ThreadManager {
     /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
     /// remain tracked so callers can retry or inspect them later.
     pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
+        let shutdown_started = tokio::time::Instant::now();
         let threads = {
             let threads = self.state.threads.read().await;
             threads
@@ -1162,6 +1166,19 @@ impl ThreadManager {
         report
             .timed_out
             .sort_by_key(std::string::ToString::to_string);
+        let remaining = timeout.saturating_sub(shutdown_started.elapsed());
+        let terminal_retries = self
+            .state
+            .team
+            .drain_terminal_retries_bounded(remaining)
+            .await;
+        if terminal_retries.pending_count != 0 {
+            warn!(
+                pending = terminal_retries.pending_count,
+                workers = terminal_retries.worker_count,
+                "terminal persistence retries remain durable after bounded runtime shutdown"
+            );
+        }
         report
     }
 
@@ -1779,6 +1796,22 @@ impl ThreadManagerState {
 
     /// Spawn a new thread with optional history and register it with the manager.
     async fn spawn_thread(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        self.team_orphan_recovery
+            .get_or_init(|| async {
+                match self.team.recover_orphaned_active_agents().await {
+                    Ok(recovered) if recovered != 0 => {
+                        warn!(
+                            recovered,
+                            "recovered orphaned active Team agents at startup"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(%error, "failed to recover orphaned active Team agents at startup");
+                    }
+                }
+            })
+            .await;
         let ThreadSpawnRequest {
             options,
             auth_manager,

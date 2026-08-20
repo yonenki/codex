@@ -1,3 +1,4 @@
+use crate::AgentTerminalStatus;
 use crate::StartNodeCommand;
 use crate::StartTeamCommand;
 use crate::TeamControl;
@@ -941,6 +942,10 @@ async fn transition_copies_graph_metric_effects_and_ignores_caller_injection() {
 }
 
 async fn bind_sample_worker(control: &TeamControl) -> crate::TeamView {
+    bind_named_sample_worker(control, "agent-a").await
+}
+
+async fn bind_named_sample_worker(control: &TeamControl, agent_thread_id: &str) -> crate::TeamView {
     let started = control
         .start_team(StartTeamCommand {
             graph_name: "sample".into(),
@@ -963,13 +968,23 @@ async fn bind_sample_worker(control: &TeamControl) -> crate::TeamView {
         .await
         .expect("pending");
     control
-        .bind_agent_before_start("agent-a", pending)
+        .bind_agent_before_start(agent_thread_id, pending)
         .await
         .expect("bind");
     control
         .status(&started.team_session_id)
         .await
         .expect("status")
+}
+
+async fn wait_for_terminal_retry_drain(control: &TeamControl) {
+    assert_eq!(
+        control
+            .drain_terminal_retries_bounded(std::time::Duration::from_secs(3))
+            .await,
+        crate::TerminalRetrySnapshot::default(),
+        "terminal retry queue should drain"
+    );
 }
 
 fn terminal_statuses(sink: &crate::RecordingSink) -> Vec<String> {
@@ -1038,6 +1053,139 @@ async fn concurrent_record_agent_terminal_appends_at_most_one_event() {
         .await
         .expect("status after concurrent terminal");
     assert!(status.agents.is_empty());
+}
+
+#[tokio::test]
+async fn managed_terminal_retry_deduplicates_by_team_agent_and_drains_with_one_worker() {
+    let sink = crate::RecordingSink::default();
+    let control = std::sync::Arc::new(TeamControl::with_memory_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        sink.clone(),
+    ));
+    let first = bind_named_sample_worker(&control, "agent-a").await;
+    let second = bind_named_sample_worker(&control, "agent-b").await;
+    control.fail_terminal_persist_times_for_test(100);
+
+    let (first_request, duplicate_request, isolated_request) = tokio::join!(
+        control.record_agent_terminal_managed("agent-a", AgentTerminalStatus::Interrupted),
+        control.record_agent_terminal_managed("agent-a", AgentTerminalStatus::Errored),
+        control.record_agent_terminal_managed("agent-b", AgentTerminalStatus::Interrupted),
+    );
+    assert!(matches!(
+        first_request.expect("first request"),
+        crate::TerminalPersistenceOutcome::RetryPending { .. }
+    ));
+    assert!(matches!(
+        duplicate_request.expect("duplicate request"),
+        crate::TerminalPersistenceOutcome::RetryPending { .. }
+    ));
+    assert!(matches!(
+        isolated_request.expect("isolated request"),
+        crate::TerminalPersistenceOutcome::RetryPending { .. }
+    ));
+    assert_eq!(
+        control.terminal_retry_snapshot(),
+        crate::TerminalRetrySnapshot {
+            pending_count: 2,
+            worker_count: 1,
+        }
+    );
+    assert_eq!(
+        control
+            .drain_terminal_retries_bounded(std::time::Duration::from_millis(50))
+            .await,
+        crate::TerminalRetrySnapshot {
+            pending_count: 2,
+            worker_count: 1,
+        },
+        "bounded shutdown drain must report rather than discard persistent failures"
+    );
+
+    control.fail_terminal_persist_times_for_test(0);
+    wait_for_terminal_retry_drain(&control).await;
+    assert_eq!(control.terminal_retry_snapshot().pending_count, 0);
+    assert!(
+        control
+            .status(&first.team_session_id)
+            .await
+            .expect("first status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        control
+            .status(&second.team_session_id)
+            .await
+            .expect("second status")
+            .agents
+            .is_empty()
+    );
+    assert_eq!(terminal_statuses(&sink).len(), 2);
+}
+
+#[tokio::test]
+async fn startup_recovery_terminalizes_durable_orphan_once_without_scanning_new_live_agent() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("terminal-recovery.sqlite");
+    let initial = std::sync::Arc::new(TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        crate::SqliteTeamStore::open(&path).await.expect("store"),
+        crate::RecordingSink::default(),
+    ));
+    let orphaned = bind_named_sample_worker(&initial, "orphaned-agent").await;
+    initial.fail_terminal_persist_times_for_test(100);
+    let outcome = initial
+        .record_agent_terminal_managed("orphaned-agent", AgentTerminalStatus::Interrupted)
+        .await
+        .expect("managed terminal");
+    assert!(matches!(
+        outcome,
+        crate::TerminalPersistenceOutcome::RetryPending { .. }
+    ));
+    assert_eq!(initial.terminal_retry_snapshot().pending_count, 1);
+    drop(initial);
+
+    let sink = crate::RecordingSink::default();
+    let reopened = std::sync::Arc::new(TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        crate::SqliteTeamStore::open(&path).await.expect("reopen"),
+        sink.clone(),
+    ));
+    assert_eq!(
+        reopened
+            .recover_orphaned_active_agents()
+            .await
+            .expect("startup recovery"),
+        1
+    );
+    assert_eq!(
+        reopened
+            .recover_orphaned_active_agents()
+            .await
+            .expect("idempotent startup recovery"),
+        0
+    );
+    assert!(
+        reopened
+            .status(&orphaned.team_session_id)
+            .await
+            .expect("orphaned status")
+            .agents
+            .is_empty()
+    );
+    let live = bind_named_sample_worker(&reopened, "new-live-agent").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        reopened
+            .status(&live.team_session_id)
+            .await
+            .expect("live status")
+            .agents
+            .len(),
+        1,
+        "startup recovery is a one-shot scan, not a live-agent reaper"
+    );
+    assert_eq!(terminal_statuses(&sink), ["interrupted"]);
 }
 
 #[tokio::test]

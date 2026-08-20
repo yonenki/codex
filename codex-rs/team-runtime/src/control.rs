@@ -29,7 +29,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 pub struct TeamControl {
@@ -41,10 +44,61 @@ pub struct TeamControl {
     surface: std::sync::RwLock<SurfaceSnapshot>,
     tool_reporting_agents: Mutex<std::collections::HashSet<String>>,
     restored: tokio::sync::OnceCell<()>,
+    terminal_retries: Arc<TerminalRetryState>,
     #[cfg(any(test, feature = "test-support"))]
     bind_persist_hold: BindPersistHold,
     #[cfg(any(test, feature = "test-support"))]
-    fail_terminal_persist: AtomicBool,
+    fail_terminal_persist: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTerminalStatus {
+    Completed,
+    Errored,
+    Interrupted,
+}
+
+impl AgentTerminalStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Errored => "errored",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalPersistenceOutcome {
+    Persisted,
+    RetryPending { first_error: String },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalRetrySnapshot {
+    pub pending_count: usize,
+    pub worker_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalRetryKey {
+    team_session_id: String,
+    agent_thread_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTerminalRetry {
+    status: AgentTerminalStatus,
+    attempts: u32,
+    next_attempt: Instant,
+}
+
+#[derive(Default)]
+struct TerminalRetryState {
+    pending: std::sync::Mutex<BTreeMap<TerminalRetryKey, PendingTerminalRetry>>,
+    worker_running: AtomicBool,
+    worker_count: AtomicUsize,
+    wake: tokio::sync::Notify,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -328,10 +382,44 @@ impl TeamControl {
             surface: std::sync::RwLock::new(SurfaceSnapshot::default()),
             tool_reporting_agents: Mutex::new(std::collections::HashSet::new()),
             restored: tokio::sync::OnceCell::const_new(),
+            terminal_retries: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             bind_persist_hold: BindPersistHold::default(),
             #[cfg(any(test, feature = "test-support"))]
-            fail_terminal_persist: AtomicBool::new(false),
+            fail_terminal_persist: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn terminal_retry_snapshot(&self) -> TerminalRetrySnapshot {
+        let pending_count = self
+            .terminal_retries
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        TerminalRetrySnapshot {
+            pending_count,
+            worker_count: self.terminal_retries.worker_count.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Give the managed owner a bounded lifecycle window to drain without discarding pending
+    /// durable intent. A non-empty result remains observable and is recovered on next startup.
+    pub async fn drain_terminal_retries_bounded(&self, timeout: Duration) -> TerminalRetrySnapshot {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let snapshot = self.terminal_retry_snapshot();
+            if snapshot.pending_count == 0 && snapshot.worker_count == 0 {
+                return snapshot;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return snapshot;
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline.min(now + Duration::from_millis(10))) => {}
+                () = self.terminal_retries.wake.notified() => {}
+            }
         }
     }
 
@@ -1032,7 +1120,12 @@ impl TeamControl {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn fail_next_terminal_persist_for_test(&self) {
-        self.fail_terminal_persist.store(true, Ordering::SeqCst);
+        self.fail_terminal_persist.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_terminal_persist_times_for_test(&self, failures: usize) {
+        self.fail_terminal_persist.store(failures, Ordering::SeqCst);
     }
 
     async fn await_bind_before_attach(&self) {
@@ -1061,17 +1154,75 @@ impl TeamControl {
         let Some(binding) = self.binding_for_checked(agent_thread_id).await? else {
             return Ok(());
         };
+        self.record_agent_terminal_for_binding(binding, status)
+            .await
+    }
+
+    /// Persist a terminal transition or transfer it to the Team-scoped retry authority.
+    /// The retry key includes both Team and agent identity, so repeated cleanup requests share
+    /// one pending transition and one worker.
+    pub async fn record_agent_terminal_managed(
+        self: &Arc<Self>,
+        agent_thread_id: &str,
+        status: AgentTerminalStatus,
+    ) -> TeamRuntimeResult<TerminalPersistenceOutcome> {
+        let Some(binding) = self.binding_for_checked(agent_thread_id).await? else {
+            return Ok(TerminalPersistenceOutcome::Persisted);
+        };
+        match self
+            .record_agent_terminal_for_binding(binding.clone(), status.as_str())
+            .await
+        {
+            Ok(()) => Ok(TerminalPersistenceOutcome::Persisted),
+            Err(error) => {
+                let first_error = error.to_string();
+                self.enqueue_terminal_retry(binding, status);
+                Ok(TerminalPersistenceOutcome::RetryPending { first_error })
+            }
+        }
+    }
+
+    /// Recover process-loss intent before the first runtime is registered in a new manager.
+    /// At this startup boundary every durable active binding is necessarily orphaned.
+    pub async fn recover_orphaned_active_agents(self: &Arc<Self>) -> TeamRuntimeResult<usize> {
+        self.ensure_restored().await?;
+        let active_agent_ids = {
+            let teams = self.teams.lock().await;
+            teams
+                .values()
+                .flat_map(|team| team.agents.keys().cloned())
+                .collect::<Vec<_>>()
+        };
+        for agent_thread_id in &active_agent_ids {
+            let _ = self
+                .record_agent_terminal_managed(agent_thread_id, AgentTerminalStatus::Interrupted)
+                .await?;
+        }
+        Ok(active_agent_ids.len())
+    }
+
+    async fn record_agent_terminal_for_binding(
+        &self,
+        binding: TeamAgentBinding,
+        status: &str,
+    ) -> TeamRuntimeResult<()> {
         {
             let teams = self.teams.lock().await;
             let already_terminal = !teams
                 .get(&binding.team_session_id)
-                .is_some_and(|state| state.agents.contains_key(agent_thread_id));
+                .is_some_and(|state| state.agents.contains_key(&binding.agent_thread_id));
             if already_terminal {
                 return Ok(());
             }
         }
         #[cfg(any(test, feature = "test-support"))]
-        if self.fail_terminal_persist.swap(false, Ordering::SeqCst) {
+        if self
+            .fail_terminal_persist
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
             return Err(TeamRuntimeError::Store(
                 "forced terminal persist failure".to_string(),
             ));
@@ -1080,11 +1231,11 @@ impl TeamControl {
             .tool_reporting_agents
             .lock()
             .await
-            .contains(agent_thread_id);
+            .contains(&binding.agent_thread_id);
         if !reported {
             let _ = self
                 .record_tool_operation(
-                    agent_thread_id,
+                    &binding.agent_thread_id,
                     "acp",
                     "unreported",
                     crate::event::TeamEventKind::ToolCoverageUnreported,
@@ -1126,6 +1277,59 @@ impl TeamControl {
         })
         .await?;
         Ok(())
+    }
+
+    fn enqueue_terminal_retry(
+        self: &Arc<Self>,
+        binding: TeamAgentBinding,
+        status: AgentTerminalStatus,
+    ) {
+        let key = TerminalRetryKey {
+            team_session_id: binding.team_session_id.to_string(),
+            agent_thread_id: binding.agent_thread_id,
+        };
+        let mut pending = self
+            .terminal_retries
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.entry(key).or_insert(PendingTerminalRetry {
+            status,
+            attempts: 0,
+            next_attempt: Instant::now() + Duration::from_millis(10),
+        });
+        drop(pending);
+        self.terminal_retries.wake.notify_one();
+        self.ensure_terminal_retry_worker();
+    }
+
+    fn ensure_terminal_retry_worker(self: &Arc<Self>) {
+        if self
+            .terminal_retries
+            .worker_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.terminal_retries
+                .worker_running
+                .store(false, Ordering::SeqCst);
+            tracing::warn!(
+                pending = self.terminal_retry_snapshot().pending_count,
+                "terminal persistence retry is pending without a Tokio runtime"
+            );
+            return;
+        };
+        self.terminal_retries
+            .worker_count
+            .fetch_add(1, Ordering::SeqCst);
+        let control = Arc::downgrade(self);
+        let retry_state = Arc::clone(&self.terminal_retries);
+        handle.spawn(async move {
+            run_terminal_retry_worker(control, retry_state).await;
+        });
     }
 
     pub async fn record_tool_operation(
@@ -1511,6 +1715,101 @@ impl TeamControl {
             recommended,
             open_team_count: teams.values().filter(|team| team.is_open()).count(),
         };
+    }
+}
+
+async fn run_terminal_retry_worker(
+    control: std::sync::Weak<TeamControl>,
+    retry_state: Arc<TerminalRetryState>,
+) {
+    loop {
+        let next = {
+            let pending = retry_state
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending
+                .iter()
+                .min_by_key(|(_, retry)| retry.next_attempt)
+                .map(|(key, retry)| (key.clone(), retry.clone()))
+        };
+        let Some((key, retry)) = next else {
+            retry_state.worker_running.store(false, Ordering::SeqCst);
+            retry_state.worker_count.fetch_sub(1, Ordering::SeqCst);
+            let pending = retry_state
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.is_empty()
+                || retry_state
+                    .worker_running
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                return;
+            }
+            retry_state.worker_count.fetch_add(1, Ordering::SeqCst);
+            drop(pending);
+            continue;
+        };
+
+        let delay = retry.next_attempt.saturating_duration_since(Instant::now());
+        if !delay.is_zero() {
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = retry_state.wake.notified() => { continue; }
+            }
+        }
+        let Some(control) = control.upgrade() else {
+            return;
+        };
+        let result = control
+            .record_agent_terminal(&key.agent_thread_id, retry.status.as_str())
+            .await;
+        drop(control);
+        let mut pending = retry_state
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match result {
+            Ok(()) => {
+                pending.remove(&key);
+            }
+            Err(error) => {
+                if let Some(current) = pending.get_mut(&key) {
+                    current.attempts = current.attempts.saturating_add(1);
+                    let shift = current.attempts.min(7);
+                    let delay_ms = 10_u64.saturating_mul(1_u64 << shift).min(1_000);
+                    current.next_attempt = Instant::now() + Duration::from_millis(delay_ms);
+                    tracing::debug!(
+                        team_session_id = %key.team_session_id,
+                        agent_thread_id = %key.agent_thread_id,
+                        attempts = current.attempts,
+                        %error,
+                        "managed terminal persistence retry remains pending"
+                    );
+                }
+            }
+        }
+        retry_state.wake.notify_waiters();
+    }
+}
+
+impl Drop for TeamControl {
+    fn drop(&mut self) {
+        let pending = self
+            .terminal_retries
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        if pending != 0 {
+            tracing::warn!(
+                pending,
+                "terminal persistence retry owner dropped; durable active state remains for startup recovery"
+            );
+        }
+        self.terminal_retries.wake.notify_waiters();
     }
 }
 

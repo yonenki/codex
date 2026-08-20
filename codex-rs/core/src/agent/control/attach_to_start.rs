@@ -2,8 +2,10 @@ use super::AgentControl;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_team_runtime::AgentTerminalStatus;
 use codex_team_runtime::BindAttemptHandle;
 use codex_team_runtime::BindAttemptOutcome;
+use codex_team_runtime::TerminalPersistenceOutcome;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -188,7 +190,7 @@ impl AttachToStartOwner {
             .await;
         let terminal = self
             .control
-            .record_attach_terminal(self.agent_thread_id, "errored")
+            .record_attach_terminal(self.agent_thread_id, AgentTerminalStatus::Errored)
             .await;
         AttachCleanupOutcome {
             resource_error,
@@ -271,42 +273,20 @@ impl AgentControl {
     async fn record_attach_terminal(
         &self,
         agent_thread_id: ThreadId,
-        status: &'static str,
+        status: AgentTerminalStatus,
     ) -> TerminalCleanupOutcome {
         match self
-            .team()
-            .record_agent_terminal(&agent_thread_id.to_string(), status)
+            .team_handle()
+            .record_agent_terminal_managed(&agent_thread_id.to_string(), status)
             .await
         {
-            Ok(()) => TerminalCleanupOutcome::Persisted,
-            Err(error) => {
-                let first_error = error.to_string();
-                let control = self.clone();
-                tokio::spawn(async move {
-                    let mut delay = std::time::Duration::from_millis(10);
-                    loop {
-                        tokio::time::sleep(delay).await;
-                        match control
-                            .team()
-                            .record_agent_terminal(&agent_thread_id.to_string(), status)
-                            .await
-                        {
-                            Ok(()) => return,
-                            Err(error) => {
-                                tracing::warn!(
-                                    %agent_thread_id,
-                                    %error,
-                                    "attach-to-start terminal persistence failed; retry remains owned"
-                                );
-                                delay = delay
-                                    .saturating_mul(2)
-                                    .min(std::time::Duration::from_secs(1));
-                            }
-                        }
-                    }
-                });
+            Ok(TerminalPersistenceOutcome::Persisted) => TerminalCleanupOutcome::Persisted,
+            Ok(TerminalPersistenceOutcome::RetryPending { first_error }) => {
                 TerminalCleanupOutcome::RetryOwned { first_error }
             }
+            Err(error) => TerminalCleanupOutcome::RetryOwned {
+                first_error: error.to_string(),
+            },
         }
     }
 
@@ -339,7 +319,7 @@ impl AgentControl {
         };
         if attached {
             let terminal = self
-                .record_attach_terminal(agent_thread_id, "interrupted")
+                .record_attach_terminal(agent_thread_id, AgentTerminalStatus::Interrupted)
                 .await;
             AttachCleanupOutcome {
                 resource_error,
@@ -351,7 +331,7 @@ impl AgentControl {
         if outcome.is_some() && !matches!(outcome, Some(BindAttemptOutcome::Uncommitted)) {
             // settle 報告が失敗でも、正規の terminal mutation で active なら一度記録する。
             let terminal = self
-                .record_attach_terminal(agent_thread_id, "interrupted")
+                .record_attach_terminal(agent_thread_id, AgentTerminalStatus::Interrupted)
                 .await;
             AttachCleanupOutcome {
                 resource_error,
