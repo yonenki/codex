@@ -4785,7 +4785,7 @@ purpose = "Implement the candidate."
 role = "worker"
 prompt = "Implement the approved scope."
 completion = "A candidate exists."
-available_tools = ["spawn_agent", "record_team_result", "transition_team"]
+available_tools = ["spawn_agent", "send_message", "wait", "record_team_result", "transition_team"]
 recommended_tools = ["spawn_agent"]
 [[nodes.transitions]]
 on = "candidate_ready"
@@ -5730,6 +5730,7 @@ async fn registry_routes_team_lifecycle_after_semantic_authority_and_keeps_gener
     );
 
     bind_agent_to_team(&session, &team_a, session.thread_id).await;
+    let same_team_start = sink.envelopes().len();
     dispatch_registry_tool(
         &router,
         Arc::clone(&session),
@@ -5745,12 +5746,75 @@ async fn registry_routes_team_lifecycle_after_semantic_authority_and_keeps_gener
     .await
     .expect("bound Team A send");
     let events = sink.envelopes();
+    assert_eq!(
+        events[same_team_start..]
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "tool_operation_started",
+            "deviation_recorded",
+            "tool_operation_completed",
+        ],
+        "deprecated same-Team dispatch records lifecycle start before deviation and completes after delivery"
+    );
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_a),
+        vec!["same Team".to_string()],
+        "semantic delivery completed between the deviation and terminal lifecycle"
+    );
     let same_team_events = operation_events(&events, "bound-send-a");
     assert_eq!(same_team_events.len(), 2);
     assert!(
         same_team_events
             .iter()
             .all(|event| event.team_session_id == team_a)
+    );
+
+    let same_team_wait_start = sink.envelopes().len();
+    dispatch_registry_tool(
+        &router,
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        codex_tools::ToolName::namespaced("team", ToolCapability::Wait.as_str()),
+        "bound-wait-a",
+        function_payload(json!({
+            "team_session_id": team_a,
+            "target": target_a.to_string(),
+            "timeout_ms": 1,
+            "reason": "same-Team semantic ordering",
+        })),
+    )
+    .await
+    .expect("bound Team A wait");
+    let events = sink.envelopes();
+    assert_eq!(
+        events[same_team_wait_start..]
+            .iter()
+            .map(|event| event.kind.as_str())
+            .filter(|kind| {
+                matches!(
+                    *kind,
+                    "tool_operation_started"
+                        | "deviation_recorded"
+                        | "agent_wait_entered"
+                        | "agent_wait_resolved"
+                        | "tool_operation_completed"
+                        | "tool_operation_failed"
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            "tool_operation_started",
+            "deviation_recorded",
+            "agent_wait_entered",
+            "agent_wait_resolved",
+            "tool_operation_completed",
+        ],
+        "deprecated same-Team dispatch records semantic events between deviation and terminal"
     );
 
     let before_cross = sink.envelopes();
@@ -5869,6 +5933,118 @@ async fn registry_routes_team_lifecycle_after_semantic_authority_and_keeps_gener
             .iter()
             .all(|event| event.team_session_id == team_a)
     );
+}
+
+#[tokio::test]
+async fn registry_cancellation_terminalizes_handler_owned_team_tool_after_semantic_mutation() {
+    use codex_team_graph::ToolCapability;
+
+    let (session, turn, sink) = prepare_registry_v2_session().await;
+    let team = start_sample_team(&session).await;
+    let target = register_external_target(&session, "registry_cancel_target");
+    bind_agent_to_team(&session, &team, target).await;
+    bind_agent_to_team(&session, &team, session.thread_id).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let (router, step_context) = build_registry_router(session.as_ref(), Arc::clone(&turn));
+    let step_context = step_context.with_tool_router_for_test(Arc::new(router));
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        Arc::clone(&session),
+        step_context,
+        Arc::new(Mutex::new(TurnDiffTracker::default())),
+    );
+    let cancellation = CancellationToken::new();
+    let call_id = "cancel-team-wait";
+    let event_start = sink.envelopes().len();
+    let mut response_task = tokio::spawn(runtime.handle_tool_call(
+        crate::tools::router::ToolCall {
+            tool_name: codex_tools::ToolName::namespaced("team", ToolCapability::Wait.as_str()),
+            call_id: call_id.to_string(),
+            payload: function_payload(json!({
+                "team_session_id": team,
+                "target": target.to_string(),
+                "timeout_ms": 30_000,
+                "reason": "cancellation boundary",
+            })),
+            encrypted_function_args: None,
+        },
+        cancellation.clone(),
+    ));
+
+    let entered_wait = timeout(Duration::from_secs(2), async {
+        loop {
+            if sink
+                .envelopes()
+                .iter()
+                .skip(event_start)
+                .any(|event| event.kind == "agent_wait_entered")
+            {
+                break true;
+            }
+            if response_task.is_finished() {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if matches!(entered_wait, Ok(false)) {
+        panic!(
+            "Team wait finished before its semantic mutation: {:?}",
+            (&mut response_task).await
+        );
+    }
+    assert!(
+        matches!(entered_wait, Ok(true)),
+        "real Team wait should reach its semantic mutation; events: {:?}",
+        sink.envelopes()
+            .iter()
+            .skip(event_start)
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>()
+    );
+    cancellation.cancel();
+
+    let response = timeout(Duration::from_secs(2), response_task)
+        .await
+        .expect("cancelled registry dispatch should finish")
+        .expect("registry task should join")
+        .expect("cancellation returns a model-visible abort response");
+    let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+        panic!("cancelled Team tool should return function output");
+    };
+    assert!(
+        output
+            .body
+            .to_text()
+            .is_some_and(|text| text.contains("aborted by user"))
+    );
+
+    let events = sink.envelopes();
+    let cancellation_events = &events[event_start..];
+    assert_eq!(
+        cancellation_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "tool_operation_started",
+            "deviation_recorded",
+            "agent_wait_entered",
+            "tool_operation_failed",
+        ],
+        "the authorized target Team gets one failed terminal after mutation, without a generic duplicate"
+    );
+    let operation = operation_events(cancellation_events, call_id);
+    assert_eq!(operation.len(), 2);
+    assert_eq!(
+        operation
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tool_operation_started", "tool_operation_failed"]
+    );
+    assert!(operation.iter().all(|event| event.team_session_id == team));
 }
 
 #[tokio::test]

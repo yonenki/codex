@@ -49,6 +49,10 @@ impl CoreToolRuntime for TeamLifecycleToolHandler {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        team_authority_class(self.capability) == TeamAuthorityClass::TeamSession
+    }
 }
 
 #[derive(Debug, Deserialize)]

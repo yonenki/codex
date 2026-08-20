@@ -490,7 +490,6 @@ where
 {
     let authority = authorize_team_tool(&invocation, capability).await?;
     let scoped_team = authority.scoped_team().cloned();
-    maybe_record_deviation(&invocation, capability).await;
     if let Some(team_session_id) = scoped_team.as_ref() {
         record_team_tool_lifecycle(
             &invocation,
@@ -499,8 +498,21 @@ where
         )
         .await?;
     }
+    maybe_record_deviation(&invocation, capability).await;
 
-    let result = handler(invocation.clone(), authority).await;
+    let operation = handler(invocation.clone(), authority);
+    tokio::pin!(operation);
+    let result = if scoped_team.is_some() {
+        tokio::select! {
+            biased;
+            _ = invocation.cancellation_token.cancelled() => {
+                Err(FunctionCallError::RespondToModel("aborted by user".to_string()))
+            }
+            result = &mut operation => result,
+        }
+    } else {
+        operation.await
+    };
     let terminal_team = scoped_team.or_else(|| {
         result
             .as_ref()
