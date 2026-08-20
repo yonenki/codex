@@ -301,7 +301,9 @@ impl AgentControl {
             .record_agent_terminal_managed(producer, &agent_thread_id.to_string(), status)
             .await
         {
-            Ok(TerminalPersistenceOutcome::Persisted) => TerminalCleanupOutcome::Persisted,
+            Ok(
+                TerminalPersistenceOutcome::Persisted | TerminalPersistenceOutcome::AlreadyTerminal,
+            ) => TerminalCleanupOutcome::Persisted,
             Ok(TerminalPersistenceOutcome::RetryPending { first_error }) => {
                 TerminalCleanupOutcome::RetryOwned { first_error }
             }

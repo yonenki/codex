@@ -131,6 +131,7 @@ pub(crate) struct AgentControl {
     external_agents: Arc<external::ExternalAgentManager>,
     external_backend_routes: Arc<Mutex<HashMap<ThreadId, ExternalBackendRoute>>>,
     external_completion_watchers: Arc<Mutex<HashSet<ThreadId>>>,
+    managed_terminal_notifications: Arc<terminal_notification::ManagedTerminalNotifications>,
     v2_residency: Arc<V2Residency>,
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
@@ -197,6 +198,7 @@ impl AgentControl {
             external_agents: Arc::default(),
             external_backend_routes: Arc::default(),
             external_completion_watchers: Arc::default(),
+            managed_terminal_notifications: Arc::default(),
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
