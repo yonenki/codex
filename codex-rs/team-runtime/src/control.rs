@@ -852,10 +852,9 @@ impl TeamControl {
         agent_thread_id: &str,
         status: &str,
     ) -> TeamRuntimeResult<()> {
-        let Some(binding) = self.binding_for(agent_thread_id).await else {
+        let Some(binding) = self.binding_for_checked(agent_thread_id).await? else {
             return Ok(());
         };
-        self.ensure_restored().await?;
         {
             let teams = self.teams.lock().await;
             let already_terminal = !teams

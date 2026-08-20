@@ -1041,7 +1041,7 @@ async fn concurrent_record_agent_terminal_appends_at_most_one_event() {
 }
 
 #[tokio::test]
-async fn sqlite_reopen_has_no_active_agent_after_pre_start_terminal() {
+async fn sqlite_reopen_restores_authority_before_recording_first_terminal() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("terminal.sqlite");
     let store = crate::SqliteTeamStore::open(&path).await.expect("open");
@@ -1051,11 +1051,19 @@ async fn sqlite_reopen_has_no_active_agent_after_pre_start_terminal() {
         crate::RecordingSink::default(),
     );
     let started = bind_sample_worker(&control).await;
-    control
+    drop(control);
+
+    let terminal_store = crate::SqliteTeamStore::open(&path).await.expect("reopen");
+    let terminal_control = TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        terminal_store,
+        crate::RecordingSink::default(),
+    );
+    terminal_control
         .record_agent_terminal("agent-a", "interrupted")
         .await
-        .expect("terminal");
-    drop(control);
+        .expect("first operation records terminal");
+    drop(terminal_control);
 
     let restored_store = crate::SqliteTeamStore::open(&path).await.expect("reopen");
     let restored = TeamControl::with_store(
