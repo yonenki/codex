@@ -56,6 +56,20 @@ fn catalog() -> TeamGraphCatalog {
 }
 
 #[tokio::test]
+async fn checked_binding_lookup_preserves_store_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("team-sessions.sqlite"))
+        .expect("make the database path unusable as a file");
+    let control = TeamControl::for_codex_home(dir.path(), crate::RecordingSink::default());
+
+    let error = control
+        .binding_for_checked("caller")
+        .await
+        .expect_err("restore failure must not become an unbound caller");
+    assert!(matches!(error, crate::TeamRuntimeError::Store(_)));
+}
+
+#[tokio::test]
 async fn sqlite_restores_team_node_and_binding() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("team.sqlite");

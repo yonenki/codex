@@ -33,8 +33,9 @@ impl ToolExecutor<ToolInvocation> for TeamLifecycleToolHandler {
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         let capability = self.capability;
         Box::pin(async move {
+            let authority = authorize_team_tool(&invocation, capability).await?;
             maybe_record_deviation(&invocation, capability).await;
-            handle_lifecycle(capability, invocation)
+            handle_lifecycle(capability, invocation, authority)
                 .await
                 .map(boxed_tool_output)
         })
@@ -54,7 +55,6 @@ struct GraphNameArgs {
 
 #[derive(Debug, Deserialize)]
 struct TeamSessionArgs {
-    team_session_id: Option<String>,
     expected_revision: Option<u64>,
     node_id: Option<String>,
     graph_name: Option<String>,
@@ -75,6 +75,7 @@ struct TeamSessionArgs {
 async fn handle_lifecycle(
     capability: ToolCapability,
     invocation: ToolInvocation,
+    authority: TeamToolAuthority,
 ) -> Result<TeamToolResult, FunctionCallError> {
     let arguments = function_arguments(invocation.payload.clone())?;
     refresh_catalog(&invocation.session, invocation.turn.as_ref()).await;
@@ -107,7 +108,20 @@ async fn handle_lifecycle(
             })));
         }
         ToolCapability::ListTeams => {
-            let teams = team.list_teams().await;
+            let TeamToolAuthority::ListTeams { bound_team } = authority else {
+                return Err(FunctionCallError::RespondToModel(
+                    "list_teams requires caller Team authority".into(),
+                ));
+            };
+            let teams = if let Some(team_session_id) = bound_team {
+                vec![
+                    team.status(&team_session_id)
+                        .await
+                        .map_err(map_team_error)?,
+                ]
+            } else {
+                team.list_teams().await
+            };
             return Ok(TeamToolResult::json(serde_json::json!({
                 "teams": teams,
                 "revision": 0,
@@ -118,7 +132,6 @@ async fn handle_lifecycle(
         _ => {}
     }
     let args: TeamSessionArgs = parse_arguments(&arguments).unwrap_or(TeamSessionArgs {
-        team_session_id: None,
         expected_revision: None,
         node_id: None,
         graph_name: None,
@@ -135,6 +148,15 @@ async fn handle_lifecycle(
         aborted: None,
         reason: None,
     });
+    let authorized_team_session_id = match authority {
+        TeamToolAuthority::TeamSession(team_session_id) => Some(team_session_id),
+        TeamToolAuthority::StartTeam => None,
+        TeamToolAuthority::CatalogRead | TeamToolAuthority::ListTeams { .. } => {
+            return Err(FunctionCallError::RespondToModel(
+                "invalid Team tool authority".into(),
+            ));
+        }
+    };
     let view = match capability {
         ToolCapability::StartTeam => {
             let graph_name = args.graph_name.ok_or_else(|| {
@@ -150,13 +172,13 @@ async fn handle_lifecycle(
             .map_err(map_team_error)?
         }
         ToolCapability::GetTeamStatus | ToolCapability::GetTeamNext => {
-            let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
+            let team_session_id = authorized_team_session_id.expect("Team session authority");
             team.status(&team_session_id)
                 .await
                 .map_err(map_team_error)?
         }
         ToolCapability::StartTeamNode => {
-            let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
+            let team_session_id = authorized_team_session_id.expect("Team session authority");
             team.start_node(StartNodeCommand {
                 team_session_id,
                 node_id: args.node_id,
@@ -166,7 +188,7 @@ async fn handle_lifecycle(
             .map_err(map_team_error)?
         }
         ToolCapability::RecordTeamResult => {
-            let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
+            let team_session_id = authorized_team_session_id.expect("Team session authority");
             team.record_result(RecordResultCommand {
                 team_session_id,
                 result: args.result.ok_or_else(|| {
@@ -182,7 +204,7 @@ async fn handle_lifecycle(
             .map_err(map_team_error)?
         }
         ToolCapability::TransitionTeam => {
-            let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
+            let team_session_id = authorized_team_session_id.expect("Team session authority");
             team.transition(TransitionCommand {
                 team_session_id,
                 result: args.result.ok_or_else(|| {
@@ -195,7 +217,7 @@ async fn handle_lifecycle(
             .map_err(map_team_error)?
         }
         ToolCapability::EndTeam => {
-            let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
+            let team_session_id = authorized_team_session_id.expect("Team session authority");
             team.end_team(EndTeamCommand {
                 team_session_id,
                 aborted: args.aborted.unwrap_or(false),
@@ -208,7 +230,7 @@ async fn handle_lifecycle(
         ToolCapability::RecordEvidence
         | ToolCapability::InvalidateEvidence
         | ToolCapability::ReuseEvidence => {
-            let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
+            let team_session_id = authorized_team_session_id.expect("Team session authority");
             let kind = match capability {
                 ToolCapability::RecordEvidence => TeamEventKind::EvidenceRecorded,
                 ToolCapability::InvalidateEvidence => TeamEventKind::EvidenceInvalidated,

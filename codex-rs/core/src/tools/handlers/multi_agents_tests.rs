@@ -22,6 +22,8 @@ use crate::tools::handlers::multi_agents_v2::MessageAcpAgentHandler;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::handlers::team::TeamAgentToolHandler;
+use crate::tools::handlers::team::TeamLifecycleToolHandler;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
@@ -4895,6 +4897,28 @@ async fn bind_agent_to_team(
         .expect("bind Team agent");
 }
 
+async fn invoke_team_agent_delivery(
+    session: Arc<crate::session::session::Session>,
+    turn: Arc<TurnContext>,
+    capability: codex_team_graph::ToolCapability,
+    team_session_id: &codex_team_runtime::TeamSessionId,
+    target: ThreadId,
+    message: &str,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    TeamAgentToolHandler::new(capability)
+        .handle(invocation(
+            session,
+            turn,
+            capability.as_str(),
+            function_payload(json!({
+                "team_session_id": team_session_id,
+                "target": target.to_string(),
+                "message": message,
+            })),
+        ))
+        .await
+}
+
 async fn invoke_acp_delivery(
     session: Arc<crate::session::session::Session>,
     turn: Arc<TurnContext>,
@@ -5217,6 +5241,257 @@ async fn acp_delivery_keeps_unknown_target_lookup_error_ahead_of_team_guidance()
         };
         assert!(!message.contains("team."), "{message}");
         assert!(!message.contains("unbound root coordinator"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn team_delivery_enforces_bound_caller_team_before_external_mutation() {
+    use codex_team_graph::ToolCapability;
+
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    let target_a_send = register_external_target(&session, "team_a_send");
+    let target_a_followup = register_external_target(&session, "team_a_followup");
+    let target_b_send = register_external_target(&session, "team_b_send");
+    let target_b_followup = register_external_target(&session, "team_b_followup");
+    bind_agent_to_team(&session, &team_a, target_a_send).await;
+    bind_agent_to_team(&session, &team_a, target_a_followup).await;
+    bind_agent_to_team(&session, &team_b, target_b_send).await;
+    bind_agent_to_team(&session, &team_b, target_b_followup).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    // An unbound root coordinator can operate an explicitly selected Team.
+    invoke_team_agent_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        ToolCapability::SendMessage,
+        &team_b,
+        target_b_send,
+        "root queue",
+    )
+    .await
+    .expect("unbound root explicit Team send");
+    invoke_team_agent_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        ToolCapability::FollowupAgent,
+        &team_b,
+        target_b_followup,
+        "root activate",
+    )
+    .await
+    .expect("unbound root explicit Team followup");
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_b_send),
+        vec!["root queue".to_string()]
+    );
+    let (_, root_generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target_b_followup)
+        .expect("root followup lifecycle");
+    assert_eq!(root_generation, 1);
+
+    bind_agent_to_team(&session, &team_a, session.thread_id).await;
+
+    // A bound caller retains the same-Team send/followup path.
+    invoke_team_agent_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        ToolCapability::SendMessage,
+        &team_a,
+        target_a_send,
+        "same Team queue",
+    )
+    .await
+    .expect("same-Team send");
+    invoke_team_agent_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        ToolCapability::FollowupAgent,
+        &team_a,
+        target_a_followup,
+        "same Team activate",
+    )
+    .await
+    .expect("same-Team followup");
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_a_send),
+        vec!["same Team queue".to_string()]
+    );
+    let (_, same_team_generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target_a_followup)
+        .expect("same-Team followup lifecycle");
+    assert_eq!(same_team_generation, 1);
+
+    let b_send_before = session
+        .services
+        .agent_control
+        .external_queued_message_contents_for_tests(target_b_send);
+    let b_followup_before = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target_b_followup)
+        .expect("Team B lifecycle before rejection");
+    for (capability, target) in [
+        (ToolCapability::SendMessage, target_b_send),
+        (ToolCapability::FollowupAgent, target_b_followup),
+    ] {
+        let error = expect_model_err(
+            invoke_team_agent_delivery(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                capability,
+                &team_b,
+                target,
+                "cross Team reject",
+            )
+            .await,
+            "bound Team A caller must not select Team B",
+        );
+        assert!(matches!(
+            error,
+            FunctionCallError::RespondToModel(message)
+                if message.contains("team session") && message.contains("another team")
+        ));
+    }
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_b_send),
+        b_send_before
+    );
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_lifecycle_status_for_tests(target_b_followup),
+        Some(b_followup_before)
+    );
+}
+
+#[tokio::test]
+async fn bound_team_caller_cannot_escape_through_any_team_tool_class() {
+    use codex_team_graph::ToolCapability;
+
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    bind_agent_to_team(&session, &team_a, session.thread_id).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let team_a_before = session
+        .services
+        .agent_control
+        .team()
+        .status(&team_a)
+        .await
+        .expect("Team A before authority probes");
+    let team_b_before = session
+        .services
+        .agent_control
+        .team()
+        .status(&team_b)
+        .await
+        .expect("Team B before authority probes");
+
+    let agent_capabilities = [
+        ToolCapability::SpawnAgent,
+        ToolCapability::SendMessage,
+        ToolCapability::FollowupAgent,
+        ToolCapability::Wait,
+        ToolCapability::InterruptAgent,
+        ToolCapability::ListAgents,
+    ];
+    let lifecycle_capabilities = [
+        ToolCapability::GetTeamStatus,
+        ToolCapability::StartTeamNode,
+        ToolCapability::RecordTeamResult,
+        ToolCapability::GetTeamNext,
+        ToolCapability::TransitionTeam,
+        ToolCapability::EndTeam,
+        ToolCapability::RecordEvidence,
+        ToolCapability::InvalidateEvidence,
+        ToolCapability::ReuseEvidence,
+    ];
+
+    for capability in agent_capabilities {
+        let result = TeamAgentToolHandler::new(capability)
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                capability.as_str(),
+                function_payload(json!({"team_session_id": team_b.as_str()})),
+            ))
+            .await;
+        expect_model_err(result, capability.as_str());
+    }
+    for capability in lifecycle_capabilities {
+        let result = TeamLifecycleToolHandler::new(capability)
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                capability.as_str(),
+                function_payload(json!({"team_session_id": team_b.as_str()})),
+            ))
+            .await;
+        expect_model_err(result, capability.as_str());
+    }
+
+    let start_error = expect_model_err(
+        TeamLifecycleToolHandler::new(ToolCapability::StartTeam)
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                ToolCapability::StartTeam.as_str(),
+                function_payload(json!({"graph_name": "sample"})),
+            ))
+            .await,
+        "bound caller must not start another Team",
+    );
+    assert!(matches!(
+        start_error,
+        FunctionCallError::RespondToModel(message)
+            if message.contains("unbound root coordinator")
+    ));
+
+    let list_payload = function_payload(json!({}));
+    let listed = TeamLifecycleToolHandler::new(ToolCapability::ListTeams)
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            ToolCapability::ListTeams.as_str(),
+            list_payload.clone(),
+        ))
+        .await
+        .expect("bound caller may list its own Team");
+    let listed_json = listed.code_mode_result(&list_payload).to_string();
+    assert!(listed_json.contains(team_a.as_str()));
+    assert!(!listed_json.contains(team_b.as_str()));
+
+    for (team_id, before) in [(&team_a, team_a_before), (&team_b, team_b_before)] {
+        let after = session
+            .services
+            .agent_control
+            .team()
+            .status(team_id)
+            .await
+            .expect("Team after authority probes");
+        assert_eq!(
+            after.revision, before.revision,
+            "authority probes must not mutate or trace Team state"
+        );
     }
 }
 

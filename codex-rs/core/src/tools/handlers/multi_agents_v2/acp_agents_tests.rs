@@ -200,6 +200,40 @@ fn reserved_acp_delivery_specs_keep_their_model_visible_contract() {
 }
 
 #[test]
+fn cross_team_acp_guidance_uses_target_authority_via_unbound_root() {
+    let caller = codex_team_runtime::TeamSessionId::parse("team-a").expect("caller Team");
+    let target = codex_team_runtime::TeamSessionId::parse("team-b").expect("target Team");
+
+    for mode in [DeliveryMode::QueueOnly, DeliveryMode::TriggerTurn] {
+        let guidance = team_bound_external_delivery_guidance(Some(&caller), Some(&target), mode)
+            .expect("cross-Team raw delivery must be rejected");
+        assert!(guidance.contains("target is governed by team_session_id=team-b"));
+        assert!(guidance.contains("unbound root coordinator"));
+        assert!(guidance.contains(&format!(
+            "{}(team_session_id=team-b, ...)",
+            mode.team_tool()
+        )));
+    }
+}
+
+#[test]
+fn same_team_and_bound_to_unbound_acp_guidance_remain_distinct() {
+    let team = codex_team_runtime::TeamSessionId::parse("team-a").expect("Team");
+    let same_team =
+        team_bound_external_delivery_guidance(Some(&team), Some(&team), DeliveryMode::QueueOnly)
+            .expect("same-Team raw delivery must be rejected");
+    assert!(same_team.contains("Same-Team"));
+    assert!(same_team.contains("team.send_message(team_session_id=team-a, ...)"));
+    assert!(!same_team.contains("unbound root coordinator"));
+
+    let target_unbound =
+        team_bound_external_delivery_guidance(Some(&team), None, DeliveryMode::TriggerTurn)
+            .expect("bound caller raw delivery must be rejected");
+    assert!(target_unbound.contains("unbound root coordinator"));
+    assert!(target_unbound.contains("acp.followup_task"));
+}
+
+#[test]
 fn spawn_output_reports_first_fallback_explicit_and_default_model() {
     let path = AgentPath::try_from("/root/worker").expect("agent path");
     let pool = [

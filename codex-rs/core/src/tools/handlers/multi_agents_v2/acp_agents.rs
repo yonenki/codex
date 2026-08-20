@@ -127,23 +127,53 @@ fn reject_team_bound_external_delivery(
     mode: DeliveryMode,
 ) -> Result<(), FunctionCallError> {
     let team = session.services.agent_control.team();
-    if let Some(target_binding) = team.binding_snapshot(target_thread_id) {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "Team-bound ACP delivery must use {}(team_session_id={}, ...). {} cannot be used when the caller or target is bound to a Team.",
-            mode.team_tool(),
-            target_binding.team_session_id,
-            mode.raw_tool(),
-        )));
+    let caller_binding = team.binding_snapshot(caller_thread_id);
+    let target_binding = team.binding_snapshot(target_thread_id);
+    if let Some(message) = team_bound_external_delivery_guidance(
+        caller_binding
+            .as_ref()
+            .map(|binding| &binding.team_session_id),
+        target_binding
+            .as_ref()
+            .map(|binding| &binding.team_session_id),
+        mode,
+    ) {
+        return Err(FunctionCallError::RespondToModel(message));
     }
-    if team.binding_snapshot(caller_thread_id).is_some() {
-        return Err(FunctionCallError::RespondToModel(format!(
+    Ok(())
+}
+
+fn team_bound_external_delivery_guidance(
+    caller_team: Option<&codex_team_runtime::TeamSessionId>,
+    target_team: Option<&codex_team_runtime::TeamSessionId>,
+    mode: DeliveryMode,
+) -> Option<String> {
+    match (caller_team, target_team) {
+        (Some(caller), Some(target)) if caller == target => Some(format!(
+            "Same-Team ACP delivery must use {}(team_session_id={}, ...). {} cannot be used when the caller or target is bound to a Team.",
+            mode.team_tool(),
+            target,
+            mode.raw_tool(),
+        )),
+        (Some(_), Some(target)) => Some(format!(
+            "The target is governed by team_session_id={target}. Delegate this cross-Team delivery to an unbound root coordinator using {}(team_session_id={target}, ...). {} cannot be used when the caller or target is bound to a Team.",
+            mode.team_tool(),
+            mode.raw_tool(),
+        )),
+        (None, Some(target)) => Some(format!(
+            "Team-bound ACP delivery must use {}(team_session_id={}, ...). {} cannot be used when the target is bound to a Team.",
+            mode.team_tool(),
+            target,
+            mode.raw_tool(),
+        )),
+        (Some(_), None) => Some(format!(
             "Team-bound {} is unsupported for an unbound target. Delegate the non-Team raw operation to an unbound root coordinator using {}. {} cannot be used when the caller or target is bound to a Team.",
             mode.raw_tool(),
             mode.raw_tool(),
             mode.raw_tool(),
-        )));
+        )),
+        (None, None) => None,
     }
-    Ok(())
 }
 
 fn spawn_spec() -> ToolSpec {

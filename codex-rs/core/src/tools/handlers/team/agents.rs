@@ -53,8 +53,9 @@ impl ToolExecutor<ToolInvocation> for TeamAgentToolHandler {
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         let capability = self.capability;
         Box::pin(async move {
+            let authority = authorize_team_tool(&invocation, capability).await?;
             maybe_record_deviation(&invocation, capability).await;
-            handle_agent_tool(capability, invocation)
+            handle_agent_tool(capability, invocation, authority)
                 .await
                 .map(boxed_tool_output)
         })
@@ -69,7 +70,6 @@ impl CoreToolRuntime for TeamAgentToolHandler {
 
 #[derive(Debug, Deserialize)]
 struct TeamSpawnArgs {
-    team_session_id: Option<String>,
     role: Option<String>,
     agent_type: Option<String>,
     task_name: String,
@@ -79,14 +79,12 @@ struct TeamSpawnArgs {
 
 #[derive(Debug, Deserialize)]
 struct TeamTargetArgs {
-    team_session_id: Option<String>,
     target: String,
     message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TeamWaitArgs {
-    team_session_id: Option<String>,
     target: Option<String>,
     timeout_ms: Option<i64>,
     reason: Option<String>,
@@ -97,18 +95,24 @@ struct TeamWaitArgs {
 async fn handle_agent_tool(
     capability: ToolCapability,
     invocation: ToolInvocation,
+    authority: TeamToolAuthority,
 ) -> Result<TeamToolResult, FunctionCallError> {
+    let TeamToolAuthority::TeamSession(team_session_id) = authority else {
+        return Err(FunctionCallError::RespondToModel(
+            "team agent tool requires Team session authority".into(),
+        ));
+    };
     match capability {
-        ToolCapability::SpawnAgent => handle_team_spawn(invocation).await,
+        ToolCapability::SpawnAgent => handle_team_spawn(invocation, team_session_id).await,
         ToolCapability::SendMessage => {
-            handle_team_message(invocation, /*trigger_turn*/ false).await
+            handle_team_message(invocation, team_session_id, /*trigger_turn*/ false).await
         }
         ToolCapability::FollowupAgent => {
-            handle_team_message(invocation, /*trigger_turn*/ true).await
+            handle_team_message(invocation, team_session_id, /*trigger_turn*/ true).await
         }
-        ToolCapability::Wait => handle_team_wait(invocation).await,
-        ToolCapability::InterruptAgent => handle_team_interrupt(invocation).await,
-        ToolCapability::ListAgents => handle_team_list(invocation).await,
+        ToolCapability::Wait => handle_team_wait(invocation, team_session_id).await,
+        ToolCapability::InterruptAgent => handle_team_interrupt(invocation, team_session_id).await,
+        ToolCapability::ListAgents => handle_team_list(invocation, team_session_id).await,
         _ => Err(FunctionCallError::RespondToModel(
             "unsupported team agent tool".into(),
         )),
@@ -117,6 +121,7 @@ async fn handle_agent_tool(
 
 async fn handle_team_spawn(
     invocation: ToolInvocation,
+    team_session_id: TeamSessionId,
 ) -> Result<TeamToolResult, FunctionCallError> {
     let arguments = function_arguments(invocation.payload.clone())?;
     let args: TeamSpawnArgs = parse_arguments(&arguments)?;
@@ -124,7 +129,6 @@ async fn handle_team_spawn(
         .role
         .or(args.agent_type)
         .ok_or_else(|| FunctionCallError::RespondToModel("role is required".into()))?;
-    let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
     let mut pending = invocation
         .session
         .services
@@ -274,11 +278,11 @@ async fn handle_team_spawn(
 
 async fn handle_team_message(
     invocation: ToolInvocation,
+    team_session_id: TeamSessionId,
     trigger_turn: bool,
 ) -> Result<TeamToolResult, FunctionCallError> {
     let arguments = function_arguments(invocation.payload.clone())?;
     let args: TeamTargetArgs = parse_arguments(&arguments)?;
-    let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
     let target = crate::agent::agent_resolver::resolve_agent_target(
         &invocation.session,
         &invocation.turn,
@@ -294,58 +298,44 @@ async fn handle_team_message(
         .await
         .map_err(map_team_error)?;
     let message = message_content(args.message.unwrap_or_default())?;
-    if trigger_turn {
+    let communication = InterAgentCommunication::new(
+        invocation
+            .turn
+            .session_source
+            .get_agent_path()
+            .unwrap_or_else(AgentPath::root),
         invocation
             .session
             .services
             .agent_control
-            .send_input(
-                target,
-                vec![codex_protocol::user_input::UserInput::Text {
-                    text: message,
-                    text_elements: Vec::new(),
-                }],
-                Some(invocation.turn.sub_id.clone()),
-                invocation.turn.turn_metadata_state.root_turn_id(),
-            )
-            .await
-            .map_err(collab_spawn_error)?;
-    } else {
-        let communication = InterAgentCommunication::new(
-            invocation
-                .turn
-                .session_source
-                .get_agent_path()
-                .unwrap_or_else(AgentPath::root),
-            invocation
-                .session
-                .services
-                .agent_control
-                .ensure_agent_known(target)
-                .ok()
-                .and_then(|agent| agent.agent_path)
-                .unwrap_or_else(AgentPath::root),
-            Vec::new(),
-            message,
-            /*trigger_turn*/ false,
-        );
-        invocation
-            .session
-            .services
-            .agent_control
-            .send_inter_agent_communication(
-                target,
-                communication,
-                AgentCommunicationContext::new(
-                    AgentCommunicationKind::Message,
-                    invocation.session.thread_id,
-                ),
-                Some(invocation.turn.sub_id.clone()),
-                invocation.turn.turn_metadata_state.root_turn_id(),
-            )
-            .await
-            .map_err(collab_spawn_error)?;
-    }
+            .ensure_agent_known(target)
+            .ok()
+            .and_then(|agent| agent.agent_path)
+            .unwrap_or_else(AgentPath::root),
+        Vec::new(),
+        message,
+        trigger_turn,
+    );
+    invocation
+        .session
+        .services
+        .agent_control
+        .send_inter_agent_communication(
+            target,
+            communication,
+            AgentCommunicationContext::new(
+                if trigger_turn {
+                    AgentCommunicationKind::Followup
+                } else {
+                    AgentCommunicationKind::Message
+                },
+                invocation.session.thread_id,
+            ),
+            trigger_turn.then(|| invocation.turn.sub_id.clone()),
+            invocation.turn.turn_metadata_state.root_turn_id(),
+        )
+        .await
+        .map_err(collab_spawn_error)?;
     let view = invocation
         .session
         .services
@@ -357,10 +347,12 @@ async fn handle_team_message(
     Ok(TeamToolResult::view(view))
 }
 
-async fn handle_team_wait(invocation: ToolInvocation) -> Result<TeamToolResult, FunctionCallError> {
+async fn handle_team_wait(
+    invocation: ToolInvocation,
+    team_session_id: TeamSessionId,
+) -> Result<TeamToolResult, FunctionCallError> {
     let arguments = function_arguments(invocation.payload.clone())?;
     let args: TeamWaitArgs = parse_arguments(&arguments)?;
-    let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
     let team = invocation.session.services.agent_control.team();
     if args.resolve.unwrap_or(false) {
         let view = team
@@ -468,10 +460,10 @@ fn revision(value: Option<u64>) -> Result<codex_team_runtime::StateRevision, Fun
 
 async fn handle_team_interrupt(
     invocation: ToolInvocation,
+    team_session_id: TeamSessionId,
 ) -> Result<TeamToolResult, FunctionCallError> {
     let arguments = function_arguments(invocation.payload.clone())?;
     let args: TeamTargetArgs = parse_arguments(&arguments)?;
-    let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
     let target = crate::agent::agent_resolver::resolve_agent_target(
         &invocation.session,
         &invocation.turn,
@@ -512,12 +504,10 @@ async fn handle_team_interrupt(
     Ok(TeamToolResult::view(view))
 }
 
-async fn handle_team_list(invocation: ToolInvocation) -> Result<TeamToolResult, FunctionCallError> {
-    let arguments = function_arguments(invocation.payload.clone())?;
-    let args: TeamSessionArgsLite = parse_arguments(&arguments).unwrap_or(TeamSessionArgsLite {
-        team_session_id: None,
-    });
-    let team_session_id = require_team_session_id(&invocation, args.team_session_id)?;
+async fn handle_team_list(
+    invocation: ToolInvocation,
+    team_session_id: TeamSessionId,
+) -> Result<TeamToolResult, FunctionCallError> {
     let view = invocation
         .session
         .services
@@ -533,11 +523,6 @@ async fn handle_team_list(invocation: ToolInvocation) -> Result<TeamToolResult, 
         "recommended_next": view.recommended_next,
         "guide": view.current_node,
     })))
-}
-
-#[derive(Debug, Deserialize)]
-struct TeamSessionArgsLite {
-    team_session_id: Option<String>,
 }
 
 fn agent_spec(capability: ToolCapability) -> ToolSpec {

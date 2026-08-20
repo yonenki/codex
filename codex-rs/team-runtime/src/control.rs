@@ -689,6 +689,16 @@ impl TeamControl {
         self.bindings.lock().await.get(agent_thread_id).cloned()
     }
 
+    /// Resolve a caller binding only after the persistent Team authority has been restored.
+    /// Callers making authorization decisions must not interpret a restore failure as unbound.
+    pub async fn binding_for_checked(
+        &self,
+        agent_thread_id: &str,
+    ) -> TeamRuntimeResult<Option<TeamAgentBinding>> {
+        self.ensure_restored().await?;
+        Ok(self.binding_for(agent_thread_id).await)
+    }
+
     pub async fn require_same_team(
         &self,
         team_session_id: &TeamSessionId,
