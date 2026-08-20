@@ -9,6 +9,9 @@ doctest = false
 name = "codex_team_runtime"
 path = "src/lib.rs"
 
+[features]
+test-support = []
+
 [lints]
 workspace = true
 

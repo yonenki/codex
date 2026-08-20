@@ -1439,6 +1439,78 @@ async fn bind_drop_after_durable_commit_settles_without_snapshot_inject() {
 }
 
 #[tokio::test]
+async fn bind_task_loss_after_commit_preserves_truth_and_reopens_terminal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("task-loss.sqlite");
+    let store = crate::SqliteTeamStore::open(&path).await.expect("store");
+    let sink = crate::RecordingSink::default();
+    let control = std::sync::Arc::new(TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        store,
+        sink.clone(),
+    ));
+    let (started, pending) = start_bound_sample(&control).await;
+    let (hold, entered) = control.hold_next_bind_after_durable_commit();
+    let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let handle =
+        std::sync::Arc::clone(&control).spawn_bind_attempt("agent-a", pending, |_| {}, cancel_rx);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .expect("bind should reach committed result seam")
+        .expect("committed seam entered");
+    handle.abort_task_for_test();
+    drop(hold);
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
+        .await
+        .expect("closed result channel must settle");
+    assert!(
+        matches!(
+            outcome,
+            crate::BindAttemptOutcome::Failed {
+                committed: true,
+                ..
+            }
+        ),
+        "task loss after commit must preserve durable truth: {outcome:?}"
+    );
+    control
+        .record_agent_terminal("agent-a", "interrupted")
+        .await
+        .expect("terminalize committed attach");
+    control
+        .record_agent_terminal("agent-a", "errored")
+        .await
+        .expect("duplicate terminal is ignored");
+
+    drop(control);
+    let reopened = TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        crate::SqliteTeamStore::open(&path)
+            .await
+            .expect("reopen store"),
+        crate::RecordingSink::default(),
+    );
+    reopened.restore().await.expect("restore");
+    assert!(
+        reopened
+            .status(&started.team_session_id)
+            .await
+            .expect("reopened status")
+            .agents
+            .is_empty(),
+        "reopened durable snapshot must contain no active agent"
+    );
+    let terminal_count = sink
+        .envelopes()
+        .into_iter()
+        .filter(|event| event.kind == "agent_interrupted")
+        .count();
+    assert_eq!(terminal_count, 1, "terminal must be exactly once");
+}
+
+#[tokio::test]
 async fn bind_unobserved_commit_serializes_concurrent_team_mutation() {
     let sink = crate::RecordingSink::default();
     let control = std::sync::Arc::new(TeamControl::with_memory_store(

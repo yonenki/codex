@@ -6866,6 +6866,83 @@ async fn native_spawn_cancel_after_durable_commit_before_observe_records_one_int
 }
 
 #[tokio::test]
+async fn native_cancel_retries_terminal_after_cleanup_failure_and_releases_resources() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.team().hold_next_bind_after_durable_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should reach committed result seam")
+        .expect("committed seam entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    let child = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    harness.control.team().fail_next_terminal_persist_for_test();
+    harness.control.fail_next_native_shutdown_before_send();
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must keep the cancel outcome");
+    drop(hold);
+
+    wait_until_thread_gone(&harness, child).await;
+    assert!(
+        harness.control.get_agent_metadata(child).is_none(),
+        "spawn registry must be released even when pre-shutdown cleanup fails"
+    );
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty(),
+        "terminal retry must clear durable active state"
+    );
+}
+
+#[tokio::test]
 async fn acp_spawn_cancel_after_durable_commit_before_observe_records_one_interrupted_terminal() {
     let harness = acp_spawn_harness().await;
     let (started, pending) = seed_sample_team(&harness).await;

@@ -41,15 +41,20 @@ pub struct TeamControl {
     surface: std::sync::RwLock<SurfaceSnapshot>,
     tool_reporting_agents: Mutex<std::collections::HashSet<String>>,
     restored: tokio::sync::OnceCell<()>,
+    #[cfg(any(test, feature = "test-support"))]
     bind_persist_hold: BindPersistHold,
+    #[cfg(any(test, feature = "test-support"))]
+    fail_terminal_persist: AtomicBool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct BindPersistHold {
     before_attach: std::sync::Mutex<BindPersistHoldSlot>,
     after_durable: std::sync::Mutex<BindPersistHoldSlot>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct BindPersistHoldSlot {
     release: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -264,16 +269,26 @@ pub enum BindAttemptOutcome {
 #[derive(Clone)]
 pub struct BindAttemptHandle {
     settle: tokio::sync::watch::Receiver<Option<BindAttemptOutcome>>,
+    committed: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
+    abort: tokio::task::AbortHandle,
 }
 
 impl BindAttemptHandle {
     pub async fn wait(mut self) -> BindAttemptOutcome {
-        wait_bind_attempt_outcome(&mut self.settle).await
+        wait_bind_attempt_outcome(&mut self.settle, &self.committed).await
+    }
+
+    /// Abort the owned bind task to model task/runtime loss after a durable commit.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn abort_task_for_test(&self) {
+        self.abort.abort();
     }
 }
 
 async fn wait_bind_attempt_outcome(
     settle: &mut tokio::sync::watch::Receiver<Option<BindAttemptOutcome>>,
+    committed: &AtomicBool,
 ) -> BindAttemptOutcome {
     loop {
         if let Some(outcome) = settle.borrow().clone() {
@@ -284,7 +299,7 @@ async fn wait_bind_attempt_outcome(
                 error: TeamRuntimeError::invalid(
                     "bind attempt ended without reporting a durable outcome",
                 ),
-                committed: false,
+                committed: committed.load(Ordering::SeqCst),
             };
         }
     }
@@ -313,7 +328,10 @@ impl TeamControl {
             surface: std::sync::RwLock::new(SurfaceSnapshot::default()),
             tool_reporting_agents: Mutex::new(std::collections::HashSet::new()),
             restored: tokio::sync::OnceCell::const_new(),
+            #[cfg(any(test, feature = "test-support"))]
             bind_persist_hold: BindPersistHold::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_terminal_persist: AtomicBool::new(false),
         }
     }
 
@@ -851,7 +869,7 @@ impl TeamControl {
         pending: PendingTeamBinding,
         on_persisted: impl FnOnce(&TeamAgentBinding),
     ) -> TeamRuntimeResult<TeamAgentBinding> {
-        await_bind_persist_hold(&self.bind_persist_hold.before_attach).await;
+        self.await_bind_before_attach().await;
         self.persist_bind_after_pre_gate(agent_thread_id.into(), pending, on_persisted)
             .await
     }
@@ -866,18 +884,19 @@ impl TeamControl {
     ) -> BindAttemptHandle {
         let agent_thread_id = agent_thread_id.into();
         let (settle_tx, settle_rx) = tokio::sync::watch::channel(None);
-        tokio::spawn(async move {
+        let committed = Arc::new(AtomicBool::new(false));
+        let committed_task = Arc::clone(&committed);
+        let _task = tokio::spawn(async move {
             let cancelled = tokio::select! {
                 biased;
                 _ = pre_commit_cancel => true,
-                () = await_bind_persist_hold(&self.bind_persist_hold.before_attach) => false,
+                () = self.await_bind_before_attach() => false,
             };
             let outcome = if cancelled {
                 BindAttemptOutcome::Uncommitted
             } else {
-                let committed = Arc::new(AtomicBool::new(false));
                 let on_persisted = {
-                    let committed = Arc::clone(&committed);
+                    let committed = Arc::clone(&committed_task);
                     move |binding: &TeamAgentBinding| {
                         committed.store(true, Ordering::SeqCst);
                         on_persisted(binding);
@@ -889,14 +908,19 @@ impl TeamControl {
                 {
                     Ok(binding) => BindAttemptOutcome::Attached(binding),
                     Err(error) => BindAttemptOutcome::Failed {
-                        committed: committed.load(Ordering::SeqCst),
+                        committed: committed_task.load(Ordering::SeqCst),
                         error,
                     },
                 }
             };
             let _ = settle_tx.send(Some(outcome));
         });
-        BindAttemptHandle { settle: settle_rx }
+        BindAttemptHandle {
+            settle: settle_rx,
+            committed,
+            #[cfg(any(test, feature = "test-support"))]
+            abort: _task.abort_handle(),
+        }
     }
 
     async fn persist_bind_after_pre_gate(
@@ -972,9 +996,12 @@ impl TeamControl {
             },
         };
         let next = self.persist_event_snapshot(state, event).await?;
-        await_bind_persist_hold(&self.bind_persist_hold.after_durable).await;
+        // No await may separate durable commit from the matching in-memory truth.  Cancellation
+        // can only be observed at an await boundary, so the serialized teams authority cannot
+        // release an old snapshot after the store has accepted the next revision.
         *state = next;
         on_persisted(&binding);
+        self.await_bind_after_durable().await;
         self.flush_committed_outbox().await?;
         drop(teams);
         self.refresh_surface().await;
@@ -982,7 +1009,7 @@ impl TeamControl {
     }
 
     /// 次の bind を attach 永続化の直前で止める。テスト専用。
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn hold_next_bind_before_attach_commit(
         &self,
     ) -> (
@@ -992,8 +1019,8 @@ impl TeamControl {
         arm_bind_persist_hold(&self.bind_persist_hold.before_attach)
     }
 
-    /// 次の bind を store へ書いた直後、in-memory 適用と persist callback の前で止める。テスト専用。
-    #[doc(hidden)]
+    /// 次の bind をstoreとin-memoryへcommitした直後、result通知の前で止める。テスト専用。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn hold_next_bind_after_durable_commit(
         &self,
     ) -> (
@@ -1001,6 +1028,21 @@ impl TeamControl {
         tokio::sync::oneshot::Receiver<()>,
     ) {
         arm_bind_persist_hold(&self.bind_persist_hold.after_durable)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_terminal_persist_for_test(&self) {
+        self.fail_terminal_persist.store(true, Ordering::SeqCst);
+    }
+
+    async fn await_bind_before_attach(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        await_bind_persist_hold(&self.bind_persist_hold.before_attach).await;
+    }
+
+    async fn await_bind_after_durable(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        await_bind_persist_hold(&self.bind_persist_hold.after_durable).await;
     }
 
     /// 以後の outbox publish 先を差し替える。
@@ -1027,6 +1069,12 @@ impl TeamControl {
             if already_terminal {
                 return Ok(());
             }
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if self.fail_terminal_persist.swap(false, Ordering::SeqCst) {
+            return Err(TeamRuntimeError::Store(
+                "forced terminal persist failure".to_string(),
+            ));
         }
         let reported = self
             .tool_reporting_agents
@@ -1466,6 +1514,7 @@ impl TeamControl {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn arm_bind_persist_hold(
     slot: &std::sync::Mutex<BindPersistHoldSlot>,
 ) -> (
@@ -1483,6 +1532,7 @@ fn arm_bind_persist_hold(
     (release_tx, entered_rx)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 async fn await_bind_persist_hold(slot: &std::sync::Mutex<BindPersistHoldSlot>) {
     let (release, entered) = {
         let mut hold = slot
