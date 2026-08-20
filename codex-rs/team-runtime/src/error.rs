@@ -4,7 +4,7 @@ use thiserror::Error;
 
 pub type TeamRuntimeResult<T> = Result<T, TeamRuntimeError>;
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum TeamRuntimeError {
     #[error("{0}")]
     Invalid(String),

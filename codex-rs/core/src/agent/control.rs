@@ -229,6 +229,10 @@ impl AgentControl {
         &self.team
     }
 
+    pub(crate) fn team_handle(&self) -> Arc<codex_team_runtime::TeamControl> {
+        Arc::clone(&self.team)
+    }
+
     pub(crate) fn generate_thread_id(&self) -> ThreadId {
         (self.thread_id_generator)()
     }

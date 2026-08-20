@@ -21,6 +21,8 @@ pub use contract::TEAM_EVENTS_MAX_BATCH;
 pub use contract::TeamEventEnvelope;
 pub use contract::TeamEventsBatch;
 pub use contract::team_events_path;
+pub use control::BindAttemptHandle;
+pub use control::BindAttemptOutcome;
 pub use control::EndTeamCommand;
 pub use control::EvidenceCommand;
 pub use control::ExternalWaitCommand;

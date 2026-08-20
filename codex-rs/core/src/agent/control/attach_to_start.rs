@@ -2,41 +2,52 @@ use super::AgentControl;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_team_runtime::BindAttemptHandle;
+use codex_team_runtime::BindAttemptOutcome;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
 #[cfg(test)]
-use std::sync::Mutex;
+use std::sync::Mutex as StdMutex;
 
 /// Native または ACP の実行体ができた直後から start 成功までの Team bind 所有権。
-/// Drop 時は永続 attach を reconcile し、未commitなら実行体の cleanup のみ、commit 済みなら interrupted を一度だけ記録する。
+/// Drop 時は owned bind の settle を待ち、未commitなら実行体の cleanup のみ、commit 済みなら interrupted を一度だけ記録する。
 pub(super) struct AttachToStartOwner {
     control: AgentControl,
     agent_thread_id: ThreadId,
     cleanup_external: bool,
     committed: Arc<AtomicBool>,
     disarmed: Arc<AtomicBool>,
+    flight: Arc<Mutex<Option<BindFlight>>>,
     wakeup: Option<oneshot::Sender<()>>,
+}
+
+struct BindFlight {
+    cancel: Option<oneshot::Sender<()>>,
+    handle: BindAttemptHandle,
 }
 
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct AttachToStartTestControl {
     fail_initial_delivery: AtomicBool,
-    hold: Mutex<Option<oneshot::Receiver<()>>>,
-    entered: Mutex<Option<oneshot::Sender<()>>>,
+    hold: StdMutex<Option<oneshot::Receiver<()>>>,
+    entered: StdMutex<Option<oneshot::Sender<()>>>,
 }
 
 impl AttachToStartOwner {
     fn arm(control: AgentControl, agent_thread_id: ThreadId, cleanup_external: bool) -> Self {
         let committed = Arc::new(AtomicBool::new(false));
         let disarmed = Arc::new(AtomicBool::new(false));
+        let flight = Arc::new(Mutex::new(None));
         let (wakeup, parked) = oneshot::channel();
         let control_task = control.clone();
         let committed_task = Arc::clone(&committed);
         let disarmed_task = Arc::clone(&disarmed);
+        let flight_task = Arc::clone(&flight);
         tokio::spawn(async move {
             let _ = parked.await;
             if disarmed_task.load(Ordering::SeqCst) {
@@ -47,6 +58,7 @@ impl AttachToStartOwner {
                     agent_thread_id,
                     cleanup_external,
                     committed_task.load(Ordering::SeqCst),
+                    flight_task.lock().await.take(),
                 )
                 .await;
         });
@@ -56,12 +68,15 @@ impl AttachToStartOwner {
             cleanup_external,
             committed,
             disarmed,
+            flight,
             wakeup: Some(wakeup),
         }
     }
 
     /// persist callback から呼ぶ。以後の Drop は interrupted へ収束する。
-    pub(super) fn on_persisted(&self) -> impl FnOnce(&codex_team_runtime::TeamAgentBinding) {
+    pub(super) fn on_persisted(
+        &self,
+    ) -> impl FnOnce(&codex_team_runtime::TeamAgentBinding) + Send + 'static + use<> {
         let committed = Arc::clone(&self.committed);
         move |_| {
             committed.store(true, Ordering::SeqCst);
@@ -70,6 +85,45 @@ impl AttachToStartOwner {
 
     pub(super) fn is_committed(&self) -> bool {
         self.committed.load(Ordering::SeqCst)
+    }
+
+    pub(super) async fn bind_pending(
+        self,
+        pending: codex_team_runtime::PendingTeamBinding,
+    ) -> CodexResult<Self> {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let on_persisted = self.on_persisted();
+        let handle: BindAttemptHandle = self.control.team_handle().spawn_bind_attempt(
+            self.agent_thread_id.to_string(),
+            pending,
+            on_persisted,
+            cancel_rx,
+        );
+        {
+            let mut flight = self.flight.lock().await;
+            *flight = Some(BindFlight {
+                cancel: Some(cancel_tx),
+                handle: handle.clone(),
+            });
+        }
+        match handle.wait().await {
+            BindAttemptOutcome::Attached(_) => Ok(self),
+            BindAttemptOutcome::Uncommitted => {
+                self.abandon_uncommitted().await;
+                Err(CodexErr::InvalidRequest(
+                    "team bind cancelled before persist".to_string(),
+                ))
+            }
+            BindAttemptOutcome::Failed { error, committed } => {
+                let mapped = CodexErr::InvalidRequest(error.to_string());
+                if committed || self.is_committed() {
+                    Err(abort_attach_to_start(Some(self), mapped).await)
+                } else {
+                    self.abandon_uncommitted().await;
+                    Err(mapped)
+                }
+            }
+        }
     }
 
     pub(super) fn disarm(mut self) {
@@ -164,18 +218,36 @@ impl AgentControl {
         agent_thread_id: ThreadId,
         cleanup_external: bool,
         committed: bool,
+        flight: Option<BindFlight>,
     ) {
+        let outcome = if let Some(mut flight) = flight {
+            if let Some(cancel) = flight.cancel.take() {
+                let _ = cancel.send(());
+            }
+            Some(flight.handle.wait().await)
+        } else {
+            None
+        };
         self.cleanup_bind_attempt_resources(agent_thread_id, cleanup_external)
             .await;
-        let attached = if committed {
-            true
-        } else {
-            self.team()
-                .reconcile_agent_attach(&agent_thread_id.to_string())
-                .await
-                .unwrap_or(false)
+        let attached = match &outcome {
+            None => committed,
+            Some(BindAttemptOutcome::Uncommitted) => false,
+            Some(BindAttemptOutcome::Attached(_)) => true,
+            Some(BindAttemptOutcome::Failed {
+                committed: persist_committed,
+                ..
+            }) => committed || *persist_committed,
         };
         if attached {
+            let _ = self
+                .team()
+                .record_agent_terminal(&agent_thread_id.to_string(), "interrupted")
+                .await;
+            return;
+        }
+        if outcome.is_some() && !matches!(outcome, Some(BindAttemptOutcome::Uncommitted)) {
+            // settle 報告が失敗でも、正規の terminal mutation で active なら一度記録する。
             let _ = self
                 .team()
                 .record_agent_terminal(&agent_thread_id.to_string(), "interrupted")

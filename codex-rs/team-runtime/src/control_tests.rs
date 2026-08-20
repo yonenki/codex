@@ -1313,12 +1313,14 @@ async fn bind_drop_before_attach_commit_does_not_create_active_agent() {
     ));
     let (started, pending) = start_bound_sample(&control).await;
     let (hold, entered) = control.hold_next_bind_before_attach_commit();
-    let bind_control = std::sync::Arc::clone(&control);
-    let task = tokio::spawn(async move {
-        bind_control
-            .bind_agent_before_start_on_persist("unpersisted-agent", pending, |_| {})
-            .await
-    });
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let handle = std::sync::Arc::clone(&control).spawn_bind_attempt(
+        "unpersisted-agent",
+        pending,
+        |_| {},
+        cancel_rx,
+    );
+    let task = tokio::spawn(handle.wait());
 
     tokio::time::timeout(std::time::Duration::from_secs(5), entered)
         .await
@@ -1329,15 +1331,10 @@ async fn bind_drop_before_attach_commit_does_not_create_active_agent() {
         .await
         .expect("cancelled bind should not wait indefinitely");
     assert!(join.is_err(), "bind future must keep the cancel outcome");
+    let _ = cancel_tx.send(());
     drop(hold);
+    tokio::task::yield_now().await;
 
-    assert!(
-        !control
-            .reconcile_agent_attach("unpersisted-agent")
-            .await
-            .expect("reconcile"),
-        "pre-commit cancel must not observe a durable attach"
-    );
     control
         .record_agent_terminal("unpersisted-agent", "interrupted")
         .await
@@ -1357,7 +1354,7 @@ async fn bind_drop_before_attach_commit_does_not_create_active_agent() {
 }
 
 #[tokio::test]
-async fn bind_drop_after_durable_commit_is_visible_to_reconcile() {
+async fn bind_drop_after_durable_commit_settles_without_snapshot_inject() {
     let sink = crate::RecordingSink::default();
     let control = std::sync::Arc::new(TeamControl::with_memory_store(
         TeamGraphCatalog::new([sample_graph()]),
@@ -1365,14 +1362,18 @@ async fn bind_drop_after_durable_commit_is_visible_to_reconcile() {
     ));
     let (started, pending) = start_bound_sample(&control).await;
     let (hold, entered) = control.hold_next_bind_after_durable_commit();
-    let bind_control = std::sync::Arc::clone(&control);
-    let task = tokio::spawn(async move {
-        bind_control
-            .bind_agent_before_start_on_persist("agent-a", pending, |_| {
-                panic!("persist callback must not run before outer observes bind success");
-            })
-            .await
-    });
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let persisted_flag = std::sync::Arc::clone(&persisted);
+    let handle = std::sync::Arc::clone(&control).spawn_bind_attempt(
+        "agent-a",
+        pending,
+        move |_| {
+            persisted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+        cancel_rx,
+    );
+    let task = tokio::spawn(handle.wait());
 
     tokio::time::timeout(std::time::Duration::from_secs(5), entered)
         .await
@@ -1383,19 +1384,32 @@ async fn bind_drop_after_durable_commit_is_visible_to_reconcile() {
         .await
         .expect("cancelled bind should not wait indefinitely");
     assert!(join.is_err(), "bind future must keep the cancel outcome");
+    let _ = cancel_tx.send(());
     drop(hold);
 
-    assert!(
-        control
-            .reconcile_agent_attach("agent-a")
-            .await
-            .expect("reconcile"),
-        "durable attach must be visible even if the outer bind future never observed it"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if persisted.load(std::sync::atomic::Ordering::SeqCst)
+                && control
+                    .status(&started.team_session_id)
+                    .await
+                    .expect("status")
+                    .agents
+                    .len()
+                    == 1
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned bind must apply the committed attach without snapshot inject");
+
     control
         .record_agent_terminal("agent-a", "interrupted")
         .await
-        .expect("terminal after reconcile");
+        .expect("terminal after owned settle");
     control
         .record_agent_terminal("agent-a", "errored")
         .await
@@ -1422,4 +1436,88 @@ async fn bind_drop_after_durable_commit_is_visible_to_reconcile() {
         !kinds.iter().any(|kind| kind == "agent_completed"),
         "errored duplicate must not append another terminal, got {kinds:?}"
     );
+}
+
+#[tokio::test]
+async fn bind_unobserved_commit_serializes_concurrent_team_mutation() {
+    let sink = crate::RecordingSink::default();
+    let control = std::sync::Arc::new(TeamControl::with_memory_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        sink.clone(),
+    ));
+    let (started, pending) = start_bound_sample(&control).await;
+    let (hold, entered) = control.hold_next_bind_after_durable_commit();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let handle =
+        std::sync::Arc::clone(&control).spawn_bind_attempt("agent-a", pending, |_| {}, cancel_rx);
+    let wait_task = tokio::spawn(handle.wait());
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .expect("bind should wait after durable commit")
+        .expect("hold entered");
+    wait_task.abort();
+    let _ = cancel_tx.send(());
+    let mutate_control = std::sync::Arc::clone(&control);
+    let team_session_id = started.team_session_id.clone();
+    let mutate = tokio::spawn(async move {
+        mutate_control
+            .record_deviation(&team_session_id, "concurrent-after-unobserved-commit")
+            .await
+    });
+    drop(hold);
+    mutate.await.expect("mutate task").expect("deviation");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if control
+                .status(&started.team_session_id)
+                .await
+                .expect("status")
+                .agents
+                .len()
+                == 1
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("committed attach must be visible to the same lock");
+    control
+        .record_agent_terminal("agent-a", "interrupted")
+        .await
+        .expect("terminal");
+
+    let events: Vec<_> = sink
+        .envelopes()
+        .into_iter()
+        .filter(|event| event.team_session_id == started.team_session_id)
+        .collect();
+    let sequences: Vec<_> = events.iter().map(|event| event.sequence).collect();
+    let mut ordered = sequences.clone();
+    ordered.sort_unstable();
+    ordered.dedup();
+    assert_eq!(
+        sequences, ordered,
+        "concurrent mutation must not rewind or duplicate sequences: {sequences:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "agent_interrupted")
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "deviation_recorded")
+    );
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status");
+    assert!(status.agents.is_empty());
 }

@@ -1,4 +1,4 @@
-use super::attach_to_start::AttachToStartOwner;
+#[cfg(test)]
 use super::attach_to_start::abort_attach_to_start;
 use super::attach_to_start::settle_attach_to_start;
 use super::residency::is_v2_resident_session_source;
@@ -344,6 +344,18 @@ impl AgentControl {
             args: host_args,
         };
         let backend_identity = (backend.harness.clone(), backend.model.clone());
+        let pending_team_binding = self
+            .resolve_pending_team_binding(pending_team_binding, Some(parent_thread_id))
+            .await;
+        let pending_team_binding = pending_team_binding.map(|mut pending| {
+            if let Some(metadata) = pending.attach_metadata.as_mut() {
+                metadata.identity = Some(codex_team_runtime::AgentBackendIdentity::Acp {
+                    harness: backend_identity.0,
+                    model: backend_identity.1,
+                });
+            }
+            pending
+        });
         self.external_agents.register(
             agent_id,
             backend,
@@ -351,24 +363,17 @@ impl AgentControl {
             env,
             Some(std::sync::Arc::clone(&self.team)),
         )?;
-        let pending_team_binding = if let Some(pending) = pending_team_binding {
-            Some(pending)
-        } else {
-            self.team
-                .binding_for(&parent_thread_id.to_string())
-                .await
-                .map(|binding| binding.to_pending())
-        };
-        let mut attach_to_start = None;
-        if let Some(mut pending) = pending_team_binding {
-            if let Some(metadata) = pending.attach_metadata.as_mut() {
-                metadata.identity = Some(codex_team_runtime::AgentBackendIdentity::Acp {
-                    harness: backend_identity.0,
-                    model: backend_identity.1,
-                });
+        let mut attach_to_start = pending_team_binding
+            .as_ref()
+            .map(|_| self.arm_attach_to_start(agent_id, true));
+        if let (Some(pending), Some(owner)) = (pending_team_binding, attach_to_start.take()) {
+            match Box::pin(owner.bind_pending(pending)).await {
+                Ok(owner) => attach_to_start = Some(owner),
+                Err(error) => {
+                    self.external_agents.remove(agent_id);
+                    return Err(error);
+                }
             }
-            attach_to_start =
-                Box::pin(self.bind_team_agent_for_start(agent_id, pending, true)).await?;
         }
         #[cfg(test)]
         if let Err(error) = self.apply_attach_to_start_test_probe().await {
@@ -547,33 +552,87 @@ impl AgentControl {
         }
     }
 
-    async fn bind_team_agent_for_start(
+    async fn resolve_pending_team_binding(
         &self,
-        agent_thread_id: ThreadId,
-        pending: codex_team_runtime::PendingTeamBinding,
-        cleanup_external: bool,
-    ) -> CodexResult<Option<AttachToStartOwner>> {
-        let owner = self.arm_attach_to_start(agent_thread_id, cleanup_external);
-        let on_persisted = owner.on_persisted();
-        let team = Arc::clone(&self.team);
-        let bind_result = Box::pin(team.bind_agent_before_start_on_persist(
-            agent_thread_id.to_string(),
-            pending,
-            on_persisted,
-        ))
-        .await;
-        match bind_result {
-            Ok(_) => Ok(Some(owner)),
-            Err(err) => {
-                let error = CodexErr::InvalidRequest(err.to_string());
-                if owner.is_committed() {
-                    Err(abort_attach_to_start(Some(owner), error).await)
-                } else {
-                    owner.abandon_uncommitted().await;
-                    Err(error)
+        explicit: Option<codex_team_runtime::PendingTeamBinding>,
+        parent_thread_id: Option<ThreadId>,
+    ) -> Option<codex_team_runtime::PendingTeamBinding> {
+        if explicit.is_some() {
+            return explicit;
+        }
+        let parent_thread_id = parent_thread_id?;
+        self.team
+            .binding_for(&parent_thread_id.to_string())
+            .await
+            .map(|binding| binding.to_pending())
+    }
+
+    async fn arm_and_bind_native_team_agent(
+        &self,
+        pending_team_binding: Option<codex_team_runtime::PendingTeamBinding>,
+        new_thread: &crate::thread_manager::NewThread,
+        notification_source: Option<&SessionSource>,
+        state: &Arc<ThreadManagerState>,
+    ) -> CodexResult<Option<super::attach_to_start::AttachToStartOwner>> {
+        let mut attach_to_start = pending_team_binding
+            .as_ref()
+            .map(|_| self.arm_attach_to_start(new_thread.thread_id, false));
+        if let Some(SessionSource::SubAgent(
+            subagent_source @ SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            },
+        )) = notification_source
+        {
+            let client_metadata = match state.get_thread(*parent_thread_id).await {
+                Ok(parent_thread) => parent_thread.session.app_server_client_metadata().await,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        parent_thread_id = %parent_thread_id,
+                        "skipping subagent thread analytics: failed to load parent thread metadata"
+                    );
+                    crate::session::session::AppServerClientMetadata {
+                        client_name: None,
+                        client_version: None,
+                    }
                 }
+            };
+            let thread_config = new_thread.thread.config_snapshot().await;
+            let parent_thread_id = thread_config.parent_thread_id;
+            emit_subagent_session_started(
+                &new_thread.thread.session.services.analytics_events_client,
+                client_metadata,
+                new_thread.thread.session.session_id(),
+                new_thread.thread_id,
+                parent_thread_id,
+                thread_config,
+                subagent_source.clone(),
+            );
+        }
+
+        // Notify a new thread has been created. This notification will be processed by clients
+        // to subscribe or drain this newly created thread.
+        // TODO(jif) add helper for drain
+        state.notify_thread_created(new_thread.thread_id);
+
+        self.persist_thread_spawn_edge_for_source(
+            new_thread.thread.as_ref(),
+            new_thread.thread_id,
+            notification_source,
+        )
+        .await;
+
+        if let Some(mut pending) = pending_team_binding {
+            if let Some(metadata) = pending.attach_metadata.as_mut() {
+                metadata.identity = Some(codex_team_runtime::AgentBackendIdentity::Native {
+                    model: new_thread.thread.config_snapshot().await.model,
+                });
+            }
+            if let Some(owner) = attach_to_start.take() {
+                attach_to_start = Some(Box::pin(owner.bind_pending(pending)).await?);
             }
         }
+        Ok(attach_to_start)
     }
 
     async fn spawn_agent_internal(
@@ -646,6 +705,12 @@ impl AgentControl {
         };
         agent_metadata.metadata = options.metadata.clone();
         let notification_source = session_source.clone();
+        let pending_team_binding = self
+            .resolve_pending_team_binding(
+                options.pending_team_binding.clone(),
+                options.parent_thread_id,
+            )
+            .await;
 
         // The same `AgentControl` is sent to spawn the thread.
         let new_thread = match (session_source, options.fork_mode.as_ref(), inheritance) {
@@ -695,72 +760,13 @@ impl AgentControl {
             residency_slot.commit(new_thread.thread_id);
         }
 
-        if let Some(SessionSource::SubAgent(
-            subagent_source @ SubAgentSource::ThreadSpawn {
-                parent_thread_id, ..
-            },
-        )) = notification_source.as_ref()
-        {
-            let client_metadata = match state.get_thread(*parent_thread_id).await {
-                Ok(parent_thread) => parent_thread.session.app_server_client_metadata().await,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        parent_thread_id = %parent_thread_id,
-                        "skipping subagent thread analytics: failed to load parent thread metadata"
-                    );
-                    crate::session::session::AppServerClientMetadata {
-                        client_name: None,
-                        client_version: None,
-                    }
-                }
-            };
-            let thread_config = new_thread.thread.config_snapshot().await;
-            let parent_thread_id = thread_config.parent_thread_id;
-            emit_subagent_session_started(
-                &new_thread.thread.session.services.analytics_events_client,
-                client_metadata,
-                new_thread.thread.session.session_id(),
-                new_thread.thread_id,
-                parent_thread_id,
-                thread_config,
-                subagent_source.clone(),
-            );
-        }
-
-        // Notify a new thread has been created. This notification will be processed by clients
-        // to subscribe or drain this newly created thread.
-        // TODO(jif) add helper for drain
-        state.notify_thread_created(new_thread.thread_id);
-
-        self.persist_thread_spawn_edge_for_source(
-            new_thread.thread.as_ref(),
-            new_thread.thread_id,
+        let attach_to_start = Box::pin(self.arm_and_bind_native_team_agent(
+            pending_team_binding,
+            &new_thread,
             notification_source.as_ref(),
-        )
-        .await;
-
-        let pending_team_binding = if let Some(pending) = options.pending_team_binding.clone() {
-            Some(pending)
-        } else if let Some(parent_thread_id) = options.parent_thread_id {
-            self.team
-                .binding_for(&parent_thread_id.to_string())
-                .await
-                .map(|binding| binding.to_pending())
-        } else {
-            None
-        };
-        let mut attach_to_start = None;
-        if let Some(mut pending) = pending_team_binding {
-            if let Some(metadata) = pending.attach_metadata.as_mut() {
-                metadata.identity = Some(codex_team_runtime::AgentBackendIdentity::Native {
-                    model: new_thread.thread.config_snapshot().await.model,
-                });
-            }
-            attach_to_start =
-                Box::pin(self.bind_team_agent_for_start(new_thread.thread_id, pending, false))
-                    .await?;
-        }
+            &state,
+        ))
+        .await?;
 
         #[cfg(test)]
         if let Err(error) = self.apply_attach_to_start_test_probe().await {

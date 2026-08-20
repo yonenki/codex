@@ -28,6 +28,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 
 pub struct TeamControl {
@@ -242,6 +244,50 @@ pub struct TeamView {
     pub possible_next: Vec<NextAction>,
     pub recommended_next: Vec<NextAction>,
     pub waiting_reason: Option<String>,
+}
+
+/// outer cancel から独立して settle する bind の結果。
+#[derive(Clone, Debug)]
+pub enum BindAttemptOutcome {
+    /// persist 開始前に cancel された。
+    Uncommitted,
+    /// agent_attached を store と in-memory へ適用した。
+    Attached(TeamAgentBinding),
+    /// persist 経路が失敗した。`committed` は durable attach が残っているか。
+    Failed {
+        error: TeamRuntimeError,
+        committed: bool,
+    },
+}
+
+/// persist 開始後は caller の drop では止まらない bind の待ち口。
+#[derive(Clone)]
+pub struct BindAttemptHandle {
+    settle: tokio::sync::watch::Receiver<Option<BindAttemptOutcome>>,
+}
+
+impl BindAttemptHandle {
+    pub async fn wait(mut self) -> BindAttemptOutcome {
+        wait_bind_attempt_outcome(&mut self.settle).await
+    }
+}
+
+async fn wait_bind_attempt_outcome(
+    settle: &mut tokio::sync::watch::Receiver<Option<BindAttemptOutcome>>,
+) -> BindAttemptOutcome {
+    loop {
+        if let Some(outcome) = settle.borrow().clone() {
+            return outcome;
+        }
+        if settle.changed().await.is_err() {
+            return BindAttemptOutcome::Failed {
+                error: TeamRuntimeError::invalid(
+                    "bind attempt ended without reporting a durable outcome",
+                ),
+                committed: false,
+            };
+        }
+    }
 }
 
 impl TeamControl {
@@ -805,7 +851,60 @@ impl TeamControl {
         pending: PendingTeamBinding,
         on_persisted: impl FnOnce(&TeamAgentBinding),
     ) -> TeamRuntimeResult<TeamAgentBinding> {
+        await_bind_persist_hold(&self.bind_persist_hold.before_attach).await;
+        self.persist_bind_after_pre_gate(agent_thread_id.into(), pending, on_persisted)
+            .await
+    }
+
+    /// persist 開始前だけ cancel を受け、開始後は outer drop から独立して settle する。
+    pub fn spawn_bind_attempt(
+        self: Arc<Self>,
+        agent_thread_id: impl Into<String>,
+        pending: PendingTeamBinding,
+        on_persisted: impl FnOnce(&TeamAgentBinding) + Send + 'static,
+        pre_commit_cancel: tokio::sync::oneshot::Receiver<()>,
+    ) -> BindAttemptHandle {
         let agent_thread_id = agent_thread_id.into();
+        let (settle_tx, settle_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(async move {
+            let cancelled = tokio::select! {
+                biased;
+                _ = pre_commit_cancel => true,
+                () = await_bind_persist_hold(&self.bind_persist_hold.before_attach) => false,
+            };
+            let outcome = if cancelled {
+                BindAttemptOutcome::Uncommitted
+            } else {
+                let committed = Arc::new(AtomicBool::new(false));
+                let on_persisted = {
+                    let committed = Arc::clone(&committed);
+                    move |binding: &TeamAgentBinding| {
+                        committed.store(true, Ordering::SeqCst);
+                        on_persisted(binding);
+                    }
+                };
+                match self
+                    .persist_bind_after_pre_gate(agent_thread_id, pending, on_persisted)
+                    .await
+                {
+                    Ok(binding) => BindAttemptOutcome::Attached(binding),
+                    Err(error) => BindAttemptOutcome::Failed {
+                        committed: committed.load(Ordering::SeqCst),
+                        error,
+                    },
+                }
+            };
+            let _ = settle_tx.send(Some(outcome));
+        });
+        BindAttemptHandle { settle: settle_rx }
+    }
+
+    async fn persist_bind_after_pre_gate(
+        &self,
+        agent_thread_id: String,
+        pending: PendingTeamBinding,
+        on_persisted: impl FnOnce(&TeamAgentBinding),
+    ) -> TeamRuntimeResult<TeamAgentBinding> {
         let backend_fallback = pending.backend_fallback;
         let attach_metadata = pending.attach_metadata.clone();
         let (backend, harness, model, delegation_message) = match attach_metadata {
@@ -833,7 +932,6 @@ impl TeamControl {
             None => (None, None, None, None),
         };
         let binding = pending.bind(agent_thread_id.clone());
-        await_bind_persist_hold(&self.bind_persist_hold.before_attach).await;
         self.store.persist_binding(binding.clone()).await?;
         {
             let mut bindings = self.bindings.lock().await;
@@ -883,7 +981,8 @@ impl TeamControl {
         Ok(binding)
     }
 
-    /// 次の bind を attach 永続化の直前で止める。
+    /// 次の bind を attach 永続化の直前で止める。テスト専用。
+    #[doc(hidden)]
     pub fn hold_next_bind_before_attach_commit(
         &self,
     ) -> (
@@ -893,7 +992,8 @@ impl TeamControl {
         arm_bind_persist_hold(&self.bind_persist_hold.before_attach)
     }
 
-    /// 次の bind を store へ書いた直後、in-memory 適用と persist callback の前で止める。
+    /// 次の bind を store へ書いた直後、in-memory 適用と persist callback の前で止める。テスト専用。
+    #[doc(hidden)]
     pub fn hold_next_bind_after_durable_commit(
         &self,
     ) -> (
@@ -901,47 +1001,6 @@ impl TeamControl {
         tokio::sync::oneshot::Receiver<()>,
     ) {
         arm_bind_persist_hold(&self.bind_persist_hold.after_durable)
-    }
-
-    /// durable snapshot を正として attach 成否を返す。in-memory が未反映なら store から取り込む。
-    pub async fn reconcile_agent_attach(&self, agent_thread_id: &str) -> TeamRuntimeResult<bool> {
-        self.ensure_restored().await?;
-        {
-            let teams = self.teams.lock().await;
-            if teams
-                .values()
-                .any(|state| state.agents.contains_key(agent_thread_id))
-            {
-                return Ok(true);
-            }
-        }
-        let stored_teams = self.store.load_teams().await?;
-        let Some(stored) = stored_teams
-            .into_iter()
-            .find(|state| state.agents.contains_key(agent_thread_id))
-        else {
-            return Ok(false);
-        };
-        {
-            let mut teams = self.teams.lock().await;
-            teams.insert(stored.team_session_id.clone(), stored);
-        }
-        if self.binding_for(agent_thread_id).await.is_none() {
-            if let Some(binding) = self
-                .store
-                .load_bindings()
-                .await?
-                .into_iter()
-                .find(|binding| binding.agent_thread_id == agent_thread_id)
-            {
-                self.bindings
-                    .lock()
-                    .await
-                    .insert(agent_thread_id.to_string(), binding);
-            }
-        }
-        self.refresh_surface().await;
-        Ok(true)
     }
 
     /// 以後の outbox publish 先を差し替える。
