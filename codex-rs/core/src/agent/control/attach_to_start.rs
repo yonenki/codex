@@ -1,5 +1,4 @@
 use super::AgentControl;
-use super::external::ExternalAgentManager;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -11,14 +10,15 @@ use tokio::sync::oneshot;
 #[cfg(test)]
 use std::sync::Mutex;
 
-/// agent_attached の永続 commit 後から初回入力または start hook 成功までの Team 終端所有権。
-/// 解除せずに破棄されたときは interrupted として終端する。
+/// Native または ACP の実行体ができた直後から start 成功までの Team bind 所有権。
+/// Drop 時は永続 attach を reconcile し、未commitなら実行体の cleanup のみ、commit 済みなら interrupted を一度だけ記録する。
 pub(super) struct AttachToStartOwner {
-    team: Arc<codex_team_runtime::TeamControl>,
-    agent_thread_id: String,
+    control: AgentControl,
+    agent_thread_id: ThreadId,
+    cleanup_external: bool,
+    committed: Arc<AtomicBool>,
     disarmed: Arc<AtomicBool>,
     wakeup: Option<oneshot::Sender<()>>,
-    external: Option<(Arc<ExternalAgentManager>, ThreadId)>,
 }
 
 #[cfg(test)]
@@ -30,50 +30,67 @@ pub(super) struct AttachToStartTestControl {
 }
 
 impl AttachToStartOwner {
-    fn arm(
-        team: Arc<codex_team_runtime::TeamControl>,
-        agent_thread_id: impl Into<String>,
-        external: Option<(Arc<ExternalAgentManager>, ThreadId)>,
-    ) -> Self {
-        let agent_thread_id = agent_thread_id.into();
+    fn arm(control: AgentControl, agent_thread_id: ThreadId, cleanup_external: bool) -> Self {
+        let committed = Arc::new(AtomicBool::new(false));
         let disarmed = Arc::new(AtomicBool::new(false));
         let (wakeup, parked) = oneshot::channel();
-        let team_task = Arc::clone(&team);
-        let agent_task = agent_thread_id.clone();
+        let control_task = control.clone();
+        let committed_task = Arc::clone(&committed);
         let disarmed_task = Arc::clone(&disarmed);
-        let external_task = external.clone();
         tokio::spawn(async move {
             let _ = parked.await;
             if disarmed_task.load(Ordering::SeqCst) {
                 return;
             }
-            if let Some((manager, agent_id)) = external_task {
-                manager.remove(agent_id);
-            }
-            let _ = team_task
-                .record_agent_terminal(&agent_task, "interrupted")
+            control_task
+                .settle_dropped_bind_attempt(
+                    agent_thread_id,
+                    cleanup_external,
+                    committed_task.load(Ordering::SeqCst),
+                )
                 .await;
         });
         Self {
-            team,
+            control,
             agent_thread_id,
+            cleanup_external,
+            committed,
             disarmed,
             wakeup: Some(wakeup),
-            external,
         }
+    }
+
+    /// persist callback から呼ぶ。以後の Drop は interrupted へ収束する。
+    pub(super) fn on_persisted(&self) -> impl FnOnce(&codex_team_runtime::TeamAgentBinding) {
+        let committed = Arc::clone(&self.committed);
+        move |_| {
+            committed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::SeqCst)
     }
 
     pub(super) fn disarm(mut self) {
         self.release(true);
     }
 
+    pub(super) async fn abandon_uncommitted(mut self) {
+        self.control
+            .cleanup_bind_attempt_resources(self.agent_thread_id, self.cleanup_external)
+            .await;
+        self.release(true);
+    }
+
     pub(super) async fn fail_errored(mut self) {
-        if let Some((manager, agent_id)) = self.external.take() {
-            manager.remove(agent_id);
-        }
+        self.control
+            .cleanup_bind_attempt_resources(self.agent_thread_id, self.cleanup_external)
+            .await;
         let _ = self
-            .team
-            .record_agent_terminal(&self.agent_thread_id, "errored")
+            .control
+            .team()
+            .record_agent_terminal(&self.agent_thread_id.to_string(), "errored")
             .await;
         self.release(true);
     }
@@ -127,13 +144,43 @@ impl AgentControl {
         agent_thread_id: ThreadId,
         cleanup_external: bool,
     ) -> AttachToStartOwner {
-        let external =
-            cleanup_external.then(|| (Arc::clone(&self.external_agents), agent_thread_id));
-        AttachToStartOwner::arm(
-            Arc::clone(&self.team),
-            agent_thread_id.to_string(),
-            external,
-        )
+        AttachToStartOwner::arm(self.clone(), agent_thread_id, cleanup_external)
+    }
+
+    async fn cleanup_bind_attempt_resources(
+        &self,
+        agent_thread_id: ThreadId,
+        cleanup_external: bool,
+    ) {
+        if cleanup_external {
+            self.external_agents.remove(agent_thread_id);
+        } else {
+            let _ = self.shutdown_live_agent(agent_thread_id).await;
+        }
+    }
+
+    async fn settle_dropped_bind_attempt(
+        &self,
+        agent_thread_id: ThreadId,
+        cleanup_external: bool,
+        committed: bool,
+    ) {
+        self.cleanup_bind_attempt_resources(agent_thread_id, cleanup_external)
+            .await;
+        let attached = if committed {
+            true
+        } else {
+            self.team()
+                .reconcile_agent_attach(&agent_thread_id.to_string())
+                .await
+                .unwrap_or(false)
+        };
+        if attached {
+            let _ = self
+                .team()
+                .record_agent_terminal(&agent_thread_id.to_string(), "interrupted")
+                .await;
+        }
     }
 
     #[cfg(test)]

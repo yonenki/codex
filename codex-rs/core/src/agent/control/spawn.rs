@@ -553,24 +553,25 @@ impl AgentControl {
         pending: codex_team_runtime::PendingTeamBinding,
         cleanup_external: bool,
     ) -> CodexResult<Option<AttachToStartOwner>> {
-        let mut owner = None;
+        let owner = self.arm_attach_to_start(agent_thread_id, cleanup_external);
+        let on_persisted = owner.on_persisted();
         let team = Arc::clone(&self.team);
         let bind_result = Box::pin(team.bind_agent_before_start_on_persist(
             agent_thread_id.to_string(),
             pending,
-            |_| {
-                owner = Some(self.arm_attach_to_start(agent_thread_id, cleanup_external));
-            },
+            on_persisted,
         ))
         .await;
         match bind_result {
-            Ok(_) => Ok(owner),
+            Ok(_) => Ok(Some(owner)),
             Err(err) => {
-                if cleanup_external {
-                    // persist 前失敗では owner が無いため、ここで ACP 実行体を外す。
-                    self.external_agents.remove(agent_thread_id);
+                let error = CodexErr::InvalidRequest(err.to_string());
+                if owner.is_committed() {
+                    Err(abort_attach_to_start(Some(owner), error).await)
+                } else {
+                    owner.abandon_uncommitted().await;
+                    Err(error)
                 }
-                Err(abort_attach_to_start(owner, CodexErr::InvalidRequest(err.to_string())).await)
             }
         }
     }

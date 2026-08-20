@@ -155,6 +155,11 @@ impl AgentControl {
         self.external_agents.contains(agent_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn registered_external_agent_ids(&self) -> Vec<ThreadId> {
+        self.external_agents.registered_ids()
+    }
+
     pub(crate) fn external_backend_identity(
         &self,
         agent_id: ThreadId,

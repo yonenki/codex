@@ -218,6 +218,16 @@ impl ExternalAgentManager {
         self.agent(agent_id).is_some()
     }
 
+    #[cfg(test)]
+    pub(super) fn registered_ids(&self) -> Vec<ThreadId> {
+        self.agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub(super) fn register(
         &self,
         agent_id: ThreadId,

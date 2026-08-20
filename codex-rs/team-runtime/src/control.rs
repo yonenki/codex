@@ -39,6 +39,19 @@ pub struct TeamControl {
     surface: std::sync::RwLock<SurfaceSnapshot>,
     tool_reporting_agents: Mutex<std::collections::HashSet<String>>,
     restored: tokio::sync::OnceCell<()>,
+    bind_persist_hold: BindPersistHold,
+}
+
+#[derive(Default)]
+struct BindPersistHold {
+    before_attach: std::sync::Mutex<BindPersistHoldSlot>,
+    after_durable: std::sync::Mutex<BindPersistHoldSlot>,
+}
+
+#[derive(Default)]
+struct BindPersistHoldSlot {
+    release: Option<tokio::sync::oneshot::Receiver<()>>,
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -254,6 +267,7 @@ impl TeamControl {
             surface: std::sync::RwLock::new(SurfaceSnapshot::default()),
             tool_reporting_agents: Mutex::new(std::collections::HashSet::new()),
             restored: tokio::sync::OnceCell::const_new(),
+            bind_persist_hold: BindPersistHold::default(),
         }
     }
 
@@ -819,6 +833,7 @@ impl TeamControl {
             None => (None, None, None, None),
         };
         let binding = pending.bind(agent_thread_id.clone());
+        await_bind_persist_hold(&self.bind_persist_hold.before_attach).await;
         self.store.persist_binding(binding.clone()).await?;
         {
             let mut bindings = self.bindings.lock().await;
@@ -858,12 +873,75 @@ impl TeamControl {
                 delegation_message,
             },
         };
-        self.persist_committed_event(state, event).await?;
+        let next = self.persist_event_snapshot(state, event).await?;
+        await_bind_persist_hold(&self.bind_persist_hold.after_durable).await;
+        *state = next;
         on_persisted(&binding);
         self.flush_committed_outbox().await?;
         drop(teams);
         self.refresh_surface().await;
         Ok(binding)
+    }
+
+    /// 次の bind を attach 永続化の直前で止める。
+    pub fn hold_next_bind_before_attach_commit(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        arm_bind_persist_hold(&self.bind_persist_hold.before_attach)
+    }
+
+    /// 次の bind を store へ書いた直後、in-memory 適用と persist callback の前で止める。
+    pub fn hold_next_bind_after_durable_commit(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        arm_bind_persist_hold(&self.bind_persist_hold.after_durable)
+    }
+
+    /// durable snapshot を正として attach 成否を返す。in-memory が未反映なら store から取り込む。
+    pub async fn reconcile_agent_attach(&self, agent_thread_id: &str) -> TeamRuntimeResult<bool> {
+        self.ensure_restored().await?;
+        {
+            let teams = self.teams.lock().await;
+            if teams
+                .values()
+                .any(|state| state.agents.contains_key(agent_thread_id))
+            {
+                return Ok(true);
+            }
+        }
+        let stored_teams = self.store.load_teams().await?;
+        let Some(stored) = stored_teams
+            .into_iter()
+            .find(|state| state.agents.contains_key(agent_thread_id))
+        else {
+            return Ok(false);
+        };
+        {
+            let mut teams = self.teams.lock().await;
+            teams.insert(stored.team_session_id.clone(), stored);
+        }
+        if self.binding_for(agent_thread_id).await.is_none() {
+            if let Some(binding) = self
+                .store
+                .load_bindings()
+                .await?
+                .into_iter()
+                .find(|binding| binding.agent_thread_id == agent_thread_id)
+            {
+                self.bindings
+                    .lock()
+                    .await
+                    .insert(agent_thread_id.to_string(), binding);
+            }
+        }
+        self.refresh_surface().await;
+        Ok(true)
     }
 
     /// 以後の outbox publish 先を差し替える。
@@ -1264,11 +1342,11 @@ impl TeamControl {
         Ok(Some(view))
     }
 
-    async fn persist_committed_event(
+    async fn persist_event_snapshot(
         &self,
-        state: &mut TeamSessionState,
+        state: &TeamSessionState,
         event: TeamEvent,
-    ) -> TeamRuntimeResult<()> {
+    ) -> TeamRuntimeResult<TeamSessionState> {
         let mut next = state.clone();
         if event.sequence == 1 && event.kind == TeamEventKind::TeamStarted {
             // start_team already constructed the initial snapshot.
@@ -1278,7 +1356,15 @@ impl TeamControl {
         self.store
             .persist_event(next.clone(), event.clone())
             .await?;
-        *state = next;
+        Ok(next)
+    }
+
+    async fn persist_committed_event(
+        &self,
+        state: &mut TeamSessionState,
+        event: TeamEvent,
+    ) -> TeamRuntimeResult<()> {
+        *state = self.persist_event_snapshot(state, event).await?;
         Ok(())
     }
 
@@ -1318,6 +1404,38 @@ impl TeamControl {
             recommended,
             open_team_count: teams.values().filter(|team| team.is_open()).count(),
         };
+    }
+}
+
+fn arm_bind_persist_hold(
+    slot: &std::sync::Mutex<BindPersistHoldSlot>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = BindPersistHoldSlot {
+        release: Some(release_rx),
+        entered: Some(entered_tx),
+    };
+    (release_tx, entered_rx)
+}
+
+async fn await_bind_persist_hold(slot: &std::sync::Mutex<BindPersistHoldSlot>) {
+    let (release, entered) = {
+        let mut hold = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (hold.release.take(), hold.entered.take())
+    };
+    if let Some(entered) = entered {
+        let _ = entered.send(());
+    }
+    if let Some(release) = release {
+        let _ = release.await;
     }
 }
 
