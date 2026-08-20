@@ -1,3 +1,4 @@
+use crate::binding::AgentBackend;
 use crate::ids::EventId;
 use crate::ids::NodeRunId;
 use crate::ids::TeamSessionId;
@@ -81,6 +82,14 @@ pub enum TeamEventPayload {
         /// 明示的な backend fallback のときだけ true にする。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backend_fallback: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend: Option<AgentBackend>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        harness: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delegation_message: Option<String>,
     },
     AgentTerminal {
         status: String,
@@ -156,5 +165,49 @@ impl TeamEvent {
             role: None,
             payload,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn agent_attached_accepts_legacy_payload_and_round_trips_attach_metadata() {
+        let legacy: TeamEventPayload = serde_json::from_value(json!({
+            "type": "agent_attached",
+            "role": "worker"
+        }))
+        .expect("legacy agent_attached payload");
+        assert_eq!(
+            legacy,
+            TeamEventPayload::AgentAttached {
+                role: "worker".into(),
+                backend_fallback: None,
+                backend: None,
+                harness: None,
+                model: None,
+                delegation_message: None,
+            }
+        );
+
+        let payload = TeamEventPayload::AgentAttached {
+            role: "worker".into(),
+            backend_fallback: None,
+            backend: Some(AgentBackend::Acp),
+            harness: Some("cursor".into()),
+            model: Some("cursor-model".into()),
+            delegation_message: Some("preserve\nthis exact message".into()),
+        };
+        let value = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(value["backend"], "acp");
+        assert_eq!(value["harness"], "cursor");
+        assert_eq!(value["model"], "cursor-model");
+        assert_eq!(value["delegation_message"], "preserve\nthis exact message");
+        assert_eq!(
+            serde_json::from_value::<TeamEventPayload>(value).expect("deserialize"),
+            payload
+        );
     }
 }

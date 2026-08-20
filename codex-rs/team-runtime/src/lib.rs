@@ -11,6 +11,9 @@ mod sink;
 mod state;
 mod store;
 
+pub use binding::AgentBackend;
+pub use binding::AgentBackendIdentity;
+pub use binding::PendingAgentAttachMetadata;
 pub use binding::PendingTeamBinding;
 pub use binding::TeamAgentBinding;
 pub use contract::TEAM_EVENTS_CONTRACT_VERSION;

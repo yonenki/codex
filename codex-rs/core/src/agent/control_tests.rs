@@ -5541,12 +5541,16 @@ async fn team_spawn_binds_native_agent_before_first_turn() {
         })
         .await
         .expect("start node");
-    let pending = harness
+    let mut pending = harness
         .control
         .team()
         .pending_binding_for_node(&started.team_session_id, "worker")
         .await
         .expect("pending");
+    let exact_message = "do the work\nwith exact  spacing";
+    pending.attach_metadata = Some(codex_team_runtime::PendingAgentAttachMetadata::new(
+        exact_message.into(),
+    ));
     let (parent_thread_id, _) = harness.start_thread().await;
     let spawn = harness
         .control
@@ -5556,7 +5560,7 @@ async fn team_spawn_binds_native_agent_before_first_turn() {
                 AgentPath::root(),
                 AgentPath::try_from("/root/worker").expect("path"),
                 Vec::new(),
-                "do the work".into(),
+                exact_message.into(),
                 /*trigger_turn*/ true,
             ),
             AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
@@ -5586,6 +5590,7 @@ async fn team_spawn_binds_native_agent_before_first_turn() {
                 .unwrap_or_else(ThreadId::new)
         });
     if let Ok(agent) = spawn {
+        let expected_model = harness.config.model.clone();
         let binding = harness
             .control
             .team()
@@ -5595,10 +5600,179 @@ async fn team_spawn_binds_native_agent_before_first_turn() {
         assert_eq!(binding.role, "worker");
         assert_eq!(binding.team_session_id, started.team_session_id);
         assert_eq!(agent.thread_id, thread_id);
+        let store = codex_team_runtime::SqliteTeamStore::open(
+            &codex_team_runtime::TeamControl::team_store_path(
+                &harness.config.codex_home.to_path_buf(),
+            ),
+        )
+        .await
+        .expect("open team store");
+        let attached = codex_team_runtime::TeamStore::load_events(&store, &started.team_session_id)
+            .await
+            .expect("load team events")
+            .into_iter()
+            .find(|event| event.kind == codex_team_runtime::TeamEventKind::AgentAttached)
+            .expect("agent_attached");
+        let codex_team_runtime::TeamEventPayload::AgentAttached {
+            backend,
+            harness: attached_harness,
+            model,
+            delegation_message,
+            ..
+        } = attached.payload
+        else {
+            panic!("agent_attached payload");
+        };
+        assert_eq!(backend, Some(codex_team_runtime::AgentBackend::Native));
+        assert_eq!(attached_harness, None);
+        assert_eq!(model.as_deref(), expected_model.as_deref());
+        assert_eq!(delegation_message.as_deref(), Some(exact_message));
     } else {
         let bindings_exist = harness.control.team().open_team_count() > 0;
         assert!(bindings_exist);
     }
+}
+
+#[tokio::test]
+async fn team_spawn_persists_acp_identity_and_message_before_start_hook() {
+    let (home, mut config) = test_config().await;
+    config.permissions.shell_environment_policy.r#set.insert(
+        "CODEX_ACP_HARNESS_HOST_COMMAND".to_string(),
+        std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    harness
+        .control
+        .team()
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([
+            sample_team_graph(),
+        ]))
+        .await;
+    let started = harness
+        .control
+        .team()
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    harness
+        .control
+        .team()
+        .start_node(codex_team_runtime::StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+    let exact_message = "ACP delegation\nwith exact  spacing";
+    let mut pending = harness
+        .control
+        .team()
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    pending.attach_metadata = Some(codex_team_runtime::PendingAgentAttachMetadata::new(
+        exact_message.into(),
+    ));
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let trace_seen_by_start_hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_flag = Arc::clone(&trace_seen_by_start_hook);
+    let hook_store_path =
+        codex_team_runtime::TeamControl::team_store_path(&harness.config.codex_home.to_path_buf());
+    let hook_team_id = started.team_session_id.clone();
+    let hook_message = exact_message.to_string();
+
+    let spawn = timeout(
+        Duration::from_secs(5),
+        harness.control.spawn_external_agent_with_communication(
+            harness.config.clone(),
+            crate::agent::role::ExternalAgentBackend {
+                harness: "cursor".into(),
+                model: Some("cursor-model".into()),
+                effort: None,
+            },
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker_acp").expect("path"),
+                Vec::new(),
+                exact_message.into(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(AgentPath::try_from("/root/worker_acp").expect("path")),
+                agent_nickname: None,
+                agent_role: Some("worker".into()),
+            }),
+            None,
+            Some(pending),
+            move |_| async move {
+                let store = codex_team_runtime::SqliteTeamStore::open(&hook_store_path)
+                    .await
+                    .expect("open team store from start hook");
+                let saw_exact_trace =
+                    codex_team_runtime::TeamStore::load_events(&store, &hook_team_id)
+                        .await
+                        .expect("load team events from start hook")
+                        .into_iter()
+                        .any(|event| {
+                            matches!(
+                                event.payload,
+                                codex_team_runtime::TeamEventPayload::AgentAttached {
+                                    backend: Some(codex_team_runtime::AgentBackend::Acp),
+                                    harness: Some(ref harness),
+                                    model: Some(ref model),
+                                    delegation_message: Some(ref message),
+                                    ..
+                                } if harness == "cursor"
+                                    && model == "cursor-model"
+                                    && message == &hook_message
+                            )
+                        });
+                hook_flag.store(saw_exact_trace, std::sync::atomic::Ordering::SeqCst);
+            },
+        ),
+    )
+    .await
+    .expect("external start attempt should terminate");
+    spawn.expect("external agent registration");
+    assert!(trace_seen_by_start_hook.load(std::sync::atomic::Ordering::SeqCst));
+
+    let store = codex_team_runtime::SqliteTeamStore::open(
+        &codex_team_runtime::TeamControl::team_store_path(&harness.config.codex_home.to_path_buf()),
+    )
+    .await
+    .expect("open team store");
+    let attached = codex_team_runtime::TeamStore::load_events(&store, &started.team_session_id)
+        .await
+        .expect("load events")
+        .into_iter()
+        .find(|event| event.kind == codex_team_runtime::TeamEventKind::AgentAttached)
+        .expect("agent_attached persisted before start hook");
+    let codex_team_runtime::TeamEventPayload::AgentAttached {
+        backend,
+        harness: attached_harness,
+        model,
+        delegation_message,
+        ..
+    } = attached.payload
+    else {
+        panic!("agent_attached payload");
+    };
+    assert_eq!(backend, Some(codex_team_runtime::AgentBackend::Acp));
+    assert_eq!(attached_harness.as_deref(), Some("cursor"));
+    assert_eq!(model.as_deref(), Some("cursor-model"));
+    assert_eq!(delegation_message.as_deref(), Some(exact_message));
 }
 
 #[tokio::test]

@@ -149,6 +149,9 @@ async fn handle_team_spawn(
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
     let message = message_content(args.message)?;
+    pending.attach_metadata = Some(codex_team_runtime::PendingAgentAttachMetadata::new(
+        message.clone(),
+    ));
     let turn = invocation.turn.as_ref();
     let mut config = build_agent_spawn_config(
         &invocation.session.get_base_instructions().await,

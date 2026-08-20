@@ -117,6 +117,71 @@ async fn sqlite_restores_team_node_and_binding() {
 }
 
 #[tokio::test]
+async fn sqlite_reopen_preserves_exact_long_agent_attach_metadata_in_outbox() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("long-attach.sqlite");
+    let store = crate::SqliteTeamStore::open(&path).await.expect("open");
+    let control = TeamControl::with_store(catalog(), store, crate::FailingSink::fail_times(10));
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let exact_message = format!("start\n{}\nend  ", "x".repeat(199_988));
+    assert_eq!(exact_message.chars().count(), 200_000);
+    let mut pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    pending.attach_metadata = Some(crate::PendingAgentAttachMetadata {
+        delegation_message: exact_message.clone(),
+        identity: Some(crate::AgentBackendIdentity::Native {
+            model: "resolved-native-model".into(),
+        }),
+    });
+    control
+        .bind_agent_before_start("native-1", pending)
+        .await
+        .expect("bind");
+    drop(control);
+
+    let reopened = crate::SqliteTeamStore::open(&path).await.expect("reopen");
+    let attached = reopened
+        .pending_outbox()
+        .await
+        .expect("outbox")
+        .into_iter()
+        .find(|event| event.kind == crate::TeamEventKind::AgentAttached)
+        .expect("agent_attached");
+    let crate::TeamEventPayload::AgentAttached {
+        backend,
+        harness,
+        model,
+        delegation_message,
+        ..
+    } = attached.payload
+    else {
+        panic!("agent_attached payload");
+    };
+    assert_eq!(backend, Some(crate::AgentBackend::Native));
+    assert_eq!(harness, None);
+    assert_eq!(model.as_deref(), Some("resolved-native-model"));
+    assert_eq!(delegation_message.as_deref(), Some(exact_message.as_str()));
+}
+
+#[tokio::test]
 async fn outbox_replays_in_order_after_sink_failure() {
     let sink = FailingSink::fail_times(2);
     let store = crate::SqliteTeamStore::memory().await.expect("memory");

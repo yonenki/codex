@@ -339,6 +339,7 @@ impl AgentControl {
             command: resolved_command.to_string_lossy().into_owned(),
             args: host_args,
         };
+        let backend_identity = (backend.harness.clone(), backend.model.clone());
         self.external_agents.register(
             agent_id,
             backend,
@@ -354,7 +355,13 @@ impl AgentControl {
                 .await
                 .map(|binding| binding.to_pending())
         };
-        if let Some(pending) = pending_team_binding {
+        if let Some(mut pending) = pending_team_binding {
+            if let Some(metadata) = pending.attach_metadata.as_mut() {
+                metadata.identity = Some(codex_team_runtime::AgentBackendIdentity::Acp {
+                    harness: backend_identity.0,
+                    model: backend_identity.1,
+                });
+            }
             self.team
                 .bind_agent_before_start(agent_id.to_string(), pending)
                 .await
@@ -705,7 +712,12 @@ impl AgentControl {
         } else {
             None
         };
-        if let Some(pending) = pending_team_binding {
+        if let Some(mut pending) = pending_team_binding {
+            if let Some(metadata) = pending.attach_metadata.as_mut() {
+                metadata.identity = Some(codex_team_runtime::AgentBackendIdentity::Native {
+                    model: new_thread.thread.config_snapshot().await.model,
+                });
+            }
             self.team
                 .bind_agent_before_start(new_thread.thread_id.to_string(), pending)
                 .await

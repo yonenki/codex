@@ -8,6 +8,8 @@ use crate::event::TeamEvent;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+const TEAM_EVENTS_MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 pub trait TeamEventSink: Send + Sync {
     fn publish(
         &self,
@@ -137,29 +139,60 @@ impl TeamEventSink for HttpTeamEventSink {
         if events.is_empty() {
             return Ok(());
         }
-        let batch = TeamEventsBatch {
-            contract_version: TEAM_EVENTS_CONTRACT_VERSION.to_string(),
-            agent_id: self.agent_id.clone(),
-            events: events.iter().map(TeamEventEnvelope::from_event).collect(),
-        };
         let url = team_events_path(&self.server_url, &self.agent_id);
-        let response = self
-            .client
-            .post(url)
-            .header("content-type", "application/json")
-            .header("x-agent-collab-report-token", &self.report_token)
-            .json(&batch)
-            .send()
-            .await
-            .map_err(|err| TeamRuntimeError::Sink(err.to_string()))?;
-        if !response.status().is_success() {
-            return Err(TeamRuntimeError::Sink(format!(
-                "team event ingest returned {}",
-                response.status()
-            )));
+        for body in serialized_http_batches(&self.agent_id, events)? {
+            let response = self
+                .client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("x-agent-collab-report-token", &self.report_token)
+                .body(body)
+                .send()
+                .await
+                .map_err(|err| TeamRuntimeError::Sink(err.to_string()))?;
+            if !response.status().is_success() {
+                return Err(TeamRuntimeError::Sink(format!(
+                    "team event ingest returned {}",
+                    response.status()
+                )));
+            }
         }
         Ok(())
     }
+}
+
+fn serialized_http_batches(
+    agent_id: &str,
+    events: &[TeamEvent],
+) -> TeamRuntimeResult<Vec<Vec<u8>>> {
+    let mut bodies = Vec::new();
+    serialize_http_chunk(agent_id, events, &mut bodies)?;
+    Ok(bodies)
+}
+
+fn serialize_http_chunk(
+    agent_id: &str,
+    events: &[TeamEvent],
+    bodies: &mut Vec<Vec<u8>>,
+) -> TeamRuntimeResult<()> {
+    let batch = TeamEventsBatch {
+        contract_version: TEAM_EVENTS_CONTRACT_VERSION.to_string(),
+        agent_id: agent_id.to_string(),
+        events: events.iter().map(TeamEventEnvelope::from_event).collect(),
+    };
+    let body = serde_json::to_vec(&batch).map_err(|err| TeamRuntimeError::Sink(err.to_string()))?;
+    if body.len() <= TEAM_EVENTS_MAX_HTTP_BODY_BYTES {
+        bodies.push(body);
+        return Ok(());
+    }
+    if events.len() == 1 {
+        return Err(TeamRuntimeError::Sink(format!(
+            "serialized team event exceeds the {TEAM_EVENTS_MAX_HTTP_BODY_BYTES}-byte HTTP body limit"
+        )));
+    }
+    let middle = events.len() / 2;
+    serialize_http_chunk(agent_id, &events[..middle], bodies)?;
+    serialize_http_chunk(agent_id, &events[middle..], bodies)
 }
 
 #[cfg(test)]
@@ -204,5 +237,53 @@ mod tests {
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].event_id, event.event_id.to_string());
         assert_eq!(envelopes[0].sequence, 1);
+    }
+
+    #[test]
+    fn http_batches_preserve_long_messages_within_consumer_body_limit() {
+        let exact_message = "x".repeat(200_000);
+        let events: Vec<_> = (0..100)
+            .map(|sequence| {
+                TeamEvent::new(
+                    TeamSessionId::generate(),
+                    sequence,
+                    TeamEventKind::AgentAttached,
+                    "sample".into(),
+                    "1".into(),
+                    crate::tests_support::sample_hash(),
+                    TeamEventPayload::AgentAttached {
+                        role: "worker".into(),
+                        backend_fallback: None,
+                        backend: Some(crate::AgentBackend::Native),
+                        harness: None,
+                        model: Some("resolved-model".into()),
+                        delegation_message: Some(exact_message.clone()),
+                    },
+                )
+            })
+            .collect();
+
+        let bodies = serialized_http_batches("agent-1", &events).expect("serialize batches");
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body.len() <= TEAM_EVENTS_MAX_HTTP_BODY_BYTES)
+        );
+        let decoded: Vec<TeamEventsBatch> = bodies
+            .iter()
+            .map(|body| serde_json::from_slice(body).expect("decode batch"))
+            .collect();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|batch| batch.events.len())
+                .sum::<usize>(),
+            100
+        );
+        assert_eq!(
+            decoded[0].events[0].payload["delegation_message"],
+            exact_message
+        );
     }
 }

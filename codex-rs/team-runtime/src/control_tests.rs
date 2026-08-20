@@ -61,6 +61,105 @@ async fn bind_agent_emits_backend_fallback_only_when_marked() {
 }
 
 #[tokio::test]
+async fn bind_agent_emits_resolved_attach_metadata_without_persisting_it_in_binding() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let exact_message = "delegate\nwith  spacing and 日本語";
+    let mut pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    pending.attach_metadata = Some(crate::PendingAgentAttachMetadata {
+        delegation_message: exact_message.into(),
+        identity: Some(crate::AgentBackendIdentity::Acp {
+            harness: "cursor".into(),
+            model: Some("cursor-model".into()),
+        }),
+    });
+    assert!(
+        serde_json::to_value(&pending)
+            .expect("serialize pending binding")
+            .get("attach_metadata")
+            .is_none(),
+        "attach metadata must persist only through agent_attached"
+    );
+    let binding = control
+        .bind_agent_before_start("agent-acp", pending)
+        .await
+        .expect("bind");
+
+    let envelope = sink
+        .envelopes()
+        .into_iter()
+        .find(|event| event.kind == "agent_attached")
+        .expect("agent_attached");
+    assert_eq!(envelope.payload["backend"], "acp");
+    assert_eq!(envelope.payload["harness"], "cursor");
+    assert_eq!(envelope.payload["model"], "cursor-model");
+    assert_eq!(envelope.payload["delegation_message"], exact_message);
+    assert!(binding.to_pending().attach_metadata.is_none());
+}
+
+#[tokio::test]
+async fn bind_agent_rejects_unresolved_attach_metadata_before_persistence() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let mut pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    pending.attach_metadata = Some(crate::PendingAgentAttachMetadata::new("delegate".into()));
+
+    let error = control
+        .bind_agent_before_start("untraced-agent", pending)
+        .await
+        .expect_err("unresolved identity must fail before binding");
+    assert!(matches!(error, TeamRuntimeError::Invalid(_)));
+    assert!(control.binding_for("untraced-agent").await.is_none());
+    assert!(
+        sink.envelopes()
+            .into_iter()
+            .all(|event| event.kind != "agent_attached")
+    );
+}
+
+#[tokio::test]
 async fn two_teams_do_not_share_revision_or_node() {
     let control = control();
     let a = control

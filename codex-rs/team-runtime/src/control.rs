@@ -770,6 +770,7 @@ impl TeamControl {
             node_id: run.node_id.clone(),
             role: role.to_string(),
             backend_fallback: false,
+            attach_metadata: None,
         })
     }
 
@@ -780,6 +781,31 @@ impl TeamControl {
     ) -> TeamRuntimeResult<TeamAgentBinding> {
         let agent_thread_id = agent_thread_id.into();
         let backend_fallback = pending.backend_fallback;
+        let attach_metadata = pending.attach_metadata.clone();
+        let (backend, harness, model, delegation_message) = match attach_metadata {
+            Some(metadata) => {
+                let identity = metadata.identity.ok_or_else(|| {
+                    TeamRuntimeError::invalid(
+                        "agent attach metadata requires a resolved backend identity",
+                    )
+                })?;
+                let (backend, harness, model) = match identity {
+                    crate::binding::AgentBackendIdentity::Native { model } => {
+                        (crate::binding::AgentBackend::Native, None, Some(model))
+                    }
+                    crate::binding::AgentBackendIdentity::Acp { harness, model } => {
+                        (crate::binding::AgentBackend::Acp, Some(harness), model)
+                    }
+                };
+                (
+                    Some(backend),
+                    harness,
+                    model,
+                    Some(metadata.delegation_message),
+                )
+            }
+            None => (None, None, None, None),
+        };
         let binding = pending.bind(agent_thread_id.clone());
         self.store.persist_binding(binding.clone()).await?;
         {
@@ -810,6 +836,10 @@ impl TeamControl {
                 payload: TeamEventPayload::AgentAttached {
                     role: binding.role.clone(),
                     backend_fallback: backend_fallback.then_some(true),
+                    backend,
+                    harness,
+                    model,
+                    delegation_message,
                 },
             })
         })
