@@ -45,6 +45,17 @@ impl Handler {
         let input_items = parse_collab_input(args.message, args.items)?;
         let caller_thread_id = session.thread_id.to_string();
         let receiver_thread = receiver_thread_id.to_string();
+        if !session
+            .services
+            .agent_control
+            .is_agent_known(receiver_thread_id)
+            .await
+        {
+            return Err(collab_agent_error(
+                receiver_thread_id,
+                CodexErr::ThreadNotFound(receiver_thread_id),
+            ));
+        }
         reject_team_bound_raw_collaboration_v1(
             &session,
             &caller_thread_id,

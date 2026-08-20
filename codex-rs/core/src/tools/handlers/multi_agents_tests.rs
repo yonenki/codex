@@ -3920,7 +3920,10 @@ async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
     let (mut session, mut turn) = make_session_and_context().await;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
     let mut config = (*turn.config).clone();
+    config.codex_home = temp_dir.path().to_path_buf().try_into().unwrap();
+    config.sqlite = codex_state::SqliteConfig::from_sqlite_home(config.codex_home.clone());
     config.multi_agent_v2.max_concurrent_threads_per_session = 2;
     config
         .features
@@ -4253,7 +4256,10 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 #[tokio::test]
 async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed() {
     let (_session, turn) = make_session_and_context().await;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
     let mut config = turn.config.as_ref().clone();
+    config.codex_home = temp_dir.path().to_path_buf().try_into().unwrap();
+    config.sqlite = codex_state::SqliteConfig::from_sqlite_home(config.codex_home.clone());
     config.agent_max_depth = 3;
     config
         .features
@@ -5000,10 +5006,14 @@ async fn raw_wait_rejects_bound_caller_and_multi_target_atomically() {
     );
     assert_v2_team_tool_guidance(bound_wait, "team.wait");
 
-    let (unbound_session, unbound_turn, _manager) = prepare_v2_session().await;
+    let (unbound_session, unbound_turn, unbound_manager) = prepare_v2_session().await;
     let team_session_id = start_sample_team(&unbound_session).await;
     let bound_target = ThreadId::new();
-    let unbound_target = ThreadId::new();
+    let unbound_thread = unbound_manager
+        .start_thread(StartThreadOptions::new((*unbound_turn.config).clone()))
+        .await
+        .expect("start unbound thread");
+    let unbound_target = unbound_thread.thread_id;
     let pending = unbound_session
         .services
         .agent_control
@@ -5582,9 +5592,13 @@ async fn v1_wait_splits_multi_team_targets_with_explicit_stable_ids() {
 
 #[tokio::test]
 async fn v1_bound_caller_to_unbound_target_guides_to_unbound_root_raw_without_fabricated_team_id() {
-    let (session, turn, _manager) = prepare_v1_session().await;
+    let (session, turn, manager) = prepare_v1_session().await;
     let team_a = start_sample_team(&session).await;
-    let unbound_target = ThreadId::new().to_string();
+    let unbound_thread = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("start unbound target thread");
+    let unbound_target = unbound_thread.thread_id.to_string();
 
     let team = session.services.agent_control.team();
     let caller_pending = team
@@ -5710,10 +5724,14 @@ async fn v1_bound_caller_to_unbound_target_guides_to_unbound_root_raw_without_fa
 
 #[tokio::test]
 async fn v1_mixed_targets_split_into_team_managed_and_unbound_raw() {
-    let (session, turn, _manager) = prepare_v1_session().await;
+    let (session, turn, manager) = prepare_v1_session().await;
     let team_a = start_sample_team(&session).await;
     let bound_target = ThreadId::new();
-    let unbound_target = ThreadId::new();
+    let unbound_thread = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("start unbound target thread");
+    let unbound_target = unbound_thread.thread_id;
 
     let team = session.services.agent_control.team();
     let pending = team
@@ -5761,6 +5779,192 @@ async fn v1_mixed_targets_split_into_team_managed_and_unbound_raw() {
     assert!(
         msg.contains("unbound root coordinator"),
         "mixed wait must mention unbound root coordinator: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn v1_bound_caller_to_unknown_targets_yield_lookup_error_or_not_found() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let unknown_target = ThreadId::new();
+    let unknown_target_str = unknown_target.to_string();
+
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    // 1. send_input: bound caller -> unknown target must yield lookup error, not team guidance
+    let send_err = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": unknown_target_str.clone(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "bound caller to unknown send_input",
+    );
+    let FunctionCallError::RespondToModel(send_msg) = send_err else {
+        panic!("expected model err");
+    };
+    assert_eq!(
+        send_msg,
+        format!("agent with id {unknown_target} not found"),
+        "send_input to unknown agent must return exact not found error"
+    );
+    assert!(
+        !send_msg.contains("multi_agent_v2")
+            && !send_msg.contains("team_session_id")
+            && !send_msg.contains("unbound root coordinator"),
+        "send_input must not contain team guidance: {send_msg}"
+    );
+
+    // 2. close_agent: bound caller -> unknown target must yield lookup error, not team guidance
+    let close_err = expect_model_err(
+        CloseAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "close_agent",
+                function_payload(json!({
+                    "target": unknown_target_str.clone()
+                })),
+            ))
+            .await,
+        "bound caller to unknown close_agent",
+    );
+    let FunctionCallError::RespondToModel(close_msg) = close_err else {
+        panic!("expected model err");
+    };
+    assert_eq!(
+        close_msg,
+        format!("agent with id {unknown_target} not found"),
+        "close_agent to unknown agent must return exact not found error"
+    );
+    assert!(
+        !close_msg.contains("multi_agent_v2")
+            && !close_msg.contains("team_session_id")
+            && !close_msg.contains("unbound root coordinator"),
+        "close_agent must not contain team guidance: {close_msg}"
+    );
+
+    // 3. resume_agent: bound caller -> unknown target must yield lookup error, not team guidance
+    let resume_err = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "resume_agent",
+                function_payload(json!({
+                    "id": unknown_target_str.clone()
+                })),
+            ))
+            .await,
+        "bound caller to unknown resume_agent",
+    );
+    let FunctionCallError::RespondToModel(resume_msg) = resume_err else {
+        panic!("expected model err");
+    };
+    assert_eq!(
+        resume_msg,
+        format!("agent with id {unknown_target} not found"),
+        "resume_agent to unknown agent must return exact not found error"
+    );
+    assert!(
+        !resume_msg.contains("multi_agent_v2")
+            && !resume_msg.contains("team_session_id")
+            && !resume_msg.contains("unbound root coordinator"),
+        "resume_agent must not contain team guidance: {resume_msg}"
+    );
+
+    // 4. wait_agent: bound caller -> unknown target must succeed with NotFound status, not team guidance
+    let wait_output = crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "wait_agent",
+            function_payload(json!({
+                "targets": [unknown_target_str.clone()]
+            })),
+        ))
+        .await
+        .expect("wait_agent on unknown target should succeed with NotFound status");
+    let (content, _success) = expect_text_output(wait_output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        wait::WaitAgentResult {
+            status: HashMap::from([(unknown_target_str.clone(), AgentStatus::NotFound)]),
+            timed_out: false,
+        }
+    );
+}
+
+#[tokio::test]
+async fn v1_multi_wait_partially_unknown_is_atomic_without_team_guidance() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    let bound_target_b = ThreadId::new();
+    let unknown_target = ThreadId::new();
+
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller to team A");
+
+    let target_pending = team
+        .pending_binding_for_node(&team_b, "worker")
+        .await
+        .expect("target pending");
+    team.bind_agent_before_start(bound_target_b.to_string(), target_pending)
+        .await
+        .expect("bind target to team B");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    // Multi wait containing both bound target B and an unknown target:
+    // Because 1 target is unknown, existing lookup takes precedence atomically; no Team guidance is returned.
+    let wait_output = crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "wait_agent",
+            function_payload(json!({
+                "targets": [bound_target_b.to_string(), unknown_target.to_string()]
+            })),
+        ))
+        .await
+        .expect("wait_agent with partially unknown target should succeed with NotFound status for unknown");
+    let (content, _success) = expect_text_output(wait_output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result.status.get(&unknown_target.to_string()),
+        Some(&AgentStatus::NotFound),
+        "unknown target should have NotFound status"
+    );
+    assert!(
+        result.status.contains_key(&bound_target_b.to_string()),
+        "bound target should be present in statuses"
     );
 }
 

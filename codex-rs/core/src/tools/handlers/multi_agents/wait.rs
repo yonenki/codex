@@ -69,12 +69,21 @@ impl Handler {
             .map(ToString::to_string)
             .collect();
         let target_refs: Vec<&str> = target_ids.iter().map(String::as_str).collect();
-        reject_team_bound_raw_collaboration_v1(
-            &session,
-            &caller_thread_id,
-            &target_refs,
-            V1RawOp::Wait,
-        )?;
+        let mut all_targets_known = true;
+        for id in &receiver_thread_ids {
+            if !session.services.agent_control.is_agent_known(*id).await {
+                all_targets_known = false;
+                break;
+            }
+        }
+        if all_targets_known {
+            reject_team_bound_raw_collaboration_v1(
+                &session,
+                &caller_thread_id,
+                &target_refs,
+                V1RawOp::Wait,
+            )?;
+        }
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {

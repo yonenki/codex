@@ -41,6 +41,17 @@ async fn handle_close_agent(
     let agent_id = parse_agent_id_target(&args.target)?;
     let caller_thread_id = session.thread_id.to_string();
     let target = agent_id.to_string();
+    if !session
+        .services
+        .agent_control
+        .is_agent_known(agent_id)
+        .await
+    {
+        return Err(collab_agent_error(
+            agent_id,
+            CodexErr::ThreadNotFound(agent_id),
+        ));
+    }
     reject_team_bound_raw_collaboration_v1(
         &session,
         &caller_thread_id,

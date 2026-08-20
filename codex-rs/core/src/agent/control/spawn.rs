@@ -107,7 +107,7 @@ fn is_fork_excluded_developer_message(item: &ResponseItem, usage_hint_texts: &[S
             .any(|usage_hint_text| usage_hint_text == text)
 }
 
-async fn load_agent_model_context(
+pub(super) async fn load_agent_model_context(
     state: &ThreadManagerState,
     thread_id: ThreadId,
     history_mode: ThreadHistoryMode,

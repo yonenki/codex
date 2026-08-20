@@ -46,8 +46,26 @@ async fn handle_resume_agent(
     let receiver_thread_id = ThreadId::from_string(&args.id).map_err(|err| {
         FunctionCallError::RespondToModel(format!("invalid agent id {}: {err:?}", args.id))
     })?;
+    let child_depth = next_thread_spawn_depth(&turn.session_source);
+    let max_depth = turn.config.agent_max_depth;
+    if exceeds_thread_spawn_depth_limit(child_depth, max_depth) {
+        return Err(FunctionCallError::RespondToModel(
+            "Agent depth limit reached. Solve the task yourself.".to_string(),
+        ));
+    }
     let caller_thread_id = session.thread_id.to_string();
     let target = receiver_thread_id.to_string();
+    if !session
+        .services
+        .agent_control
+        .is_agent_known_or_resumable(receiver_thread_id)
+        .await
+    {
+        return Err(collab_agent_error(
+            receiver_thread_id,
+            CodexErr::ThreadNotFound(receiver_thread_id),
+        ));
+    }
     reject_team_bound_raw_collaboration_v1(
         &session,
         &caller_thread_id,
@@ -59,13 +77,6 @@ async fn handle_resume_agent(
         .agent_control
         .get_agent_metadata(receiver_thread_id)
         .unwrap_or_default();
-    let child_depth = next_thread_spawn_depth(&turn.session_source);
-    let max_depth = turn.config.agent_max_depth;
-    if exceeds_thread_spawn_depth_limit(child_depth, max_depth) {
-        return Err(FunctionCallError::RespondToModel(
-            "Agent depth limit reached. Solve the task yourself.".to_string(),
-        ));
-    }
 
     session
         .emit_turn_item_started(
