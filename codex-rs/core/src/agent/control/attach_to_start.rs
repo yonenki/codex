@@ -2,11 +2,8 @@ use super::AgentControl;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
-use codex_team_runtime::AgentTerminalStatus;
 use codex_team_runtime::BindAttemptHandle;
 use codex_team_runtime::BindAttemptOutcome;
-use codex_team_runtime::RuntimeProducerPermit;
-use codex_team_runtime::TerminalPersistenceOutcome;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -25,7 +22,6 @@ pub(super) struct AttachToStartOwner {
     committed: Arc<AtomicBool>,
     disarmed: Arc<AtomicBool>,
     flight: Arc<Mutex<Option<BindFlight>>>,
-    producer: Arc<RuntimeProducerPermit>,
     wakeup: Option<oneshot::Sender<()>>,
 }
 
@@ -41,15 +37,15 @@ pub(super) struct AttachToStartTestControl {
     fail_native_shutdown_before_send: AtomicBool,
     hold: StdMutex<Option<oneshot::Receiver<()>>>,
     entered: StdMutex<Option<oneshot::Sender<()>>>,
-    cleanup_hold: StdMutex<Option<oneshot::Receiver<()>>>,
-    cleanup_entered: StdMutex<Option<oneshot::Sender<()>>>,
 }
+
+const ATTACH_TERMINAL_PERSIST_ATTEMPTS: usize = 3;
 
 #[derive(Debug)]
 enum TerminalCleanupOutcome {
     NotRequired,
     Persisted,
-    RetryOwned { first_error: String },
+    PersistFailed { last_error: String },
 }
 
 #[derive(Debug)]
@@ -69,7 +65,7 @@ impl AttachCleanupOutcome {
             return;
         }
         let terminal_error = match &self.terminal {
-            TerminalCleanupOutcome::RetryOwned { first_error } => Some(first_error.as_str()),
+            TerminalCleanupOutcome::PersistFailed { last_error } => Some(last_error.as_str()),
             TerminalCleanupOutcome::NotRequired | TerminalCleanupOutcome::Persisted => None,
         };
         tracing::warn!(
@@ -77,18 +73,13 @@ impl AttachCleanupOutcome {
             resource_error = ?self.resource_error,
             terminal = ?self.terminal,
             terminal_error,
-            "attach-to-start cleanup completed with a recoverable failure"
+            "attach-to-start cleanup finished with a remaining failure"
         );
     }
 }
 
 impl AttachToStartOwner {
-    fn arm(
-        control: AgentControl,
-        agent_thread_id: ThreadId,
-        cleanup_external: bool,
-        producer: RuntimeProducerPermit,
-    ) -> Self {
+    fn arm(control: AgentControl, agent_thread_id: ThreadId, cleanup_external: bool) -> Self {
         let committed = Arc::new(AtomicBool::new(false));
         let disarmed = Arc::new(AtomicBool::new(false));
         let flight = Arc::new(Mutex::new(None));
@@ -97,8 +88,6 @@ impl AttachToStartOwner {
         let committed_task = Arc::clone(&committed);
         let disarmed_task = Arc::clone(&disarmed);
         let flight_task = Arc::clone(&flight);
-        let producer = Arc::new(producer);
-        let producer_task = Arc::clone(&producer);
         tokio::spawn(async move {
             let _ = parked.await;
             if disarmed_task.load(Ordering::SeqCst) {
@@ -110,7 +99,6 @@ impl AttachToStartOwner {
                     cleanup_external,
                     committed_task.load(Ordering::SeqCst),
                     flight_task.lock().await.take(),
-                    &producer_task,
                 )
                 .await;
         });
@@ -121,7 +109,6 @@ impl AttachToStartOwner {
             committed,
             disarmed,
             flight,
-            producer,
             wakeup: Some(wakeup),
         }
     }
@@ -203,11 +190,7 @@ impl AttachToStartOwner {
             .await;
         let terminal = self
             .control
-            .record_attach_terminal(
-                &self.producer,
-                self.agent_thread_id,
-                AgentTerminalStatus::Errored,
-            )
+            .record_attach_terminal(self.agent_thread_id, "errored")
             .await;
         AttachCleanupOutcome {
             resource_error,
@@ -265,9 +248,8 @@ impl AgentControl {
         &self,
         agent_thread_id: ThreadId,
         cleanup_external: bool,
-        producer: RuntimeProducerPermit,
     ) -> AttachToStartOwner {
-        AttachToStartOwner::arm(self.clone(), agent_thread_id, cleanup_external, producer)
+        AttachToStartOwner::arm(self.clone(), agent_thread_id, cleanup_external)
     }
 
     async fn cleanup_bind_attempt_resources(
@@ -281,8 +263,6 @@ impl AgentControl {
             self.state.release_spawned_thread(agent_thread_id);
             None
         } else {
-            #[cfg(test)]
-            self.apply_cleanup_before_registry_test_probe().await;
             self.shutdown_live_agent(agent_thread_id)
                 .await
                 .err()
@@ -292,24 +272,36 @@ impl AgentControl {
 
     async fn record_attach_terminal(
         &self,
-        producer: &RuntimeProducerPermit,
         agent_thread_id: ThreadId,
-        status: AgentTerminalStatus,
+        status: &'static str,
     ) -> TerminalCleanupOutcome {
-        match self
-            .team_handle()
-            .record_agent_terminal_managed(producer, &agent_thread_id.to_string(), status)
-            .await
-        {
-            Ok(
-                TerminalPersistenceOutcome::Persisted | TerminalPersistenceOutcome::AlreadyTerminal,
-            ) => TerminalCleanupOutcome::Persisted,
-            Ok(TerminalPersistenceOutcome::RetryPending { first_error }) => {
-                TerminalCleanupOutcome::RetryOwned { first_error }
+        // 永続回復は持たず、cleanup 内で短い有限回だけ再試行する。
+        let mut delay = std::time::Duration::from_millis(10);
+        let mut last_error = None;
+        for attempt in 0..ATTACH_TERMINAL_PERSIST_ATTEMPTS {
+            match self
+                .team()
+                .record_agent_terminal(&agent_thread_id.to_string(), status)
+                .await
+            {
+                Ok(()) => return TerminalCleanupOutcome::Persisted,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    if attempt + 1 < ATTACH_TERMINAL_PERSIST_ATTEMPTS {
+                        tracing::warn!(
+                            %agent_thread_id,
+                            %error,
+                            attempt = attempt + 1,
+                            "attach-to-start terminal persistence failed; retrying locally"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = delay.saturating_mul(2);
+                    }
+                }
             }
-            Err(error) => TerminalCleanupOutcome::RetryOwned {
-                first_error: error.to_string(),
-            },
+        }
+        TerminalCleanupOutcome::PersistFailed {
+            last_error: last_error.expect("attach terminal persist is attempted at least once"),
         }
     }
 
@@ -319,7 +311,6 @@ impl AgentControl {
         cleanup_external: bool,
         committed: bool,
         flight: Option<BindFlight>,
-        producer: &RuntimeProducerPermit,
     ) {
         let outcome = if let Some(mut flight) = flight {
             if let Some(cancel) = flight.cancel.take() {
@@ -343,7 +334,7 @@ impl AgentControl {
         };
         if attached {
             let terminal = self
-                .record_attach_terminal(producer, agent_thread_id, AgentTerminalStatus::Interrupted)
+                .record_attach_terminal(agent_thread_id, "interrupted")
                 .await;
             AttachCleanupOutcome {
                 resource_error,
@@ -355,7 +346,7 @@ impl AgentControl {
         if outcome.is_some() && !matches!(outcome, Some(BindAttemptOutcome::Uncommitted)) {
             // settle 報告が失敗でも、正規の terminal mutation で active なら一度記録する。
             let terminal = self
-                .record_attach_terminal(producer, agent_thread_id, AgentTerminalStatus::Interrupted)
+                .record_attach_terminal(agent_thread_id, "interrupted")
                 .await;
             AttachCleanupOutcome {
                 resource_error,
@@ -409,47 +400,6 @@ impl AgentControl {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entered_tx);
         (release_tx, entered_rx)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hold_next_cleanup_before_registry(
-        &self,
-    ) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
-        let (release_tx, release_rx) = oneshot::channel();
-        let (entered_tx, entered_rx) = oneshot::channel();
-        *self
-            .attach_to_start_test
-            .cleanup_hold
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release_rx);
-        *self
-            .attach_to_start_test
-            .cleanup_entered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entered_tx);
-        (release_tx, entered_rx)
-    }
-
-    #[cfg(test)]
-    async fn apply_cleanup_before_registry_test_probe(&self) {
-        let hold = self
-            .attach_to_start_test
-            .cleanup_hold
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let entered = self
-            .attach_to_start_test
-            .cleanup_entered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(entered) = entered {
-            let _ = entered.send(());
-        }
-        if let Some(hold) = hold {
-            let _ = hold.await;
-        }
     }
 
     #[cfg(test)]

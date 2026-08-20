@@ -656,149 +656,6 @@ async fn terminal_status_forwards_typed_event_without_child_result_body() {
 }
 
 #[tokio::test]
-async fn managed_team_terminal_waits_for_durable_retry_and_notifies_parent_once() {
-    let harness = AgentControlHarness::new().await;
-    let (parent_thread_id, parent_thread) = harness.start_thread().await;
-    harness
-        .control
-        .register_session_root(parent_thread_id, None);
-    let child_thread = harness
-        .manager
-        .start_thread(StartThreadOptions::new(harness.config.clone()))
-        .await
-        .expect("child thread should start")
-        .thread;
-    let child_thread_id = child_thread.session.thread_id;
-    register_test_agent_metadata(
-        &harness.control,
-        child_thread_id,
-        AgentPath::root().join("worker").expect("child path"),
-        "Luna",
-        "worker",
-    );
-    let (started, pending) = seed_sample_team(&harness).await;
-    harness
-        .control
-        .team()
-        .bind_agent_before_start(child_thread_id.to_string(), pending)
-        .await
-        .expect("bind Team child");
-    harness
-        .control
-        .team()
-        .fail_terminal_persist_times_for_test(100);
-
-    let first_control = harness.control.clone();
-    let mut first = tokio::spawn(async move {
-        first_control
-            .maybe_notify_parent_of_terminal_status(child_thread_id, &AgentStatus::Completed(None))
-            .await;
-    });
-    let second_control = harness.control.clone();
-    let mut duplicate = tokio::spawn(async move {
-        second_control
-            .maybe_notify_parent_of_terminal_status(
-                child_thread_id,
-                &AgentStatus::Errored("late duplicate".to_string()),
-            )
-            .await;
-    });
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if harness
-                .control
-                .team()
-                .terminal_retry_snapshot()
-                .pending_count
-                == 1
-            {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("managed terminal retry should become pending");
-    assert!(
-        timeout(Duration::from_millis(20), &mut first)
-            .await
-            .is_err(),
-        "first notifier must wait for durable persistence"
-    );
-    assert!(
-        timeout(Duration::from_millis(20), &mut duplicate)
-            .await
-            .is_err(),
-        "duplicate notifier must observe the same durable completion"
-    );
-
-    let shutdown = harness
-        .manager
-        .shutdown_all_threads_bounded(Duration::from_millis(20))
-        .await;
-    assert!(shutdown.runtime_producers.in_flight_count >= 1);
-    assert_eq!(shutdown.terminal_retries.pending_count, 1);
-
-    harness
-        .control
-        .team()
-        .fail_terminal_persist_times_for_test(0);
-    timeout(Duration::from_secs(5), &mut first)
-        .await
-        .expect("first notifier should finish after persistence recovery")
-        .expect("first notifier task");
-    timeout(Duration::from_secs(5), &mut duplicate)
-        .await
-        .expect("duplicate notifier should finish after persistence recovery")
-        .expect("duplicate notifier task");
-    let terminal = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
-    assert_eq!(
-        terminal[0].status,
-        SubAgentTerminalStatus::Completed,
-        "the first managed terminal owns the parent notification"
-    );
-    assert_eq!(
-        terminal_statuses(&load_team_events(&harness, &started.team_session_id).await),
-        ["completed"]
-    );
-    assert!(
-        harness
-            .control
-            .team()
-            .status(&started.team_session_id)
-            .await
-            .expect("Team status")
-            .agents
-            .is_empty()
-    );
-    assert_eq!(
-        harness.control.team().terminal_retry_snapshot(),
-        codex_team_runtime::TerminalRetrySnapshot::default()
-    );
-
-    harness
-        .control
-        .maybe_notify_parent_of_terminal_status(child_thread_id, &AgentStatus::Interrupted)
-        .await;
-    assert!(
-        timeout(Duration::from_millis(50), async {
-            loop {
-                let event = parent_thread
-                    .next_event()
-                    .await
-                    .expect("parent event stream should stay open");
-                if matches!(event.msg, EventMsg::SubAgentTerminal(_)) {
-                    return;
-                }
-            }
-        })
-        .await
-        .is_err(),
-        "managed Team terminal notification must remain exactly once"
-    );
-}
-
-#[tokio::test]
 async fn native_v2_interrupted_notifies_parent_without_completion_communication() {
     let (home, mut config) = test_config().await;
     config.ephemeral = true;
@@ -6139,151 +5996,6 @@ async fn seed_sample_team(
     (started, pending)
 }
 
-#[tokio::test]
-async fn first_spawn_retries_failed_orphan_recovery_without_rescanning_live_agents() {
-    Box::pin(async {
-        let harness = AgentControlHarness::new().await;
-        let (started, pending) = seed_sample_team(&harness).await;
-        let orphaned_agent = ThreadId::new();
-        harness
-            .control
-            .team()
-            .bind_agent_before_start(orphaned_agent.to_string(), pending.clone())
-            .await
-            .expect("bind durable orphan");
-        harness.control.team().fail_next_orphan_recovery_for_test();
-
-        let first = harness
-            .manager
-            .start_thread(StartThreadOptions::new(harness.config.clone()))
-            .await;
-        match first {
-            Err(error) => match error.details() {
-                CodexErrorDetails::Fatal(message) => {
-                    assert!(message.contains("failed to recover orphaned active Team agents"));
-                }
-                _ => panic!("first spawn must return a typed fatal recovery failure"),
-            },
-            _ => panic!("first spawn must stop on typed recovery failure"),
-        }
-        assert!(harness.manager.list_thread_ids().await.is_empty());
-
-        let recovered_spawn = harness
-            .manager
-            .start_thread(StartThreadOptions::new(harness.config.clone()))
-            .await
-            .expect("next spawn retries recovery");
-        assert_eq!(
-            terminal_statuses(&load_team_events(&harness, &started.team_session_id).await),
-            ["interrupted"]
-        );
-
-        let live_agent = ThreadId::new();
-        harness
-            .control
-            .team()
-            .bind_agent_before_start(live_agent.to_string(), pending)
-            .await
-            .expect("bind post-recovery live agent");
-        let later_spawn = harness
-            .manager
-            .start_thread(StartThreadOptions::new(harness.config.clone()))
-            .await
-            .expect("post-recovery spawn");
-        assert!(
-            harness
-                .control
-                .team()
-                .status(&started.team_session_id)
-                .await
-                .expect("team status")
-                .agents
-                .iter()
-                .any(|agent| agent.agent_thread_id == live_agent.to_string()),
-            "Once authority must not rescan a live agent after successful recovery"
-        );
-
-        recovered_spawn
-            .thread
-            .shutdown_and_wait()
-            .await
-            .expect("shutdown recovered spawn");
-        later_spawn
-            .thread
-            .shutdown_and_wait()
-            .await
-            .expect("shutdown later spawn");
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn first_spawn_rejects_retry_pending_orphan_terminal_until_retry_drains() {
-    let harness = AgentControlHarness::new().await;
-    let (started, pending) = seed_sample_team(&harness).await;
-    let orphaned_agent = ThreadId::new();
-    harness
-        .control
-        .team()
-        .bind_agent_before_start(orphaned_agent.to_string(), pending)
-        .await
-        .expect("bind durable orphan");
-    harness
-        .control
-        .team()
-        .fail_terminal_persist_times_for_test(100);
-
-    let first = harness
-        .manager
-        .start_thread(StartThreadOptions::new(harness.config.clone()))
-        .await;
-    match first {
-        Err(error) => match error.details() {
-            CodexErrorDetails::Fatal(message) => {
-                assert!(message.contains("startup orphan terminal persistence is retry pending"));
-            }
-            _ => panic!("retry-pending recovery must return a typed fatal failure"),
-        },
-        _ => panic!("first spawn must stop while orphan recovery is retry pending"),
-    }
-    assert!(harness.manager.list_thread_ids().await.is_empty());
-    assert_eq!(
-        harness
-            .control
-            .team()
-            .terminal_retry_snapshot()
-            .pending_count,
-        1
-    );
-
-    harness
-        .control
-        .team()
-        .fail_terminal_persist_times_for_test(0);
-    assert_eq!(
-        harness
-            .control
-            .team()
-            .drain_terminal_retries_bounded(Duration::from_secs(5))
-            .await,
-        codex_team_runtime::TerminalRetrySnapshot::default()
-    );
-    let recovered_spawn = harness
-        .manager
-        .start_thread(StartThreadOptions::new(harness.config.clone()))
-        .await
-        .expect("next spawn should confirm recovered durable state");
-    assert_eq!(
-        terminal_statuses(&load_team_events(&harness, &started.team_session_id).await),
-        ["interrupted"]
-    );
-    recovered_spawn
-        .thread
-        .shutdown_and_wait()
-        .await
-        .expect("shutdown recovered spawn");
-}
-
 async fn load_team_events(
     harness: &AgentControlHarness,
     team_session_id: &codex_team_runtime::TeamSessionId,
@@ -7195,28 +6907,12 @@ async fn native_cancel_retries_terminal_after_cleanup_failure_and_releases_resou
     let child = ThreadId::from_string(&agent_thread_id).expect("thread id");
     harness.control.team().fail_next_terminal_persist_for_test();
     harness.control.fail_next_native_shutdown_before_send();
-    let (cleanup_release, cleanup_entered) = harness.control.hold_next_cleanup_before_registry();
     task.abort();
     let join = timeout(Duration::from_secs(5), task)
         .await
         .expect("cancelled spawn should not wait indefinitely");
     assert!(join.is_err(), "spawn future must keep the cancel outcome");
     drop(hold);
-    timeout(Duration::from_secs(5), cleanup_entered)
-        .await
-        .expect("cleanup must reach the registry boundary")
-        .expect("cleanup registry boundary entered");
-    let incomplete = harness
-        .manager
-        .shutdown_all_threads_bounded(Duration::from_millis(20))
-        .await;
-    assert!(
-        incomplete.runtime_producers.in_flight_count >= 1,
-        "shutdown must report the cleanup producer blocked before registry cleanup"
-    );
-    assert!(!incomplete.runtime_producers.accepting);
-    assert_eq!(incomplete.terminal_retries.pending_count, 0);
-    drop(cleanup_release);
 
     wait_until_thread_gone(&harness, child).await;
     assert!(
@@ -7242,15 +6938,85 @@ async fn native_cancel_retries_terminal_after_cleanup_failure_and_releases_resou
             .await
             .agents
             .is_empty(),
-        "terminal retry must clear durable active state"
+        "bounded local retry must persist a transient terminal failure"
     );
-    let completed = harness
-        .manager
-        .shutdown_all_threads_bounded(Duration::from_secs(5))
-        .await;
-    assert_eq!(completed.runtime_producers.in_flight_count, 0);
-    assert_eq!(completed.terminal_retries.pending_count, 0);
-    assert!(completed.runtime_producers.accepting);
+}
+
+#[tokio::test]
+async fn native_cancel_bounded_terminal_persist_failure_cleans_resources_without_resident_retry() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.team().hold_next_bind_after_durable_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should reach committed result seam")
+        .expect("committed seam entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    let child = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    harness.control.team().fail_terminal_persists_for_test(8);
+    harness.control.fail_next_native_shutdown_before_send();
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must keep the cancel outcome");
+    drop(hold);
+
+    wait_until_thread_gone(&harness, child).await;
+    assert!(
+        harness.control.get_agent_metadata(child).is_none(),
+        "spawn registry must be released even when terminal persist stays failed"
+    );
+    assert_no_agent_terminals(&harness, &started.team_session_id).await;
+    assert!(
+        !harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty(),
+        "persistent store failure is not auto-recovered"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_no_agent_terminals(&harness, &started.team_session_id).await;
+    assert!(
+        !restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty(),
+        "durable active may remain after bounded persist attempts end"
+    );
 }
 
 #[tokio::test]

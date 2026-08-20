@@ -277,10 +277,6 @@ impl AgentControl {
         F: FnOnce(ThreadId) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let runtime_producer = self
-            .team
-            .begin_runtime_producer()
-            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
         self.ensure_execution_capacity(MultiAgentVersion::V2, &session_source)?;
         let mut reservation = self
             .state
@@ -369,7 +365,7 @@ impl AgentControl {
         )?;
         let mut attach_to_start = pending_team_binding
             .as_ref()
-            .map(|_| self.arm_attach_to_start(agent_id, true, runtime_producer));
+            .map(|_| self.arm_attach_to_start(agent_id, true));
         if let (Some(pending), Some(owner)) = (pending_team_binding, attach_to_start.take()) {
             match Box::pin(owner.bind_pending(pending)).await {
                 Ok(owner) => attach_to_start = Some(owner),
@@ -574,14 +570,13 @@ impl AgentControl {
     async fn arm_and_bind_native_team_agent(
         &self,
         pending_team_binding: Option<codex_team_runtime::PendingTeamBinding>,
-        runtime_producer: codex_team_runtime::RuntimeProducerPermit,
         new_thread: &crate::thread_manager::NewThread,
         notification_source: Option<&SessionSource>,
         state: &Arc<ThreadManagerState>,
     ) -> CodexResult<Option<super::attach_to_start::AttachToStartOwner>> {
         let mut attach_to_start = pending_team_binding
             .as_ref()
-            .map(|_| self.arm_attach_to_start(new_thread.thread_id, false, runtime_producer));
+            .map(|_| self.arm_attach_to_start(new_thread.thread_id, false));
         if let Some(SessionSource::SubAgent(
             subagent_source @ SubAgentSource::ThreadSpawn {
                 parent_thread_id, ..
@@ -647,10 +642,6 @@ impl AgentControl {
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
-        let runtime_producer = self
-            .team
-            .begin_runtime_producer()
-            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
         let state = self.upgrade()?;
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
@@ -771,7 +762,6 @@ impl AgentControl {
 
         let attach_to_start = Box::pin(self.arm_and_bind_native_team_agent(
             pending_team_binding,
-            runtime_producer,
             &new_thread,
             notification_source.as_ref(),
             &state,
