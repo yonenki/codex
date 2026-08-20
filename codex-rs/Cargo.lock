@@ -2851,6 +2851,8 @@ dependencies = [
  "codex-skills",
  "codex-skills-extension",
  "codex-state",
+ "codex-team-graph",
+ "codex-team-runtime",
  "codex-terminal-detection",
  "codex-test-binary-support",
  "codex-thread-store",
@@ -4311,6 +4313,37 @@ dependencies = [
  "pretty_assertions",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "codex-team-graph"
+version = "0.0.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.9.11+spec-1.1.0",
+]
+
+[[package]]
+name = "codex-team-runtime"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "codex-team-graph",
+ "pretty_assertions",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.9.11+spec-1.1.0",
+ "uuid",
 ]
 
 [[package]]

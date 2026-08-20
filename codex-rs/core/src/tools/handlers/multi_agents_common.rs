@@ -25,13 +25,67 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use serde::Serialize;
+use serde_json::Map;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 pub(crate) const MAX_SPAWN_AGENT_MODEL_OVERRIDES: usize = 5;
+pub(crate) const MAX_SPAWN_METADATA_ENTRIES: usize = 16;
+pub(crate) const MAX_SPAWN_METADATA_KEY_CHARS: usize = 64;
+pub(crate) const MAX_SPAWN_METADATA_VALUE_CHARS: usize = 512;
+
+/// 起動時metadataをobserver向けラベルとして受理する。secretやprompt注入には使わない。
+pub(crate) fn parse_spawn_observer_metadata(
+    raw: Option<JsonValue>,
+) -> Result<Option<BTreeMap<String, String>>, FunctionCallError> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let JsonValue::Object(map) = value else {
+        return Err(FunctionCallError::RespondToModel(
+            "metadata must be an object of string keys and string values".to_string(),
+        ));
+    };
+    normalize_spawn_observer_metadata(map)
+}
+
+fn normalize_spawn_observer_metadata(
+    map: Map<String, JsonValue>,
+) -> Result<Option<BTreeMap<String, String>>, FunctionCallError> {
+    if map.is_empty() {
+        return Ok(None);
+    }
+    if map.len() > MAX_SPAWN_METADATA_ENTRIES {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "metadata supports at most {MAX_SPAWN_METADATA_ENTRIES} entries"
+        )));
+    }
+    let mut metadata = BTreeMap::new();
+    for (key, value) in map {
+        if key.is_empty() || key.chars().count() > MAX_SPAWN_METADATA_KEY_CHARS {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "metadata keys must be 1-{MAX_SPAWN_METADATA_KEY_CHARS} characters"
+            )));
+        }
+        let JsonValue::String(text) = value else {
+            return Err(FunctionCallError::RespondToModel(
+                "metadata values must be strings".to_string(),
+            ));
+        };
+        if text.chars().count() > MAX_SPAWN_METADATA_VALUE_CHARS {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "metadata values must be at most {MAX_SPAWN_METADATA_VALUE_CHARS} characters"
+            )));
+        }
+        metadata.insert(key, text);
+    }
+    Ok(Some(metadata))
+}
 
 pub(crate) fn model_supports_multi_agent_backend(
     model: &ModelPreset,
@@ -107,6 +161,252 @@ pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionC
         }
         _ => FunctionCallError::RespondToModel(format!("collab tool failed: {err}")),
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum V1RawOp {
+    Spawn,
+    SendInput,
+    Wait,
+    Close,
+    Resume,
+}
+
+impl V1RawOp {
+    pub(crate) fn raw_tool(self) -> &'static str {
+        match self {
+            Self::Spawn => "multi_agent_v1.spawn_agent",
+            Self::SendInput => "multi_agent_v1.send_input",
+            Self::Wait => "multi_agent_v1.wait_agent",
+            Self::Close => "multi_agent_v1.close_agent",
+            Self::Resume => "multi_agent_v1.resume_agent",
+        }
+    }
+
+    pub(crate) fn has_no_equivalent_team_op(self) -> bool {
+        matches!(self, Self::Close | Self::Resume)
+    }
+}
+
+/// caller またはいずれかの target が Team-bound なら legacy v1 raw collaboration を拒否する。
+pub(crate) async fn reject_team_bound_raw_collaboration_v1(
+    session: &Session,
+    caller_thread_id: &str,
+    target_thread_ids: &[&str],
+    op: V1RawOp,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    let mut subjects = Vec::with_capacity(target_thread_ids.len() + 1);
+    subjects.push(caller_thread_id);
+    subjects.extend_from_slice(target_thread_ids);
+    let mut bindings = team
+        .bindings_for_checked(&subjects)
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .into_iter();
+    let caller_binding = bindings.next().flatten();
+
+    // Spawn has no targets; authority comes from the caller.
+    if target_thread_ids.is_empty() {
+        let Some(binding) = caller_binding else {
+            return Ok(());
+        };
+        let message = format!(
+            "Team-bound {} is unsupported. Delegate Team operations to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id={}. {} cannot be used when the caller or any target is bound to a Team.",
+            op.raw_tool(),
+            binding.team_session_id,
+            op.raw_tool(),
+        );
+        return Err(FunctionCallError::RespondToModel(message));
+    }
+
+    let mut bound_team_ids = BTreeSet::new();
+    let mut has_unbound_target = false;
+
+    for binding in bindings {
+        if let Some(binding) = binding {
+            bound_team_ids.insert(binding.team_session_id);
+        } else {
+            has_unbound_target = true;
+        }
+    }
+
+    if caller_binding.is_none() && bound_team_ids.is_empty() {
+        return Ok(());
+    }
+
+    let ids_guidance = bound_team_ids
+        .iter()
+        .map(|id| format!("team_session_id={id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let message = if bound_team_ids.is_empty() {
+        // Caller is bound, but all targets are unbound. Guide to unbound root non-Team raw op without fabricating a team_session_id.
+        format!(
+            "Team-bound {} is unsupported. Delegate non-Team raw operations to an unbound root coordinator using {}. {} cannot be used when the caller or any target is bound to a Team.",
+            op.raw_tool(),
+            op.raw_tool(),
+            op.raw_tool(),
+        )
+    } else if has_unbound_target {
+        // Mixed targets: some bound, some unbound. Split into Team-managed per Team + unbound raw.
+        if op.has_no_equivalent_team_op() {
+            format!(
+                "Team-bound {} has no equivalent Team operation. Delegate operations to an unbound root coordinator by splitting into Team-managed operations using multi_agent_v2 Team tools with explicit {} and unbound raw operations using {}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                ids_guidance,
+                op.raw_tool(),
+                op.raw_tool(),
+            )
+        } else {
+            format!(
+                "Team-bound {} is unsupported. Delegate operations to an unbound root coordinator by splitting into Team-managed operations using multi_agent_v2 Team tools with explicit {} and unbound raw operations using {}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                ids_guidance,
+                op.raw_tool(),
+                op.raw_tool(),
+            )
+        }
+    } else if bound_team_ids.len() > 1 {
+        // Multi-Team targets: split per Team with explicit IDs in stable order.
+        if op.has_no_equivalent_team_op() {
+            format!(
+                "Team-bound {} has no equivalent Team operation. Delegate Team operations to an unbound root coordinator by splitting targets per Team using multi_agent_v2 Team tools with explicit {}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                ids_guidance,
+                op.raw_tool(),
+            )
+        } else {
+            format!(
+                "Team-bound {} is unsupported. Delegate Team operations to an unbound root coordinator by splitting targets per Team using multi_agent_v2 Team tools with explicit {}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                ids_guidance,
+                op.raw_tool(),
+            )
+        }
+    } else {
+        // Single Team target(s). Target binding authority.
+        let team_id = bound_team_ids.iter().next().unwrap();
+        if op.has_no_equivalent_team_op() {
+            format!(
+                "Team-bound {} has no equivalent Team operation. Delegate Team operations to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id={}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                team_id,
+                op.raw_tool(),
+            )
+        } else {
+            format!(
+                "Team-bound {} is unsupported. Delegate Team operations to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id={}. {} cannot be used when the caller or any target is bound to a Team.",
+                op.raw_tool(),
+                team_id,
+                op.raw_tool(),
+            )
+        }
+    };
+    Err(FunctionCallError::RespondToModel(message))
+}
+
+/// 未所属 root が open Team ありのまま legacy v1 raw spawn すると帰属を推測できない。
+pub(crate) async fn reject_unbound_raw_spawn_when_teams_open_v1(
+    session: &Session,
+    caller_thread_id: &str,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    if team
+        .binding_for_checked(caller_thread_id)
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .is_none()
+        && team.open_team_count() > 0
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "open Team sessions require delegating to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id. multi_agent_v1.spawn_agent cannot infer Team identity.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawCollaborationOp {
+    Spawn,
+    SendMessage,
+    FollowupTask,
+    Wait,
+    Interrupt,
+}
+
+impl RawCollaborationOp {
+    fn team_tool(self) -> &'static str {
+        match self {
+            Self::Spawn => "team.spawn_agent",
+            Self::SendMessage => "team.send_message",
+            Self::FollowupTask => "team.followup_agent",
+            Self::Wait => "team.wait",
+            Self::Interrupt => "team.interrupt_agent",
+        }
+    }
+
+    fn raw_tool(self) -> &'static str {
+        match self {
+            Self::Spawn => "collaboration.spawn_agent",
+            Self::SendMessage => "collaboration.send_message",
+            Self::FollowupTask => "collaboration.followup_task",
+            Self::Wait => "collaboration.wait_agent",
+            Self::Interrupt => "collaboration.interrupt_agent",
+        }
+    }
+}
+
+/// caller またはいずれかの target が Team-bound なら raw collaboration を拒否する。
+pub(crate) async fn reject_team_bound_raw_collaboration(
+    session: &Session,
+    caller_thread_id: &str,
+    target_thread_ids: &[&str],
+    op: RawCollaborationOp,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    let mut subjects = Vec::with_capacity(target_thread_ids.len() + 1);
+    subjects.push(caller_thread_id);
+    subjects.extend_from_slice(target_thread_ids);
+    let mut bindings = team
+        .bindings_for_checked(&subjects)
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .into_iter();
+    let caller_binding = bindings.next().flatten();
+    let target_binding = bindings.flatten().next();
+    let Some(binding) = caller_binding.as_ref().or(target_binding.as_ref()) else {
+        return Ok(());
+    };
+    let message = format!(
+        "Team-bound collaboration must use {}(team_session_id={}, ...). {} cannot be used when the caller or any target is bound to a Team.",
+        op.team_tool(),
+        binding.team_session_id,
+        op.raw_tool(),
+    );
+    Err(FunctionCallError::RespondToModel(message))
+}
+
+/// 未所属 root が open Team ありのまま raw spawn すると帰属を推測できない。
+pub(crate) async fn reject_unbound_raw_spawn_when_teams_open(
+    session: &Session,
+    caller_thread_id: &str,
+    spawn_tool: &str,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    if team
+        .binding_for_checked(caller_thread_id)
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .is_none()
+        && team.open_team_count() > 0
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "open Team sessions require team.spawn_agent(team_session_id, ...). {spawn_tool} cannot infer Team identity."
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn thread_spawn_source(
@@ -475,4 +775,91 @@ fn validate_spawn_agent_reasoning_effort(
     Err(FunctionCallError::RespondToModel(format!(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn omitted_or_empty_metadata_is_absent() {
+        assert_eq!(parse_spawn_observer_metadata(None).expect("omit"), None);
+        assert_eq!(
+            parse_spawn_observer_metadata(Some(json!({}))).expect("empty"),
+            None
+        );
+    }
+
+    #[test]
+    fn string_map_is_accepted() {
+        let parsed = parse_spawn_observer_metadata(Some(json!({
+            "issue": "3360",
+            "note": "",
+        })))
+        .expect("valid metadata");
+        assert_eq!(
+            parsed,
+            Some(BTreeMap::from([
+                ("issue".to_string(), "3360".to_string()),
+                ("note".to_string(), String::new()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn non_object_or_non_string_metadata_is_rejected() {
+        assert!(parse_spawn_observer_metadata(Some(json!("x"))).is_err());
+        assert!(parse_spawn_observer_metadata(Some(json!(["a"]))).is_err());
+        assert!(parse_spawn_observer_metadata(Some(json!({"a": 1}))).is_err());
+    }
+
+    #[test]
+    fn metadata_limits_are_rejected() {
+        assert!(parse_spawn_observer_metadata(Some(json!({"": "x"}))).is_err());
+        assert!(
+            parse_spawn_observer_metadata(Some(json!({
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "x"
+            })))
+            .is_err()
+        );
+        assert!(
+            parse_spawn_observer_metadata(Some(json!({
+                "a": "x".repeat(MAX_SPAWN_METADATA_VALUE_CHARS + 1)
+            })))
+            .is_err()
+        );
+        let too_many = (0..=MAX_SPAWN_METADATA_ENTRIES)
+            .map(|index| (format!("k{index}"), json!("v")))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(parse_spawn_observer_metadata(Some(JsonValue::Object(too_many))).is_err());
+    }
+
+    #[test]
+    fn metadata_limits_count_unicode_scalars() {
+        let scalar = "😀";
+        assert_eq!(scalar.chars().count(), 1);
+        let key_ok = scalar.repeat(MAX_SPAWN_METADATA_KEY_CHARS);
+        let value_ok = scalar.repeat(MAX_SPAWN_METADATA_VALUE_CHARS);
+        let parsed = parse_spawn_observer_metadata(Some(json!({ key_ok: value_ok })))
+            .expect("scalar-length boundary must be accepted");
+        assert_eq!(
+            parsed.as_ref().map(std::collections::BTreeMap::len),
+            Some(1)
+        );
+
+        assert!(
+            parse_spawn_observer_metadata(Some(
+                json!({ scalar.repeat(MAX_SPAWN_METADATA_KEY_CHARS + 1): "x" })
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_spawn_observer_metadata(Some(
+                json!({ "a": scalar.repeat(MAX_SPAWN_METADATA_VALUE_CHARS + 1) })
+            ))
+            .is_err()
+        );
+    }
 }

@@ -41,6 +41,7 @@ pub(crate) struct ExternalAgentBackend {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedExternalAgentBackend {
     pub(crate) harness: String,
+    pub(crate) model: Option<String>,
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
 }
@@ -48,7 +49,7 @@ pub(crate) struct ResolvedExternalAgentBackend {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AcpRoleSettings {
     pub(crate) developer_instructions: Option<String>,
-    pub(crate) backend: Option<ExternalAgentBackend>,
+    pub(crate) backends: Vec<ExternalAgentBackend>,
 }
 
 pub(crate) fn acp_backend(
@@ -199,8 +200,9 @@ pub(crate) fn resolve_role_config<'a>(
 
 /// Loads the behavioral contract and optional ACP backend defaults declared by a role.
 ///
-/// A role becomes ACP-backed only when it declares `acp_harness`. In that case its
-/// `model` and `model_reasoning_effort` values supply defaults for the same backend.
+/// A role becomes ACP-backed when it declares either `acp_harness` or
+/// `acp_backend_pool`. A pool keeps the role contract independent from its ordered
+/// harness/model candidates.
 pub(crate) async fn acp_role_settings(
     config: &Config,
     role_name: &str,
@@ -211,7 +213,7 @@ pub(crate) async fn acp_role_settings(
     let Some(config_file) = role.config_file.as_ref() else {
         return Ok(AcpRoleSettings {
             developer_instructions: None,
-            backend: None,
+            backends: Vec::new(),
         });
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name)
@@ -238,9 +240,39 @@ pub(crate) async fn acp_role_settings(
                 .and_then(TomlValue::as_str)
                 .map(str::to_owned),
         });
+    let pool_name = role_layer_toml
+        .get("acp_backend_pool")
+        .and_then(TomlValue::as_str);
+    if backend.is_some() && pool_name.is_some() {
+        return Err("agent role cannot declare both acp_harness and acp_backend_pool".to_string());
+    }
+    let backends = match (backend, pool_name) {
+        (Some(backend), None) => vec![backend],
+        (None, Some(pool_name)) => {
+            let pool = config
+                .acp_backend_pools
+                .get(pool_name)
+                .ok_or_else(|| format!("unknown ACP backend pool '{pool_name}'"))?;
+            if pool.candidates.is_empty() {
+                return Err(format!(
+                    "ACP backend pool '{pool_name}' must contain at least one candidate"
+                ));
+            }
+            pool.candidates
+                .iter()
+                .map(|candidate| ExternalAgentBackend {
+                    harness: candidate.harness.clone(),
+                    model: candidate.model.clone(),
+                    effort: candidate.effort.clone(),
+                })
+                .collect()
+        }
+        (None, None) => Vec::new(),
+        (Some(_), Some(_)) => unreachable!(),
+    };
     Ok(AcpRoleSettings {
         developer_instructions,
-        backend,
+        backends,
     })
 }
 
@@ -376,33 +408,41 @@ pub(crate) mod spawn_tool_spec {
     use super::*;
 
     /// Builds the spawn-agent tool description text from built-in and configured roles.
-    pub(crate) fn build(user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>) -> String {
+    pub(crate) fn build(
+        user_defined_agent_roles: &BTreeMap<String, AgentRoleConfig>,
+        acp_backend_pools: &BTreeMap<String, codex_config::config_toml::AcpBackendPoolToml>,
+    ) -> String {
         let built_in_roles = built_in::configs();
-        build_from_configs(built_in_roles, user_defined_agent_roles)
+        build_from_configs(built_in_roles, user_defined_agent_roles, acp_backend_pools)
     }
 
     // This function is not inlined for testing purpose.
     fn build_from_configs(
         built_in_roles: &BTreeMap<String, AgentRoleConfig>,
         user_defined_roles: &BTreeMap<String, AgentRoleConfig>,
+        acp_backend_pools: &BTreeMap<String, codex_config::config_toml::AcpBackendPoolToml>,
     ) -> String {
         let mut seen = BTreeSet::new();
         let mut formatted_roles = Vec::new();
         for (name, declaration) in user_defined_roles {
             if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
+                formatted_roles.push(format_role(name, declaration, acp_backend_pools));
             }
         }
         for (name, declaration) in built_in_roles {
             if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
+                formatted_roles.push(format_role(name, declaration, acp_backend_pools));
             }
         }
 
         format!("Available roles:\n{}", formatted_roles.join("\n"))
     }
 
-    fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
+    fn format_role(
+        name: &str,
+        declaration: &AgentRoleConfig,
+        acp_backend_pools: &BTreeMap<String, codex_config::config_toml::AcpBackendPoolToml>,
+    ) -> String {
         if let Some(description) = &declaration.description {
             let locked_settings_note = declaration
                 .config_file
@@ -426,8 +466,13 @@ pub(crate) mod spawn_tool_spec {
                     let acp_harness = role_toml
                         .get("acp_harness")
                         .and_then(TomlValue::as_str);
+                    let acp_backend_pool = role_toml
+                        .get("acp_backend_pool")
+                        .and_then(TomlValue::as_str);
 
-                    let model_and_reasoning_note = if acp_harness.is_some() {
+                    let model_and_reasoning_note = if acp_backend_pool.is_some() {
+                        String::new()
+                    } else if acp_harness.is_some() {
                         match (model, reasoning_effort) {
                             (Some(model), Some(reasoning_effort)) => format!(
                                 "\n- This role defaults to ACP model `{model}` with `{reasoning_effort}` reasoning effort."
@@ -472,7 +517,18 @@ pub(crate) mod spawn_tool_spec {
                             )
                         })
                         .unwrap_or_default();
-                    format!("{model_and_reasoning_note}{service_tier_note}{acp_harness_note}")
+                    let acp_backend_pool_note = acp_backend_pool
+                        .map(|pool_name| match acp_backend_pools.get(pool_name) {
+                            Some(pool) => format!(
+                                "\n- This role has {} ordered ACP backend candidate(s), selected internally. Call `acp.spawn` with the role and omit harness/model/effort. After a prior candidate reaches a terminal result, pass its task name as `fallback_from` to use the next candidate.",
+                                pool.candidates.len()
+                            ),
+                            None => format!("\n- This role refers to unknown ACP backend pool `{pool_name}`."),
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "{model_and_reasoning_note}{service_tier_note}{acp_harness_note}{acp_backend_pool_note}"
+                    )
                 })
                 .unwrap_or_default();
             format!("{name}: {{\n{description}{locked_settings_note}\n}}")

@@ -94,6 +94,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(!description.contains("disabled-model"));
     assert!(properties.contains_key("task_name"));
     assert!(properties.contains_key("message"));
+    assert!(properties.contains_key("metadata"));
     assert_eq!(
         properties
             .get("message")
@@ -163,6 +164,7 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
 
     assert!(properties.contains_key("fork_context"));
     assert!(!properties.contains_key("fork_turns"));
+    assert!(properties.contains_key("metadata"));
     assert_eq!(
         properties.get("agent_type"),
         Some(&JsonSchema::string(Some(format!(
@@ -271,6 +273,9 @@ fn spawn_agent_tool_keeps_model_controls_when_spawn_metadata_is_hidden() {
     assert!(properties.contains_key("model"));
     assert!(properties.contains_key("reasoning_effort"));
     assert!(!properties.contains_key("service_tier"));
+    // `metadata` must stay hidden on the reserved-schema path even though the
+    // handler still accepts it.
+    assert!(!properties.contains_key("metadata"));
     assert!(!description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
     assert!(description.contains("Available model overrides"));
 }
@@ -300,11 +305,201 @@ fn spawn_agent_tool_hides_model_controls_without_override_exposure() {
         .as_ref()
         .expect("spawn_agent should use object params");
 
-    for property in ["agent_type", "model", "reasoning_effort", "service_tier"] {
+    for property in [
+        "agent_type",
+        "model",
+        "reasoning_effort",
+        "service_tier",
+        "metadata",
+    ] {
         assert!(!properties.contains_key(property));
     }
     assert!(!description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
     assert!(!description.contains("Available model overrides"));
+}
+
+#[test]
+fn reserved_spawn_agent_schema_deep_equals_required_surface() {
+    let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+        available_models: vec![model_preset("visible", /*show_in_picker*/ true)],
+        agent_type_description: "role help".to_string(),
+        expose_agent_type: false,
+        hide_agent_type_model_reasoning: true,
+        expose_spawn_agent_model_overrides: false,
+        multi_agent_version: MultiAgentVersion::V2,
+        usage_hint_text: None,
+    });
+    let ToolSpec::Function(ResponsesApiTool {
+        name,
+        parameters,
+        output_schema,
+        ..
+    }) = tool
+    else {
+        panic!("spawn_agent should be a function tool");
+    };
+    assert_eq!(name, "spawn_agent");
+    let actual = serde_json::to_value(&parameters).expect("schema json");
+    let expected = json!({
+        "type": "object",
+        "properties": {
+            "fork_turns": {
+                "type": "string",
+                "description": actual["properties"]["fork_turns"]["description"]
+            },
+            "message": {
+                "type": "string",
+                "encrypted": true,
+                "description": actual["properties"]["message"]["description"]
+            },
+            "task_name": {
+                "type": "string",
+                "description": actual["properties"]["task_name"]["description"]
+            }
+        },
+        "required": ["task_name", "message"],
+        "additionalProperties": false
+    });
+    let actual_keys = actual["properties"]
+        .as_object()
+        .expect("properties")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(actual_keys, vec!["fork_turns", "message", "task_name"]);
+    assert_eq!(actual["required"], expected["required"]);
+    assert_eq!(
+        actual["additionalProperties"],
+        expected["additionalProperties"]
+    );
+    assert!(
+        !actual["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("metadata")
+    );
+    assert!(
+        !actual["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("team_session_id")
+    );
+    let output = output_schema.expect("output schema");
+    assert_eq!(
+        output,
+        json!({
+            "type": "object",
+            "properties": {
+                "task_name": {
+                    "type": "string",
+                    "description": "Canonical task name for the spawned agent."
+                }
+            },
+            "required": ["task_name"],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[test]
+fn reserved_collaboration_schemas_stay_free_of_team_identity() {
+    let spawn = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+        available_models: vec![model_preset("visible", /*show_in_picker*/ true)],
+        agent_type_description: "role help".to_string(),
+        expose_agent_type: false,
+        hide_agent_type_model_reasoning: true,
+        expose_spawn_agent_model_overrides: false,
+        multi_agent_version: MultiAgentVersion::V2,
+        usage_hint_text: None,
+    });
+    let tools = [
+        ("spawn_agent", spawn, vec!["task_name", "message"]),
+        (
+            "send_message",
+            create_send_message_tool(),
+            vec!["target", "message"],
+        ),
+        (
+            "followup_task",
+            create_followup_task_tool(),
+            vec!["target", "message"],
+        ),
+        (
+            "wait_agent",
+            create_wait_agent_tool_v2(WaitAgentTimeoutOptions::default()),
+            vec![],
+        ),
+        (
+            "interrupt_agent",
+            create_interrupt_agent_tool_v2(),
+            vec!["target"],
+        ),
+    ];
+    for (name, tool, required) in tools {
+        let ToolSpec::Function(ResponsesApiTool {
+            name: tool_name,
+            parameters,
+            ..
+        }) = tool
+        else {
+            panic!("{name} should stay a function tool");
+        };
+        assert_eq!(tool_name, name);
+        let properties = parameters.properties.as_ref().expect("properties");
+        assert!(
+            !properties.contains_key("team_session_id"),
+            "{name} reserved schema must not gain team_session_id"
+        );
+        if !required.is_empty() {
+            assert_eq!(
+                parameters.required.as_ref(),
+                Some(&required.into_iter().map(str::to_string).collect())
+            );
+        }
+    }
+}
+
+#[test]
+fn reserved_v1_collaboration_schemas_stay_free_of_team_identity() {
+    let spawn = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
+        available_models: Vec::new(),
+        agent_type_description: "role help".to_string(),
+        expose_agent_type: true,
+        hide_agent_type_model_reasoning: false,
+        expose_spawn_agent_model_overrides: true,
+        multi_agent_version: MultiAgentVersion::V1,
+        usage_hint_text: None,
+    });
+    let tools = [
+        ("spawn_agent", spawn),
+        ("send_input", create_send_input_tool_v1()),
+        ("close_agent", create_close_agent_tool_v1()),
+        ("resume_agent", create_resume_agent_tool()),
+        (
+            "wait_agent",
+            create_wait_agent_tool_v1(WaitAgentTimeoutOptions::default()),
+        ),
+    ];
+    for (name, tool) in tools {
+        let ToolSpec::Namespace(namespace) = tool else {
+            panic!("{name} v1 should stay a namespace tool");
+        };
+        assert_eq!(namespace.name, MULTI_AGENT_V1_NAMESPACE);
+        let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool { parameters, .. })) =
+            namespace.tools.first()
+        else {
+            panic!("{name} should stay a namespace function tool");
+        };
+        let properties = parameters.properties.as_ref().expect("properties");
+        assert!(
+            !properties.contains_key("team_session_id"),
+            "{name} reserved schema must not gain team_session_id"
+        );
+        assert!(
+            !properties.contains_key("metric_effects"),
+            "{name} reserved schema must not gain metric_effects"
+        );
+    }
 }
 
 #[test]

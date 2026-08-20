@@ -6,17 +6,34 @@ impl AgentControl {
     /// Submit a shutdown request for a live agent without marking it explicitly closed in
     /// persisted spawn-edge state.
     pub(crate) async fn shutdown_live_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
-        let state = self.upgrade()?;
-        let result = if let Ok(thread) = state.get_thread(agent_id).await {
+        let state = match self.upgrade() {
+            Ok(state) => state,
+            Err(error) => {
+                self.forget_v2_residency(agent_id);
+                self.state.release_spawned_thread(agent_id);
+                return Err(error);
+            }
+        };
+        let mut first_error = None;
+        let mut response = String::new();
+        if let Ok(thread) = state.get_thread(agent_id).await {
             thread
                 .session
                 .ensure_rollout_materialized(PersistContext::Standard)
                 .await;
-            thread.session.flush_rollout().await?;
-            let result = if matches!(thread.agent_status().await, AgentStatus::Shutdown) {
-                Ok(String::new())
-            } else {
-                state
+            #[cfg(test)]
+            let forced_failure = self.take_native_shutdown_failure_probe();
+            #[cfg(not(test))]
+            let forced_failure = false;
+            if forced_failure {
+                first_error = Some(CodexErr::Fatal(
+                    "forced pre-shutdown cleanup failure".to_string(),
+                ));
+            } else if let Err(error) = thread.session.flush_rollout().await {
+                first_error = Some(error.into());
+            }
+            if !matches!(thread.agent_status().await, AgentStatus::Shutdown) {
+                match state
                     .send_op(
                         agent_id,
                         Op::Shutdown {},
@@ -24,11 +41,15 @@ impl AgentControl {
                         /*root_turn_id*/ None,
                     )
                     .await
-            };
+                {
+                    Ok(value) => response = value,
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+            }
             thread.wait_until_terminated().await;
-            result
         } else {
-            state
+            match state
                 .send_op(
                     agent_id,
                     Op::Shutdown {},
@@ -36,11 +57,18 @@ impl AgentControl {
                     /*root_turn_id*/ None,
                 )
                 .await
-        };
+            {
+                Ok(value) => response = value,
+                Err(error) => first_error = Some(error),
+            }
+        }
         let _ = state.remove_thread(&agent_id).await;
         self.forget_v2_residency(agent_id);
         self.state.release_spawned_thread(agent_id);
-        result
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(response),
+        }
     }
 
     /// Mark `agent_id` as explicitly closed in persisted spawn-edge state, then shut down the

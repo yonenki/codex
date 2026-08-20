@@ -2,6 +2,7 @@ use super::multi_agents_common::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
 use super::multi_agents_common::model_supports_multi_agent_backend;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_tools::AdditionalProperties;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -112,6 +113,10 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     }
     if options.hide_agent_type_model_reasoning {
         properties.remove("service_tier");
+        // Observer metadata is accepted by the handler but must stay out of the
+        // model-visible schema: models with a reserved `collaboration.spawn_agent`
+        // schema reject any extra property.
+        properties.remove("metadata");
     }
     if !options.expose_spawn_agent_model_overrides {
         properties.remove("model");
@@ -625,6 +630,10 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
                 SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
+        (
+            "metadata".to_string(),
+            spawn_observer_metadata_schema(),
+        ),
     ])
 }
 
@@ -669,7 +678,24 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
                 SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
         ),
+        (
+            "metadata".to_string(),
+            spawn_observer_metadata_schema(),
+        ),
     ])
+}
+
+pub(crate) fn spawn_observer_metadata_schema() -> JsonSchema {
+    let mut schema = JsonSchema::object(
+        BTreeMap::new(),
+        None,
+        Some(AdditionalProperties::from(JsonSchema::string(None))),
+    );
+    schema.description = Some(
+        "Optional observer-facing operational labels as a string map. Not for secrets. Follow-ups inherit the spawn map."
+            .to_string(),
+    );
+    schema
 }
 
 fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {
@@ -677,6 +703,9 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
     properties.remove("model");
     properties.remove("reasoning_effort");
     properties.remove("service_tier");
+    // See the note in create_spawn_agent_tool_v2: `metadata` must stay out of the
+    // model-visible schema on the reserved-schema path.
+    properties.remove("metadata");
 }
 
 fn spawn_agent_tool_description(

@@ -2367,7 +2367,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         .properties
         .as_ref()
         .expect("acp spawn should use object params");
-    for property in ["harness", "model", "effort", "agent_type"] {
+    for property in ["harness", "model", "effort", "agent_type", "fallback_from"] {
         assert!(acp_spawn_properties.contains_key(property));
     }
     let ToolSpec::Namespace(namespace) = v2.visible_spec(MULTI_AGENT_V2_NAMESPACE) else {

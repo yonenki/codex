@@ -353,6 +353,7 @@ pub(crate) struct ThreadManagerState {
     analytics_events_client: Option<AnalyticsEventsClient>,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
+    team: Arc<codex_team_runtime::TeamControl>,
 }
 
 pub fn build_models_manager(
@@ -412,6 +413,32 @@ pub fn local_agent_graph_store_from_state_db(
     })
 }
 
+fn production_team_control(codex_home: &std::path::Path) -> Arc<codex_team_runtime::TeamControl> {
+    let team = Arc::new(codex_team_runtime::TeamControl::production(codex_home));
+    spawn_team_restore_and_flush(&team);
+    team
+}
+
+fn persistent_team_control(codex_home: &std::path::Path) -> Arc<codex_team_runtime::TeamControl> {
+    let team = Arc::new(codex_team_runtime::TeamControl::for_codex_home(
+        codex_home,
+        codex_team_runtime::RecordingSink::default(),
+    ));
+    spawn_team_restore_and_flush(&team);
+    team
+}
+
+fn spawn_team_restore_and_flush(team: &Arc<codex_team_runtime::TeamControl>) {
+    let team = Arc::clone(team);
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            if let Err(err) = team.ensure_restored().await {
+                warn!("failed to restore team sessions: {err}");
+            }
+        });
+    }
+}
+
 impl ThreadManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -457,6 +484,7 @@ impl ThreadManager {
             } else {
                 Arc::new(DisabledCodeModeSessionProvider)
             };
+        let team = production_team_control(&codex_home.to_path_buf());
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
@@ -481,6 +509,7 @@ impl ThreadManager {
                 analytics_events_client,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
+                team,
             }),
             _test_codex_home_guard: None,
         }
@@ -609,7 +638,7 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
-                    .models_manager(codex_home, /*config_model_catalog*/ None),
+                    .models_manager(codex_home.clone(), /*config_model_catalog*/ None),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
@@ -630,6 +659,7 @@ impl ThreadManager {
                 analytics_events_client: None,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
+                team: persistent_team_control(&codex_home),
             }),
             _test_codex_home_guard: None,
         }
@@ -1300,18 +1330,20 @@ impl ThreadManager {
     }
 
     pub(crate) fn agent_control(&self) -> AgentControl {
-        AgentControl::new(
+        AgentControl::with_team(
             Arc::downgrade(&self.state),
             self.state.thread_id_generator.clone(),
             /*rollout_budget*/ None,
+            Arc::clone(&self.state.team),
         )
     }
 
     fn agent_control_for_config(&self, config: &Config) -> AgentControl {
-        AgentControl::new(
+        AgentControl::with_team(
             Arc::downgrade(&self.state),
             self.state.thread_id_generator.clone(),
             config.rollout_budget.clone(),
+            Arc::clone(&self.state.team),
         )
     }
 

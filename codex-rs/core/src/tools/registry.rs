@@ -43,6 +43,17 @@ use serde_json::Value;
 
 pub(crate) type ToolTelemetryTags = Vec<(&'static str, String)>;
 
+/// Selects which authority owns Team event lifecycle attribution for a tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TeamLifecycleRouting {
+    /// The registry records lifecycle events against the caller's Team binding.
+    #[default]
+    CallerBound,
+    /// The handler either records lifecycle events after resolving semantic authority or
+    /// deliberately emits no Team lifecycle events.
+    HandlerOwned,
+}
+
 pub use codex_tools::ToolExecutor;
 pub use codex_tools::ToolExposure;
 
@@ -51,6 +62,10 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::CallerBound
+    }
+
     /// Returns a shared spec when both the spec and search metadata are immutable.
     fn immutable_spec(&self) -> Option<&Arc<ToolSpec>> {
         None
@@ -583,6 +598,7 @@ impl ToolRegistry {
                         &invocation,
                         terminal_outcome_reached.as_deref(),
                         ToolCallOutcome::Blocked,
+                        tool.team_lifecycle_routing(),
                     )
                     .await;
                     return Err(err);
@@ -601,6 +617,7 @@ impl ToolRegistry {
                             ToolCallOutcome::Failed {
                                 handler_executed: false,
                             },
+                            tool.team_lifecycle_routing(),
                         )
                         .await;
                         return Err(err);
@@ -612,7 +629,8 @@ impl ToolRegistry {
             }
         }
 
-        notify_tool_start(&invocation).await;
+        let team_lifecycle_routing = tool.team_lifecycle_routing();
+        notify_tool_start(&invocation, team_lifecycle_routing).await;
 
         if let Some(command) = shell_script_for_invocation(&invocation) {
             let parsed = parse_shell_script(&command);
@@ -718,6 +736,7 @@ impl ToolRegistry {
             &invocation,
             terminal_outcome_reached.as_deref(),
             lifecycle_outcome,
+            team_lifecycle_routing,
         )
         .await;
 
@@ -767,12 +786,13 @@ async fn notify_tool_finish_if_unclaimed(
     invocation: &ToolInvocation,
     terminal_outcome_reached: Option<&AtomicBool>,
     outcome: ToolCallOutcome,
+    team_lifecycle_routing: TeamLifecycleRouting,
 ) -> bool {
     if terminal_outcome_reached.is_some_and(|reached| reached.swap(true, Ordering::AcqRel)) {
         return false;
     }
 
-    notify_tool_finish(invocation, outcome).await;
+    notify_tool_finish(invocation, outcome, team_lifecycle_routing).await;
     true
 }
 

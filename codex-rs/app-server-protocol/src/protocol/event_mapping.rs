@@ -189,6 +189,8 @@ pub fn item_event_to_server_notification(
                 kind: activity.kind.into(),
                 agent_thread_id: activity.agent_thread_id.to_string(),
                 agent_path: String::from(activity.agent_path),
+                harness: activity.harness,
+                model: activity.model,
             };
             ServerNotification::ItemCompleted(ItemCompletedNotification {
                 thread_id,
@@ -204,6 +206,8 @@ pub fn item_event_to_server_notification(
                 agent_path: event.agent_path.map(|path| path.to_string()),
                 agent_nickname: event.agent_nickname,
                 agent_role: event.agent_role,
+                harness: event.harness,
+                model: event.model,
                 status: match event.status {
                     codex_protocol::protocol::SubAgentTerminalStatus::Completed => {
                         SubAgentTerminalStatus::Completed
@@ -542,6 +546,8 @@ mod tests {
                 agent_path: Some(agent_path.clone()),
                 agent_nickname: Some("Luna".to_string()),
                 agent_role: Some("reviewer".to_string()),
+                harness: None,
+                model: None,
                 status: codex_protocol::protocol::SubAgentTerminalStatus::Errored,
             }),
             "parent-thread",

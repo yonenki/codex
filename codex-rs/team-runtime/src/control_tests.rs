@@ -1,0 +1,1595 @@
+use crate::StartNodeCommand;
+use crate::StartTeamCommand;
+use crate::TeamControl;
+use crate::TeamRuntimeError;
+use crate::TransitionCommand;
+use crate::control::EndTeamCommand;
+use crate::control::RecordResultCommand;
+use crate::ids::StateRevision;
+use crate::ids::TeamSessionId;
+use crate::tests_support::sample_graph;
+use codex_team_graph::TeamGraphCatalog;
+use pretty_assertions::assert_eq;
+
+fn control() -> TeamControl {
+    TeamControl::memory(TeamGraphCatalog::new([sample_graph()]))
+}
+
+#[tokio::test]
+async fn bind_agent_emits_backend_fallback_only_when_marked() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let mut pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    control
+        .bind_agent_before_start("agent-normal", pending.clone())
+        .await
+        .expect("normal bind");
+    pending.backend_fallback = true;
+    control
+        .bind_agent_before_start("agent-fallback", pending)
+        .await
+        .expect("fallback bind");
+    let attached: Vec<_> = sink
+        .envelopes()
+        .into_iter()
+        .filter(|envelope| envelope.kind == "agent_attached")
+        .collect();
+    assert_eq!(attached.len(), 2);
+    assert!(attached[0].payload.get("backend_fallback").is_none());
+    assert_eq!(attached[1].payload["backend_fallback"], true);
+}
+
+#[tokio::test]
+async fn bind_agent_emits_resolved_attach_metadata_without_persisting_it_in_binding() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let exact_message = "delegate\nwith  spacing and 日本語";
+    let mut pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    pending.attach_metadata = Some(crate::PendingAgentAttachMetadata {
+        delegation_message: exact_message.into(),
+        identity: Some(crate::AgentBackendIdentity::Acp {
+            harness: "cursor".into(),
+            model: Some("cursor-model".into()),
+        }),
+    });
+    assert!(
+        serde_json::to_value(&pending)
+            .expect("serialize pending binding")
+            .get("attach_metadata")
+            .is_none(),
+        "attach metadata must persist only through agent_attached"
+    );
+    let binding = control
+        .bind_agent_before_start("agent-acp", pending)
+        .await
+        .expect("bind");
+
+    let envelope = sink
+        .envelopes()
+        .into_iter()
+        .find(|event| event.kind == "agent_attached")
+        .expect("agent_attached");
+    assert_eq!(envelope.payload["backend"], "acp");
+    assert_eq!(envelope.payload["harness"], "cursor");
+    assert_eq!(envelope.payload["model"], "cursor-model");
+    assert_eq!(envelope.payload["delegation_message"], exact_message);
+    assert!(binding.to_pending().attach_metadata.is_none());
+}
+
+#[tokio::test]
+async fn bind_agent_rejects_unresolved_attach_metadata_before_persistence() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let mut pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    pending.attach_metadata = Some(crate::PendingAgentAttachMetadata::new("delegate".into()));
+
+    let error = control
+        .bind_agent_before_start("untraced-agent", pending)
+        .await
+        .expect_err("unresolved identity must fail before binding");
+    assert!(matches!(error, TeamRuntimeError::Invalid(_)));
+    assert!(control.binding_for("untraced-agent").await.is_none());
+    assert!(
+        sink.envelopes()
+            .into_iter()
+            .all(|event| event.kind != "agent_attached")
+    );
+}
+
+#[tokio::test]
+async fn two_teams_do_not_share_revision_or_node() {
+    let control = control();
+    let a = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("a".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("a");
+    let b = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("b".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("b");
+    assert_ne!(a.team_session_id, b.team_session_id);
+    let a_node = control
+        .start_node(StartNodeCommand {
+            team_session_id: a.team_session_id.clone(),
+            node_id: None,
+            expected_revision: a.revision,
+        })
+        .await
+        .expect("a node");
+    let b_status = control.status(&b.team_session_id).await.expect("b status");
+    assert_eq!(b_status.revision, b.revision);
+    assert!(b_status.current_node.is_some());
+    assert_eq!(a_node.revision.get(), a.revision.get() + 1);
+}
+
+#[tokio::test]
+async fn rejects_cross_team_agent_reference() {
+    let control = control();
+    let a = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("a");
+    let b = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("b");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: a.team_session_id.clone(),
+            node_id: None,
+            expected_revision: a.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&a.team_session_id, "worker")
+        .await
+        .expect("pending");
+    control
+        .bind_agent_before_start("agent-a", pending)
+        .await
+        .expect("bind");
+    let err = control
+        .require_same_team(&b.team_session_id, "agent-a")
+        .await
+        .expect_err("cross team");
+    assert!(matches!(err, TeamRuntimeError::CrossTeamRef { .. }));
+}
+
+#[tokio::test]
+async fn stale_revision_cas_rejects_transition() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let recorded = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            evidence_id: Some("ev_work".into()),
+            candidate_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            qa: None,
+            findings: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("result");
+    assert_eq!(
+        recorded.candidate_sha.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+    let err = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: StateRevision::new(1),
+        })
+        .await
+        .expect_err("stale");
+    assert!(matches!(err, TeamRuntimeError::StaleRevision { .. }));
+}
+
+#[tokio::test]
+async fn sequences_are_per_team() {
+    let control = control();
+    let a = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("a");
+    let b = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("b");
+    let a2 = control
+        .start_node(StartNodeCommand {
+            team_session_id: a.team_session_id.clone(),
+            node_id: None,
+            expected_revision: a.revision,
+        })
+        .await
+        .expect("a node");
+    let b2 = control
+        .start_node(StartNodeCommand {
+            team_session_id: b.team_session_id.clone(),
+            node_id: None,
+            expected_revision: b.revision,
+        })
+        .await
+        .expect("b node");
+    assert_eq!(a2.revision.get(), 2);
+    assert_eq!(b2.revision.get(), 2);
+}
+
+#[tokio::test]
+async fn unknown_team_is_not_found() {
+    let control = control();
+    let err = control
+        .status(&TeamSessionId::generate())
+        .await
+        .expect_err("missing");
+    assert!(matches!(err, TeamRuntimeError::TeamNotFound(_)));
+}
+
+#[tokio::test]
+async fn end_team_closes_session() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+    let recorded = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            qa: None,
+            findings: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("record result");
+    let transitioned = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .await
+        .expect("transition to terminal");
+    let ended = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: false,
+            reason: "done".into(),
+            expected_revision: transitioned.revision,
+        })
+        .await
+        .expect("end");
+    assert!(!control.has_open_teams().await);
+    assert!(ended.possible_next.is_empty());
+}
+
+#[tokio::test]
+async fn fake_acp_lifecycle_records_pool_retry_and_unreported_coverage() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    control
+        .bind_agent_before_start("acp-1", pending.clone())
+        .await
+        .expect("first backend");
+    control
+        .record_agent_terminal("acp-1", "errored")
+        .await
+        .expect("first terminal");
+    let mut fallback = pending;
+    fallback.backend_fallback = true;
+    control
+        .bind_agent_before_start("acp-2", fallback)
+        .await
+        .expect("retry backend");
+    control
+        .record_tool_operation(
+            "acp-2",
+            "unknown",
+            "call-1",
+            crate::TeamEventKind::ToolCoverageUnreported,
+            Some("unreported"),
+        )
+        .await
+        .expect("coverage");
+    control
+        .record_agent_terminal("acp-2", "completed")
+        .await
+        .expect("second terminal");
+    let binding = control.binding_snapshot("acp-2");
+    assert!(binding.is_some());
+}
+
+#[tokio::test]
+async fn pending_binding_rejects_role_mismatch() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let err = control
+        .pending_binding_for_node(&started.team_session_id, "textil_worker_default")
+        .await
+        .expect_err("role mismatch");
+    assert!(matches!(err, TeamRuntimeError::RoleMismatch { .. }));
+}
+
+#[tokio::test]
+async fn closed_team_rejects_lifecycle_and_unstarted_node_completion() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let err = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            qa: None,
+            findings: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect_err("unstarted node");
+    assert!(matches!(err, TeamRuntimeError::NoActiveNodeRun(_)));
+
+    let ended = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: true,
+            reason: "aborted".into(),
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("end");
+    let err = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: ended.revision,
+        })
+        .await
+        .expect_err("closed");
+    assert!(matches!(err, TeamRuntimeError::ClosedTeam(_)));
+}
+
+#[tokio::test]
+async fn rejects_double_start_while_node_run_is_active() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+
+    // Second start on active uncompleted run must be rejected.
+    let err = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect_err("double start must fail");
+    assert!(matches!(err, TeamRuntimeError::ActiveNodeRunExists(_)));
+}
+
+#[tokio::test]
+async fn rejects_transition_before_node_result_completion() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+
+    // Transition before node started: rejected.
+    let err = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect_err("transition before node start");
+    assert!(matches!(err, TeamRuntimeError::NoCompletedNodeRun(_)));
+
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+
+    // Transition before record_result: rejected.
+    let err = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect_err("transition before record_result");
+    assert!(matches!(err, TeamRuntimeError::NoCompletedNodeRun(_)));
+
+    // After record_result, transition with matching result succeeds.
+    let recorded = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            qa: None,
+            findings: None,
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("record_result");
+    let transitioned = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .await
+        .expect("transition");
+    assert_eq!(
+        transitioned.current_node.unwrap().node_id.as_str(),
+        "completed"
+    );
+}
+
+#[tokio::test]
+async fn rejects_normal_end_with_active_run_or_agent_and_allows_abort() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+
+    // 1. Non-terminal node end_team(aborted: false) rejected.
+    let err = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: false,
+            reason: "done".into(),
+            expected_revision: started.revision,
+        })
+        .await
+        .expect_err("non-terminal end rejected");
+    assert!(matches!(err, TeamRuntimeError::NonTerminalNode { .. }));
+
+    // Move to terminal node "completed".
+    let _node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending agent binding");
+    control
+        .bind_agent_before_start("active-worker", pending)
+        .await
+        .expect("bind active agent");
+    let agent_attached = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status after bind");
+    let recorded = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            qa: None,
+            findings: None,
+            expected_revision: agent_attached.revision,
+        })
+        .await
+        .expect("result");
+    let transitioned = control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "candidate_ready".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .await
+        .expect("transition");
+
+    // 2. Terminal node with active run: start_node on terminal node without record_result.
+    let terminal_run = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: transitioned.revision,
+        })
+        .await
+        .expect("terminal start_node");
+    let err = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: false,
+            reason: "done".into(),
+            expected_revision: terminal_run.revision,
+        })
+        .await
+        .expect_err("active run end rejected");
+    assert!(matches!(err, TeamRuntimeError::ActiveNodeRunExists(_)));
+
+    // Complete the terminal run while leaving the bound agent active.
+    let terminal_completed = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "done".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            qa: None,
+            findings: None,
+            expected_revision: terminal_run.revision,
+        })
+        .await
+        .expect("terminal result");
+
+    let err = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: false,
+            reason: "done".into(),
+            expected_revision: terminal_completed.revision,
+        })
+        .await
+        .expect_err("active agent normal end rejected");
+    assert!(matches!(err, TeamRuntimeError::ActiveAgents(_)));
+
+    let ended = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: true,
+            reason: "abort with active agent".into(),
+            expected_revision: terminal_completed.revision,
+        })
+        .await
+        .expect("active agent aborted end allowed");
+    assert_eq!(ended.lifecycle, crate::state::TeamLifecycle::Aborted);
+}
+
+#[tokio::test]
+async fn allows_aborted_end_team_mid_run() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    // Mid-run on non-terminal node with active run: aborted=true is allowed.
+    let aborted = control
+        .end_team(EndTeamCommand {
+            team_session_id: started.team_session_id.clone(),
+            aborted: true,
+            reason: "user requested abort".into(),
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("abort");
+    assert_eq!(aborted.lifecycle, crate::state::TeamLifecycle::Aborted);
+}
+
+#[tokio::test]
+async fn agent_wait_entered_and_resolved_preserves_agent_lifecycle() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+
+    let waited = control
+        .record_agent_wait_entered(&started.team_session_id, "agent-worker", "worker result")
+        .await
+        .expect("wait entered");
+    assert_eq!(waited.lifecycle, crate::state::TeamLifecycle::WaitingAgent);
+    assert_eq!(waited.waiting_reason, None);
+
+    let resolved = control
+        .record_agent_wait_resolved(&started.team_session_id, "agent-worker", "worker result")
+        .await
+        .expect("wait resolved");
+    assert_eq!(resolved.lifecycle, crate::state::TeamLifecycle::Running);
+    assert_eq!(resolved.waiting_reason, None);
+}
+
+#[tokio::test]
+async fn wait_and_evidence_reach_the_append_only_trace() {
+    let control = control();
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let waited = control
+        .enter_external_wait(crate::ExternalWaitCommand {
+            team_session_id: started.team_session_id.clone(),
+            reason: "ci".into(),
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("wait");
+    assert_eq!(waited.waiting_reason.as_deref(), Some("ci"));
+    let resolved = control
+        .resolve_external_wait(crate::ExternalWaitCommand {
+            team_session_id: started.team_session_id.clone(),
+            reason: "ci".into(),
+            expected_revision: waited.revision,
+        })
+        .await
+        .expect("resolve");
+    assert_eq!(resolved.waiting_reason, None);
+
+    let recorded = control
+        .record_evidence(
+            crate::EvidenceCommand {
+                team_session_id: started.team_session_id.clone(),
+                evidence_id: "ev_qa".into(),
+                identity: Some("sha".into()),
+                expected_revision: resolved.revision,
+            },
+            crate::TeamEventKind::EvidenceRecorded,
+        )
+        .await
+        .expect("evidence");
+    control
+        .record_evidence(
+            crate::EvidenceCommand {
+                team_session_id: started.team_session_id.clone(),
+                evidence_id: "ev_qa".into(),
+                identity: None,
+                expected_revision: recorded.revision,
+            },
+            crate::TeamEventKind::EvidenceInvalidated,
+        )
+        .await
+        .expect("invalidate");
+}
+
+#[tokio::test]
+async fn transition_copies_graph_metric_effects_and_ignores_caller_injection() {
+    let sink = crate::RecordingSink::default();
+    let control = TeamControl::with_memory_store(
+        TeamGraphCatalog::new([crate::tests_support::review_return_graph()]),
+        sink.clone(),
+    );
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "review-return".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    let node = control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let recorded = control
+        .record_result(RecordResultCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "changes_requested".into(),
+            evidence_id: None,
+            candidate_sha: None,
+            qa: None,
+            findings: Some(2),
+            expected_revision: node.revision,
+        })
+        .await
+        .expect("result");
+    control
+        .transition(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "changes_requested".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .await
+        .expect("transition");
+    let selected = sink
+        .envelopes()
+        .into_iter()
+        .find(|envelope| envelope.kind == "transition_selected")
+        .expect("selected");
+    assert_eq!(
+        selected.payload["metric_effects"],
+        serde_json::json!(["review_return_to_work"])
+    );
+    assert!(
+        !serde_json::to_value(TransitionCommand {
+            team_session_id: started.team_session_id.clone(),
+            result: "changes_requested".into(),
+            deviation_reason: None,
+            expected_revision: recorded.revision,
+        })
+        .expect("command json")
+        .as_object()
+        .expect("object")
+        .contains_key("metric_effects"),
+        "tool caller cannot inject metric_effects"
+    );
+}
+
+async fn bind_sample_worker(control: &TeamControl) -> crate::TeamView {
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    control
+        .bind_agent_before_start("agent-a", pending)
+        .await
+        .expect("bind");
+    control
+        .status(&started.team_session_id)
+        .await
+        .expect("status")
+}
+
+fn terminal_statuses(sink: &crate::RecordingSink) -> Vec<String> {
+    sink.envelopes()
+        .into_iter()
+        .filter(|envelope| {
+            envelope.kind == "agent_completed" || envelope.kind == "agent_interrupted"
+        })
+        .map(|envelope| {
+            envelope.payload["status"]
+                .as_str()
+                .expect("terminal status")
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn record_agent_terminal_is_idempotent_against_active_agent_state() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = bind_sample_worker(&control).await;
+    assert_eq!(started.agents.len(), 1);
+
+    control
+        .record_agent_terminal("agent-a", "errored")
+        .await
+        .expect("first terminal");
+    control
+        .record_agent_terminal("agent-a", "completed")
+        .await
+        .expect("duplicate completed");
+    control
+        .record_agent_terminal("agent-a", "interrupted")
+        .await
+        .expect("duplicate interrupted");
+
+    assert_eq!(terminal_statuses(&sink), vec!["errored".to_string()]);
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status after terminal");
+    assert!(status.agents.is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_record_agent_terminal_appends_at_most_one_event() {
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_memory_store(TeamGraphCatalog::new([sample_graph()]), sink.clone());
+    let started = bind_sample_worker(&control).await;
+
+    let (first, second, third) = tokio::join!(
+        control.record_agent_terminal("agent-a", "completed"),
+        control.record_agent_terminal("agent-a", "errored"),
+        control.record_agent_terminal("agent-a", "interrupted"),
+    );
+    first.expect("first");
+    second.expect("second");
+    third.expect("third");
+
+    assert_eq!(terminal_statuses(&sink).len(), 1);
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status after concurrent terminal");
+    assert!(status.agents.is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_reopen_restores_authority_before_recording_first_terminal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("terminal.sqlite");
+    let store = crate::SqliteTeamStore::open(&path).await.expect("open");
+    let control = TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        store,
+        crate::RecordingSink::default(),
+    );
+    let started = bind_sample_worker(&control).await;
+    drop(control);
+
+    let terminal_store = crate::SqliteTeamStore::open(&path).await.expect("reopen");
+    let terminal_control = TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        terminal_store,
+        crate::RecordingSink::default(),
+    );
+    terminal_control
+        .record_agent_terminal("agent-a", "interrupted")
+        .await
+        .expect("first operation records terminal");
+    drop(terminal_control);
+
+    let restored_store = crate::SqliteTeamStore::open(&path).await.expect("reopen");
+    let restored = TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        restored_store,
+        crate::RecordingSink::default(),
+    );
+    restored.restore().await.expect("restore");
+    let status = restored
+        .status(&started.team_session_id)
+        .await
+        .expect("restored status");
+    assert!(status.agents.is_empty());
+    let events = crate::TeamStore::load_events(
+        &crate::SqliteTeamStore::open(&path)
+            .await
+            .expect("events store"),
+        &started.team_session_id,
+    )
+    .await
+    .expect("load events");
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.payload, crate::TeamEventPayload::AgentTerminal { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1);
+}
+
+struct PersistGateStore {
+    inner: crate::MemoryTeamStore,
+    fail_events: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PersistGateStore {
+    fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let fail_events = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self {
+                inner: crate::MemoryTeamStore::default(),
+                fail_events: std::sync::Arc::clone(&fail_events),
+            },
+            fail_events,
+        )
+    }
+}
+
+impl crate::TeamStore for PersistGateStore {
+    async fn persist_event(
+        &self,
+        state: &crate::TeamSessionState,
+        event: &crate::TeamEvent,
+    ) -> crate::TeamRuntimeResult<()> {
+        if self.fail_events.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(TeamRuntimeError::Store(
+                "forced attach persist failure".to_string(),
+            ));
+        }
+        crate::TeamStore::persist_event(&self.inner, state, event).await
+    }
+
+    async fn load_teams(&self) -> crate::TeamRuntimeResult<Vec<crate::TeamSessionState>> {
+        crate::TeamStore::load_teams(&self.inner).await
+    }
+
+    async fn load_events(
+        &self,
+        team_session_id: &TeamSessionId,
+    ) -> crate::TeamRuntimeResult<Vec<crate::TeamEvent>> {
+        crate::TeamStore::load_events(&self.inner, team_session_id).await
+    }
+
+    async fn pending_outbox(&self) -> crate::TeamRuntimeResult<Vec<crate::TeamEvent>> {
+        crate::TeamStore::pending_outbox(&self.inner).await
+    }
+
+    async fn mark_outbox_sent(
+        &self,
+        event_ids: &[crate::ids::EventId],
+    ) -> crate::TeamRuntimeResult<()> {
+        crate::TeamStore::mark_outbox_sent(&self.inner, event_ids).await
+    }
+
+    async fn persist_binding(
+        &self,
+        binding: &crate::TeamAgentBinding,
+    ) -> crate::TeamRuntimeResult<()> {
+        crate::TeamStore::persist_binding(&self.inner, binding).await
+    }
+
+    async fn load_bindings(&self) -> crate::TeamRuntimeResult<Vec<crate::TeamAgentBinding>> {
+        crate::TeamStore::load_bindings(&self.inner).await
+    }
+}
+
+#[tokio::test]
+async fn bind_invokes_persist_callback_before_outbox_publish() {
+    let control = std::sync::Arc::new(TeamControl::with_memory_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        crate::RecordingSink::default(),
+    ));
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+
+    let sink = crate::HoldNextPublishSink::default();
+    let (release, entered) = sink.hold_next();
+    control.replace_event_sink(sink);
+    let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bind_control = std::sync::Arc::clone(&control);
+    let persisted_flag = std::sync::Arc::clone(&persisted);
+    let task = tokio::spawn(async move {
+        bind_control
+            .bind_agent_before_start_on_persist("agent-a", pending, |_| {
+                persisted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .expect("publish should wait after persist")
+        .expect("hold entered");
+    assert!(
+        persisted.load(std::sync::atomic::Ordering::SeqCst),
+        "owner arm must observe persist success before outbox publish"
+    );
+    drop(release);
+    task.await
+        .expect("bind task")
+        .expect("bind should complete after publish");
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status after bind");
+    assert_eq!(status.agents.len(), 1);
+}
+
+#[tokio::test]
+async fn attach_persist_failure_does_not_record_terminal_or_invoke_callback() {
+    let (store, fail_events) = PersistGateStore::new();
+    let sink = crate::RecordingSink::default();
+    let control =
+        TeamControl::with_store(TeamGraphCatalog::new([sample_graph()]), store, sink.clone());
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+
+    fail_events.store(true, std::sync::atomic::Ordering::SeqCst);
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let called_flag = std::sync::Arc::clone(&called);
+    let error = control
+        .bind_agent_before_start_on_persist("unpersisted-agent", pending, |_| {
+            called_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .expect_err("attach persist failure");
+    assert!(matches!(error, TeamRuntimeError::Store(_)));
+    assert!(
+        !called.load(std::sync::atomic::Ordering::SeqCst),
+        "persist failure must not arm terminal ownership"
+    );
+    control
+        .record_agent_terminal("unpersisted-agent", "interrupted")
+        .await
+        .expect("terminal without attach is ignored");
+    assert!(
+        sink.envelopes()
+            .into_iter()
+            .all(|event| event.kind != "agent_attached"
+                && event.kind != "agent_completed"
+                && event.kind != "agent_interrupted")
+    );
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status");
+    assert!(status.agents.is_empty());
+}
+
+async fn start_bound_sample(control: &TeamControl) -> (crate::TeamView, crate::PendingTeamBinding) {
+    let started = control
+        .start_team(StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: None,
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start");
+    control
+        .start_node(StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("node");
+    let pending = control
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    (started, pending)
+}
+
+#[tokio::test]
+async fn bind_drop_before_attach_commit_does_not_create_active_agent() {
+    let sink = crate::RecordingSink::default();
+    let control = std::sync::Arc::new(TeamControl::with_memory_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        sink.clone(),
+    ));
+    let (started, pending) = start_bound_sample(&control).await;
+    let (hold, entered) = control.hold_next_bind_before_attach_commit();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let handle = std::sync::Arc::clone(&control).spawn_bind_attempt(
+        "unpersisted-agent",
+        pending,
+        |_| {},
+        cancel_rx,
+    );
+    let task = tokio::spawn(handle.wait());
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .expect("bind should wait before attach commit")
+        .expect("hold entered");
+    task.abort();
+    let join = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("cancelled bind should not wait indefinitely");
+    assert!(join.is_err(), "bind future must keep the cancel outcome");
+    let _ = cancel_tx.send(());
+    drop(hold);
+    tokio::task::yield_now().await;
+
+    control
+        .record_agent_terminal("unpersisted-agent", "interrupted")
+        .await
+        .expect("terminal without attach is ignored");
+    assert!(
+        sink.envelopes()
+            .into_iter()
+            .all(|event| event.kind != "agent_attached"
+                && event.kind != "agent_completed"
+                && event.kind != "agent_interrupted")
+    );
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status");
+    assert!(status.agents.is_empty());
+}
+
+#[tokio::test]
+async fn bind_drop_after_durable_commit_settles_without_snapshot_inject() {
+    let sink = crate::RecordingSink::default();
+    let control = std::sync::Arc::new(TeamControl::with_memory_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        sink.clone(),
+    ));
+    let (started, pending) = start_bound_sample(&control).await;
+    let (hold, entered) = control.hold_next_bind_after_durable_commit();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let persisted_flag = std::sync::Arc::clone(&persisted);
+    let handle = std::sync::Arc::clone(&control).spawn_bind_attempt(
+        "agent-a",
+        pending,
+        move |_| {
+            persisted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+        cancel_rx,
+    );
+    let task = tokio::spawn(handle.wait());
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .expect("bind should wait after durable commit")
+        .expect("hold entered");
+    task.abort();
+    let join = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("cancelled bind should not wait indefinitely");
+    assert!(join.is_err(), "bind future must keep the cancel outcome");
+    let _ = cancel_tx.send(());
+    drop(hold);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if persisted.load(std::sync::atomic::Ordering::SeqCst)
+                && control
+                    .status(&started.team_session_id)
+                    .await
+                    .expect("status")
+                    .agents
+                    .len()
+                    == 1
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned bind must apply the committed attach without snapshot inject");
+
+    control
+        .record_agent_terminal("agent-a", "interrupted")
+        .await
+        .expect("terminal after owned settle");
+    control
+        .record_agent_terminal("agent-a", "errored")
+        .await
+        .expect("duplicate terminal is ignored");
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status");
+    assert!(status.agents.is_empty());
+    let kinds: Vec<_> = sink
+        .envelopes()
+        .into_iter()
+        .map(|event| event.kind)
+        .collect();
+    assert!(
+        kinds
+            .iter()
+            .filter(|kind| *kind == "agent_interrupted")
+            .count()
+            == 1,
+        "exactly one interrupted terminal, got {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|kind| kind == "agent_completed"),
+        "errored duplicate must not append another terminal, got {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn bind_task_loss_after_commit_preserves_truth_and_reopens_terminal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("task-loss.sqlite");
+    let store = crate::SqliteTeamStore::open(&path).await.expect("store");
+    let sink = crate::RecordingSink::default();
+    let control = std::sync::Arc::new(TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        store,
+        sink.clone(),
+    ));
+    let (started, pending) = start_bound_sample(&control).await;
+    let (hold, entered) = control.hold_next_bind_after_durable_commit();
+    let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let handle =
+        std::sync::Arc::clone(&control).spawn_bind_attempt("agent-a", pending, |_| {}, cancel_rx);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .expect("bind should reach committed result seam")
+        .expect("committed seam entered");
+    handle.abort_task_for_test();
+    drop(hold);
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
+        .await
+        .expect("closed result channel must settle");
+    assert!(
+        matches!(
+            outcome,
+            crate::BindAttemptOutcome::Failed {
+                committed: true,
+                ..
+            }
+        ),
+        "task loss after commit must preserve durable truth: {outcome:?}"
+    );
+    control
+        .record_agent_terminal("agent-a", "interrupted")
+        .await
+        .expect("terminalize committed attach");
+    control
+        .record_agent_terminal("agent-a", "errored")
+        .await
+        .expect("duplicate terminal is ignored");
+
+    drop(control);
+    let reopened = TeamControl::with_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        crate::SqliteTeamStore::open(&path)
+            .await
+            .expect("reopen store"),
+        crate::RecordingSink::default(),
+    );
+    reopened.restore().await.expect("restore");
+    assert!(
+        reopened
+            .status(&started.team_session_id)
+            .await
+            .expect("reopened status")
+            .agents
+            .is_empty(),
+        "reopened durable snapshot must contain no active agent"
+    );
+    let terminal_count = sink
+        .envelopes()
+        .into_iter()
+        .filter(|event| event.kind == "agent_interrupted")
+        .count();
+    assert_eq!(terminal_count, 1, "terminal must be exactly once");
+}
+
+#[tokio::test]
+async fn bind_unobserved_commit_serializes_concurrent_team_mutation() {
+    let sink = crate::RecordingSink::default();
+    let control = std::sync::Arc::new(TeamControl::with_memory_store(
+        TeamGraphCatalog::new([sample_graph()]),
+        sink.clone(),
+    ));
+    let (started, pending) = start_bound_sample(&control).await;
+    let (hold, entered) = control.hold_next_bind_after_durable_commit();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let handle =
+        std::sync::Arc::clone(&control).spawn_bind_attempt("agent-a", pending, |_| {}, cancel_rx);
+    let wait_task = tokio::spawn(handle.wait());
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .expect("bind should wait after durable commit")
+        .expect("hold entered");
+    wait_task.abort();
+    let _ = cancel_tx.send(());
+    let mutate_control = std::sync::Arc::clone(&control);
+    let team_session_id = started.team_session_id.clone();
+    let mutate = tokio::spawn(async move {
+        mutate_control
+            .record_deviation(&team_session_id, "concurrent-after-unobserved-commit")
+            .await
+    });
+    drop(hold);
+    mutate.await.expect("mutate task").expect("deviation");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if control
+                .status(&started.team_session_id)
+                .await
+                .expect("status")
+                .agents
+                .len()
+                == 1
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("committed attach must be visible to the same lock");
+    control
+        .record_agent_terminal("agent-a", "interrupted")
+        .await
+        .expect("terminal");
+
+    let events: Vec<_> = sink
+        .envelopes()
+        .into_iter()
+        .filter(|event| event.team_session_id == started.team_session_id)
+        .collect();
+    let sequences: Vec<_> = events.iter().map(|event| event.sequence).collect();
+    let mut ordered = sequences.clone();
+    ordered.sort_unstable();
+    ordered.dedup();
+    assert_eq!(
+        sequences, ordered,
+        "concurrent mutation must not rewind or duplicate sequences: {sequences:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "agent_interrupted")
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "deviation_recorded")
+    );
+    let status = control
+        .status(&started.team_session_id)
+        .await
+        .expect("status");
+    assert!(status.agents.is_empty());
+}

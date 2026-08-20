@@ -2513,6 +2513,10 @@ impl App {
                     Ok(()) => {
                         self.config.tui_status_line = Some(ids.clone());
                         self.config.tui_status_line_use_colors = use_theme_colors;
+                        self.chat_widget.set_status_line_subagent_count(
+                            self.agent_navigation
+                                .running_subagent_count(self.primary_thread_id),
+                        );
                         self.chat_widget.setup_status_line(items, use_theme_colors);
                     }
                     Err(err) => {

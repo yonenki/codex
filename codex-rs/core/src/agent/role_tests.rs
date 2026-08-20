@@ -2,6 +2,8 @@ use super::*;
 use crate::config::ConfigBuilder;
 use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;
+use codex_config::config_toml::AcpBackendCandidateToml;
+use codex_config::config_toml::AcpBackendPoolToml;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -324,11 +326,67 @@ model_reasoning_effort = "high"
         settings,
         AcpRoleSettings {
             developer_instructions: Some("Implement the approved plan".to_string()),
-            backend: Some(acp_backend(
+            backends: vec![acp_backend(
                 "grok-build".to_string(),
                 Some("grok-4.6".to_string()),
                 Some("high".to_string()),
-            )),
+            )],
+        }
+    );
+}
+
+#[tokio::test]
+async fn acp_role_settings_resolve_shared_backend_pool() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path = write_role_config(
+        &home,
+        "pooled-worker.toml",
+        r#"developer_instructions = "Implement the approved plan"
+acp_backend_pool = "worker_default"
+"#,
+    )
+    .await;
+    config.agent_roles.insert(
+        "pooled-worker".to_string(),
+        AgentRoleConfig {
+            description: Some("Pooled ACP worker".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    let candidates = vec![
+        AcpBackendCandidateToml {
+            harness: "grok-build".to_string(),
+            model: None,
+            effort: None,
+        },
+        AcpBackendCandidateToml {
+            harness: "antigravity".to_string(),
+            model: Some("gemini-3.7-flash".to_string()),
+            effort: Some("high".to_string()),
+        },
+    ];
+    config.acp_backend_pools.insert(
+        "worker_default".to_string(),
+        AcpBackendPoolToml {
+            candidates: candidates.clone(),
+        },
+    );
+
+    let settings = acp_role_settings(&config, "pooled-worker")
+        .await
+        .expect("load pooled ACP role");
+
+    assert_eq!(
+        settings,
+        AcpRoleSettings {
+            developer_instructions: Some("Implement the approved plan".to_string()),
+            backends: candidates
+                .into_iter()
+                .map(|candidate| {
+                    acp_backend(candidate.harness, candidate.model, candidate.effort)
+                })
+                .collect(),
         }
     );
 }
@@ -541,7 +599,7 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
         ("researcher".to_string(), AgentRoleConfig::default()),
     ]);
 
-    let spec = spawn_tool_spec::build(&user_defined_roles);
+    let spec = spawn_tool_spec::build(&user_defined_roles, &BTreeMap::new());
 
     assert!(spec.contains("researcher: no description"));
     assert!(spec.contains("explorer: {\nuser override\n}"));
@@ -560,7 +618,7 @@ fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
         },
     )]);
 
-    let spec = spawn_tool_spec::build(&user_defined_roles);
+    let spec = spawn_tool_spec::build(&user_defined_roles, &BTreeMap::new());
     let user_index = spec.find("aaa: {\nfirst\n}").expect("find user role");
     let built_in_index = spec
         .find("default: {\nDefault agent.\n}")
@@ -587,7 +645,7 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
         },
     )]);
 
-    let spec = spawn_tool_spec::build(&user_defined_roles);
+    let spec = spawn_tool_spec::build(&user_defined_roles, &BTreeMap::new());
 
     assert!(spec.contains(
             "Research carefully.\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."
@@ -612,9 +670,54 @@ fn spawn_tool_spec_marks_acp_role_backend_default() {
         },
     )]);
 
-    let spec = spawn_tool_spec::build(&roles);
+    let spec = spawn_tool_spec::build(&roles, &BTreeMap::new());
 
     assert!(spec.contains("uses the `grok-build` ACP harness by default"));
+}
+
+#[test]
+fn spawn_tool_spec_hides_acp_backend_pool_provider_details() {
+    let tempdir = TempDir::new().expect("create temp dir");
+    let role_path = tempdir.path().join("worker.toml");
+    fs::write(
+        &role_path,
+        "developer_instructions = \"Implement\"\nacp_backend_pool = \"worker_default\"\nmodel = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"high\"\n",
+    )
+    .expect("write role config");
+    let roles = BTreeMap::from([(
+        "worker".to_string(),
+        AgentRoleConfig {
+            description: Some("Default worker.".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    )]);
+    let pools = BTreeMap::from([(
+        "worker_default".to_string(),
+        AcpBackendPoolToml {
+            candidates: vec![
+                AcpBackendCandidateToml {
+                    harness: "grok-build".to_string(),
+                    model: None,
+                    effort: None,
+                },
+                AcpBackendCandidateToml {
+                    harness: "cursor".to_string(),
+                    model: Some("cursor-grok-4.6-high".to_string()),
+                    effort: None,
+                },
+            ],
+        },
+    )]);
+
+    let spec = spawn_tool_spec::build(&roles, &pools);
+
+    assert!(spec.contains("2 ordered ACP backend candidate(s), selected internally"));
+    assert!(spec.contains("pass its task name as `fallback_from`"));
+    assert!(!spec.contains("grok-build"));
+    assert!(!spec.contains("cursor-grok-4.6-high"));
+    assert!(!spec.contains("gpt-5.6-luna"));
+    assert!(!spec.contains("ACP reasoning effort"));
 }
 
 #[test]
@@ -635,7 +738,7 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
         },
     )]);
 
-    let spec = spawn_tool_spec::build(&user_defined_roles);
+    let spec = spawn_tool_spec::build(&user_defined_roles, &BTreeMap::new());
 
     assert!(spec.contains(
             "Review carefully.\n- This role's reasoning effort is set to `medium` and cannot be changed."
@@ -660,7 +763,7 @@ fn spawn_tool_spec_marks_role_locked_service_tier() {
         },
     )]);
 
-    let spec = spawn_tool_spec::build(&user_defined_roles);
+    let spec = spawn_tool_spec::build(&user_defined_roles, &BTreeMap::new());
 
     assert!(spec.contains(
         "Stay fast.\n- This role's service tier is set to `priority`. If it is supported by the resolved model, it takes precedence over a valid spawn request service tier."

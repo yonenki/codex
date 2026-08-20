@@ -26,6 +26,7 @@ pub(crate) mod request_user_input_spec;
 mod shell;
 pub(crate) mod shell_spec;
 mod sleep;
+pub(crate) mod team;
 mod test_sync;
 pub(crate) mod test_sync_spec;
 mod tool_search;

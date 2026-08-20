@@ -126,6 +126,8 @@ members = [
     "codex-client",
     "codex-api",
     "state",
+    "team-graph",
+    "team-runtime",
     "terminal-detection",
     "test-binary-support",
     "thread-manager-sample",
@@ -245,6 +247,8 @@ codex-shell-escalation = { path = "shell-escalation" }
 codex-skills-extension = { path = "ext/skills" }
 codex-skills = { path = "skills" }
 codex-state = { path = "state" }
+codex-team-graph = { path = "team-graph" }
+codex-team-runtime = { path = "team-runtime" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 codex-terminal-detection = { path = "terminal-detection" }
 codex-test-binary-support = { path = "test-binary-support" }

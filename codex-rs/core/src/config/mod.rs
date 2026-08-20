@@ -837,6 +837,9 @@ pub struct Config {
     /// User-defined role declarations keyed by role name.
     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
 
+    /// Ordered ACP backend pools referenced by agent roles.
+    pub acp_backend_pools: BTreeMap<String, codex_config::config_toml::AcpBackendPoolToml>,
+
     /// Maximum token budget allowed for a goal and default budget for new goals.
     pub max_goal_token_budget: Option<i64>,
 
@@ -3602,6 +3605,7 @@ impl Config {
         let agent_roles =
             agent_roles::load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings)
                 .await?;
+        let acp_backend_pools = cfg.acp_backend_pools.clone();
 
         let openai_base_url = cfg
             .openai_base_url
@@ -4051,6 +4055,7 @@ impl Config {
             agent_default_subagent_reasoning_effort,
             agent_max_depth,
             agent_roles,
+            acp_backend_pools,
             max_goal_token_budget: cfg
                 .goals
                 .as_ref()

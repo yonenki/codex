@@ -63,6 +63,33 @@ impl Handler {
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
         let receiver_thread_ids = parse_agent_id_targets(args.targets)?;
+        let caller_thread_id = session.thread_id.to_string();
+        let target_ids: Vec<String> = receiver_thread_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let target_refs: Vec<&str> = target_ids.iter().map(String::as_str).collect();
+        let mut all_targets_known = true;
+        for id in &receiver_thread_ids {
+            if !session
+                .services
+                .agent_control
+                .is_agent_known(*id)
+                .await
+                .map_err(|err| collab_agent_error(*id, err))?
+            {
+                all_targets_known = false;
+            }
+        }
+        if all_targets_known {
+            reject_team_bound_raw_collaboration_v1(
+                &session,
+                &caller_thread_id,
+                &target_refs,
+                V1RawOp::Wait,
+            )
+            .await?;
+        }
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {
@@ -265,6 +292,10 @@ fn wait_receiver_agents(
 }
 
 impl CoreToolRuntime for Handler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

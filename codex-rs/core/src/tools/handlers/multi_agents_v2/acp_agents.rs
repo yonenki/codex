@@ -6,13 +6,17 @@ use crate::agent::role::acp_backend;
 use crate::agent::role::acp_role_settings;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
+use crate::external_subagent_hooks::ExternalSubagentHookIdentity;
+use crate::external_subagent_hooks::run_external_subagent_start_hook;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::handlers::multi_agents_common::parse_spawn_observer_metadata;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub(crate) struct SpawnHandler;
 pub(crate) struct MessageHandler;
@@ -23,10 +27,12 @@ pub(crate) struct FollowupHandler;
 struct SpawnArgs {
     task_name: String,
     message: String,
+    fallback_from: Option<String>,
     harness: Option<String>,
     model: Option<String>,
     effort: Option<String>,
     agent_type: Option<String>,
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -34,6 +40,44 @@ struct AcpBackendOverrides {
     harness: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AcpBackendSelection {
+    backend: crate::agent::role::ExternalAgentBackend,
+    candidate_index: Option<usize>,
+}
+
+struct ExternalBackendFallbackClaim {
+    agent_control: crate::agent::control::AgentControl,
+    source_agent_id: codex_protocol::ThreadId,
+    committed: bool,
+}
+
+impl ExternalBackendFallbackClaim {
+    fn new(
+        agent_control: crate::agent::control::AgentControl,
+        source_agent_id: codex_protocol::ThreadId,
+    ) -> Self {
+        Self {
+            agent_control,
+            source_agent_id,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ExternalBackendFallbackClaim {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.agent_control
+                .release_external_backend_fallback(self.source_agent_id);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +104,76 @@ impl DeliveryMode {
             Self::TriggerTurn => AgentCommunicationKind::Followup,
         }
     }
+
+    fn team_tool(self) -> &'static str {
+        match self {
+            Self::QueueOnly => "team.send_message",
+            Self::TriggerTurn => "team.followup_agent",
+        }
+    }
+
+    fn raw_tool(self) -> &'static str {
+        match self {
+            Self::QueueOnly => "acp.send_message",
+            Self::TriggerTurn => "acp.followup_task",
+        }
+    }
+}
+
+async fn reject_team_bound_external_delivery(
+    session: &crate::session::session::Session,
+    caller_thread_id: &str,
+    target_thread_id: &str,
+    mode: DeliveryMode,
+) -> Result<(), FunctionCallError> {
+    let team = session.services.agent_control.team();
+    let bindings = team
+        .bindings_for_checked(&[caller_thread_id, target_thread_id])
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let caller_binding = bindings[0].as_ref();
+    let target_binding = bindings[1].as_ref();
+    if let Some(message) = team_bound_external_delivery_guidance(
+        caller_binding.map(|binding| &binding.team_session_id),
+        target_binding.map(|binding| &binding.team_session_id),
+        mode,
+    ) {
+        return Err(FunctionCallError::RespondToModel(message));
+    }
+    Ok(())
+}
+
+fn team_bound_external_delivery_guidance(
+    caller_team: Option<&codex_team_runtime::TeamSessionId>,
+    target_team: Option<&codex_team_runtime::TeamSessionId>,
+    mode: DeliveryMode,
+) -> Option<String> {
+    match (caller_team, target_team) {
+        (Some(caller), Some(target)) if caller == target => Some(format!(
+            "Same-Team ACP delivery must use {}(team_session_id={}, ...). {} cannot be used when the caller or target is bound to a Team.",
+            mode.team_tool(),
+            target,
+            mode.raw_tool(),
+        )),
+        (Some(_), Some(target)) => Some(format!(
+            "The target is governed by team_session_id={target}. Delegate this cross-Team delivery to an unbound root coordinator using {}(team_session_id={target}, ...). {} cannot be used when the caller or target is bound to a Team.",
+            mode.team_tool(),
+            mode.raw_tool(),
+        )),
+        (None, Some(target)) => Some(format!(
+            "Team-bound ACP delivery must use {}(team_session_id={}, ...). {} cannot be used when the target is bound to a Team.",
+            mode.team_tool(),
+            target,
+            mode.raw_tool(),
+        )),
+        (Some(_), None) => Some(format!(
+            "Team-bound {} is unsupported for an unbound target. Delegate the non-Team raw operation to an unbound root coordinator using {}. {} cannot be used when the caller or target is bound to a Team.",
+            mode.raw_tool(),
+            mode.raw_tool(),
+            mode.raw_tool(),
+        )),
+        (None, None) => None,
+    }
 }
 
 fn spawn_spec() -> ToolSpec {
@@ -76,6 +190,13 @@ fn spawn_spec() -> ToolSpec {
             harness_schema(),
         ),
         (
+            "fallback_from".to_string(),
+            JsonSchema::string(Some(
+                "Optional prior ACP task name whose terminal result should be retried with the next backend candidate from the same agent role. Do not combine with harness, model, or effort overrides."
+                    .to_string(),
+            )),
+        ),
+        (
             "effort".to_string(),
             JsonSchema::string(Some(
                 "Optional reasoning effort selected through the harness ACP thought-level configuration. The harness default is used when omitted."
@@ -85,7 +206,7 @@ fn spawn_spec() -> ToolSpec {
         (
             "agent_type".to_string(),
             JsonSchema::string(Some(
-                "Optional Codex agent role from the active .codex/agents definitions. A role may provide default ACP harness, model, and reasoning effort values; explicit spawn arguments override those defaults."
+                "Optional Codex agent role from the active .codex/agents definitions. A role may select an ACP backend pool internally; normally omit harness, model, and effort when using a role."
                     .to_string(),
             )),
         ),
@@ -102,6 +223,10 @@ fn spawn_spec() -> ToolSpec {
                 "Complete plain-text task for the ACP agent. No parent conversation history is inherited."
                     .to_string(),
             )),
+        ),
+        (
+            "metadata".to_string(),
+            crate::tools::handlers::multi_agents_spec::spawn_observer_metadata_schema(),
         ),
     ]);
     ToolSpec::Function(ResponsesApiTool {
@@ -188,6 +313,10 @@ impl ToolExecutor<ToolInvocation> for SpawnHandler {
 }
 
 impl CoreToolRuntime for SpawnHandler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -215,6 +344,10 @@ impl ToolExecutor<ToolInvocation> for MessageHandler {
 }
 
 impl CoreToolRuntime for MessageHandler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -242,6 +375,10 @@ impl ToolExecutor<ToolInvocation> for FollowupHandler {
 }
 
 impl CoreToolRuntime for FollowupHandler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -257,6 +394,16 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
     } = invocation;
     let turn = &step_context.turn;
     let args: SpawnArgs = parse_arguments(&function_arguments(payload)?)?;
+    let observer_metadata = parse_spawn_observer_metadata(args.metadata)?;
+    let caller_thread_id = session.thread_id.to_string();
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller_thread_id,
+        &[],
+        RawCollaborationOp::Spawn,
+    )
+    .await?;
+    reject_unbound_raw_spawn_when_teams_open(&session, &caller_thread_id, "acp.spawn").await?;
     let message = message_content(args.message)?;
     let explicit_backend = explicit_backend(args.harness, args.model, args.effort)?;
     let mut config = build_agent_spawn_config(
@@ -280,11 +427,23 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
             .map_err(FunctionCallError::RespondToModel)?,
         None => AcpRoleSettings {
             developer_instructions: None,
-            backend: None,
+            backends: Vec::new(),
         },
     };
-    let backend = resolve_backend(explicit_backend, role_settings.backend)?;
-    let harness = backend.harness.trim().to_string();
+    let (fallback_candidate_index, fallback_claim) = fallback_candidate_index(
+        &session,
+        turn,
+        args.fallback_from.as_deref(),
+        role_name,
+        &explicit_backend,
+    )
+    .await?;
+    let selection = resolve_backend_candidate(
+        explicit_backend,
+        &role_settings.backends,
+        fallback_candidate_index,
+    )?;
+    let harness = selection.backend.harness.trim().to_string();
     if !is_valid_harness_id(&harness) {
         return Err(FunctionCallError::RespondToModel(
             "harness must contain 1-64 lowercase ASCII letters, digits, or hyphens".to_string(),
@@ -313,7 +472,15 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         message,
         /*trigger_turn*/ true,
     );
-    let backend = acp_backend(harness, backend.model, backend.effort);
+    let model = selection.backend.model;
+    let backend = acp_backend(harness.clone(), model.clone(), selection.backend.effort);
+    let agent_type = role_name.unwrap_or(ACP_ROLE_NAME).to_string();
+    let start_session = Arc::clone(&session);
+    let start_turn = Arc::clone(turn);
+    let start_agent_path = agent_path.clone();
+    let start_harness = harness.clone();
+    let start_model = model.clone();
+    let start_metadata = observer_metadata.clone();
     let spawned = session
         .services
         .agent_control
@@ -323,24 +490,64 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
             communication,
             AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id),
             spawn_source,
+            observer_metadata,
+            None,
+            move |agent_id| async move {
+                run_external_subagent_start_hook(
+                    &start_session,
+                    &start_turn,
+                    ExternalSubagentHookIdentity {
+                        agent_id,
+                        agent_type,
+                        harness: start_harness.clone(),
+                        model: start_model.clone(),
+                        metadata: start_metadata,
+                    },
+                )
+                .await;
+                emit_sub_agent_activity(
+                    &start_session,
+                    &start_turn,
+                    SubAgentActivityItem {
+                        id: call_id,
+                        agent_thread_id: agent_id,
+                        agent_path: start_agent_path,
+                        kind: SubAgentActivityKind::Started,
+                        harness: Some(start_harness),
+                        model: start_model,
+                    },
+                )
+                .await;
+            },
         )
         .await
         .map_err(collab_spawn_error)?;
-    emit_sub_agent_activity(
-        &session,
-        turn,
-        SubAgentActivityItem {
-            id: call_id,
-            agent_thread_id: spawned.thread_id,
-            agent_path: agent_path.clone(),
-            kind: SubAgentActivityKind::Started,
-        },
-    )
-    .await;
+    if let Some(fallback_claim) = fallback_claim {
+        fallback_claim.commit();
+    }
+    if let (Some(role_name), Some(candidate_index)) = (role_name, selection.candidate_index) {
+        session
+            .services
+            .agent_control
+            .record_external_backend_route(
+                spawned.thread_id,
+                role_name.to_string(),
+                candidate_index,
+            );
+    }
     Ok(FunctionToolOutput::from_text(
-        serde_json::json!({"task_name": agent_path}).to_string(),
+        acp_spawn_output(&agent_path, &harness, model.as_deref()),
         Some(true),
     ))
+}
+
+fn acp_spawn_output(agent_path: &AgentPath, harness: &str, model: Option<&str>) -> String {
+    serde_json::json!({
+        "task_name": agent_path,
+        "harness": harness,
+        "model": model,
+    })
+    .to_string()
 }
 
 fn explicit_backend(
@@ -373,22 +580,104 @@ fn explicit_backend(
     })
 }
 
-fn resolve_backend(
+fn resolve_backend_candidate(
     explicit: AcpBackendOverrides,
-    role: Option<crate::agent::role::ExternalAgentBackend>,
-) -> Result<crate::agent::role::ExternalAgentBackend, FunctionCallError> {
-    let role = role.unwrap_or_else(|| acp_backend(String::new(), None, None));
-    let harness = explicit.harness.unwrap_or(role.harness);
+    role_backends: &[crate::agent::role::ExternalAgentBackend],
+    fallback_candidate_index: Option<usize>,
+) -> Result<AcpBackendSelection, FunctionCallError> {
+    if let Some(candidate_index) = fallback_candidate_index {
+        let backend = role_backends.get(candidate_index).cloned().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "agent_type has no remaining ACP backend candidate".to_string(),
+            )
+        })?;
+        return Ok(AcpBackendSelection {
+            backend,
+            candidate_index: Some(candidate_index),
+        });
+    }
+    let (selected, candidate_index) = match explicit.harness.as_deref() {
+        Some(harness) => role_backends
+            .iter()
+            .enumerate()
+            .find(|candidate| {
+                candidate.1.harness == harness
+                    && explicit
+                        .model
+                        .as_ref()
+                        .is_none_or(|model| candidate.1.model.as_ref() == Some(model))
+            })
+            .map(|(index, candidate)| (candidate.clone(), Some(index)))
+            .unwrap_or_else(|| (acp_backend(harness.to_string(), None, None), None)),
+        None => (
+            role_backends
+                .first()
+                .cloned()
+                .unwrap_or_else(|| acp_backend(String::new(), None, None)),
+            (!role_backends.is_empty()).then_some(0),
+        ),
+    };
+    let harness = explicit.harness.unwrap_or(selected.harness);
     if harness.is_empty() {
         return Err(FunctionCallError::RespondToModel(
-            "harness is required unless agent_type declares acp_harness".to_string(),
+            "harness is required unless agent_type declares an ACP backend".to_string(),
         ));
     }
-    Ok(acp_backend(
-        harness,
-        explicit.model.or(role.model),
-        explicit.effort.or(role.effort),
+    Ok(AcpBackendSelection {
+        backend: acp_backend(
+            harness,
+            explicit.model.or(selected.model),
+            explicit.effort.or(selected.effort),
+        ),
+        candidate_index,
+    })
+}
+
+async fn fallback_candidate_index(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<crate::session::turn_context::TurnContext>,
+    fallback_from: Option<&str>,
+    role_name: Option<&str>,
+    explicit_backend: &AcpBackendOverrides,
+) -> Result<(Option<usize>, Option<ExternalBackendFallbackClaim>), FunctionCallError> {
+    let Some(fallback_from) = fallback_from else {
+        return Ok((None, None));
+    };
+    if explicit_backend != &AcpBackendOverrides::default() {
+        return Err(FunctionCallError::RespondToModel(
+            "fallback_from cannot be combined with harness, model, or effort".to_string(),
+        ));
+    }
+    let role_name = role_name.ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "fallback_from requires the same agent_type as the prior ACP task".to_string(),
+        )
+    })?;
+    let agent_id = resolve_agent_target(session, turn, fallback_from).await?;
+    ensure_fallback_source_terminal(session.services.agent_control.get_status(agent_id).await)?;
+    let candidate_index = session
+        .services
+        .agent_control
+        .claim_next_external_backend_candidate(agent_id, role_name)
+        .map_err(collab_spawn_error)?;
+    Ok((
+        Some(candidate_index),
+        Some(ExternalBackendFallbackClaim::new(
+            session.services.agent_control.clone(),
+            agent_id,
+        )),
     ))
+}
+
+fn ensure_fallback_source_terminal(status: AgentStatus) -> Result<(), FunctionCallError> {
+    if crate::agent::status::is_final(&status) {
+        Ok(())
+    } else {
+        Err(FunctionCallError::RespondToModel(
+            "fallback source is still active; wait for a terminal result before retrying"
+                .to_string(),
+        ))
+    }
 }
 
 fn with_role_developer_instructions(
@@ -440,6 +729,10 @@ async fn deliver(
         .agent_control
         .ensure_agent_known(agent_id)
         .map_err(|error| collab_agent_error(agent_id, error))?;
+    let caller_thread_id = session.thread_id.to_string();
+    let target_thread_id = agent_id.to_string();
+    reject_team_bound_external_delivery(&session, &caller_thread_id, &target_thread_id, mode)
+        .await?;
     let agent_path = known.agent_path.ok_or_else(|| {
         FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
     })?;
@@ -452,28 +745,64 @@ async fn deliver(
         message,
         mode.trigger_turn(),
     );
-    session
+    let identity = session
         .services
         .agent_control
-        .send_inter_agent_communication(
+        .external_backend_identity(agent_id)
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "target ACP agent is missing its backend identity".to_string(),
+            )
+        })?;
+    let (harness, model) = identity;
+    let agent_type = known
+        .agent_role
+        .unwrap_or_else(|| ACP_ROLE_NAME.to_string());
+    let started_activity = SubAgentActivityItem {
+        id: call_id.clone(),
+        agent_thread_id: agent_id,
+        agent_path: agent_path.clone(),
+        kind: SubAgentActivityKind::Started,
+        harness: Some(harness.clone()),
+        model: model.clone(),
+    };
+    let start_identity = ExternalSubagentHookIdentity {
+        agent_id,
+        agent_type,
+        harness,
+        model,
+        metadata: known.metadata,
+    };
+    let start_session = Arc::clone(&session);
+    let start_turn = Arc::clone(turn);
+    let (_, requests_turn) = session
+        .services
+        .agent_control
+        .send_external_inter_agent_communication_with_start_hook(
             agent_id,
             communication,
             AgentCommunicationContext::new(mode.communication_kind(), session.thread_id),
-            mode.trigger_turn().then(|| turn.sub_id.clone()),
-            turn.turn_metadata_state.root_turn_id(),
+            move || async move {
+                run_external_subagent_start_hook(&start_session, &start_turn, start_identity).await;
+                emit_sub_agent_activity(&start_session, &start_turn, started_activity).await;
+            },
         )
         .await
         .map_err(|error| collab_agent_error(agent_id, error))?;
-    emit_sub_agent_activity(
-        &session,
-        turn,
-        SubAgentActivityItem {
-            id: call_id,
-            agent_thread_id: agent_id,
-            agent_path,
-            kind: SubAgentActivityKind::Interacted,
-        },
-    )
-    .await;
+    if !requests_turn {
+        emit_sub_agent_activity(
+            &session,
+            turn,
+            SubAgentActivityItem {
+                id: call_id,
+                agent_thread_id: agent_id,
+                agent_path,
+                kind: SubAgentActivityKind::Interacted,
+                harness: None,
+                model: None,
+            },
+        )
+        .await;
+    }
     Ok(FunctionToolOutput::from_text(String::new(), Some(true)))
 }

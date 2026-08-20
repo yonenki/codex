@@ -112,6 +112,10 @@ impl ToolCallRuntime {
         let router = &self.step_context.tool_router;
         let supports_parallel = router.tool_supports_parallel(&call);
         let tool_runtime = router.tool_runtime(&call);
+        let team_lifecycle_routing = tool_runtime
+            .as_ref()
+            .map(|runtime| runtime.team_lifecycle_routing())
+            .unwrap_or_default();
         let wait_for_runtime_cancellation = router.tool_waits_for_runtime_cancellation(&call);
         let router = Arc::clone(router);
         let session = Arc::clone(&self.session);
@@ -211,6 +215,7 @@ impl ToolCallRuntime {
                             call.call_id.as_str(),
                             &call.tool_name,
                             abort_source,
+                            team_lifecycle_routing,
                         )
                         .await;
                         Ok(response)

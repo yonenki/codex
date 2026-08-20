@@ -1,9 +1,9 @@
-use super::AcpBackendOverrides;
-use super::FunctionCallError;
-use super::explicit_backend;
-use super::resolve_backend;
-use super::with_role_developer_instructions;
+use super::*;
+use crate::agent::AgentStatus;
 use crate::agent::role::acp_backend;
+use codex_tools::ToolSpec;
+use pretty_assertions::assert_eq;
+use serde_json::json;
 
 #[test]
 fn role_instructions_are_prepended_without_changing_the_task() {
@@ -31,9 +31,14 @@ fn role_backend_is_used_without_explicit_spawn_backend() {
         Some("grok-4.6".to_string()),
         Some("high".to_string()),
     );
-
     assert_eq!(
-        resolve_backend(AcpBackendOverrides::default(), Some(role.clone())).expect("role backend"),
+        resolve_backend_candidate(
+            AcpBackendOverrides::default(),
+            std::slice::from_ref(&role),
+            None,
+        )
+        .expect("role backend")
+        .backend,
         role
     );
 }
@@ -51,9 +56,10 @@ fn explicit_backend_overrides_role_defaults() {
         Some("grok-4.6".to_string()),
         Some("high".to_string()),
     );
-
     assert_eq!(
-        resolve_backend(explicit, Some(role)).expect("explicit override"),
+        resolve_backend_candidate(explicit, &[role], None)
+            .expect("explicit override")
+            .backend,
         acp_backend(
             "antigravity".to_string(),
             Some("gemini-3.7-flash".to_string()),
@@ -63,10 +69,211 @@ fn explicit_backend_overrides_role_defaults() {
 }
 
 #[test]
+fn explicit_harness_selects_matching_pool_candidate_defaults() {
+    let pool = vec![
+        acp_backend("grok-build".to_string(), None, None),
+        acp_backend(
+            "antigravity".to_string(),
+            Some("gemini-3.7-flash".to_string()),
+            Some("high".to_string()),
+        ),
+    ];
+    let explicit = explicit_backend(Some("antigravity".to_string()), None, None)
+        .expect("valid explicit backend");
+    assert_eq!(
+        resolve_backend_candidate(explicit, &pool, None)
+            .expect("pool candidate")
+            .backend,
+        pool[1]
+    );
+}
+
+#[test]
+fn unrelated_explicit_harness_does_not_inherit_pool_model() {
+    let pool = vec![acp_backend(
+        "grok-build".to_string(),
+        Some("grok-4.6".to_string()),
+        Some("high".to_string()),
+    )];
+    let explicit =
+        explicit_backend(Some("kimi".to_string()), None, None).expect("valid explicit backend");
+    assert_eq!(
+        resolve_backend_candidate(explicit, &pool, None)
+            .expect("explicit backend")
+            .backend,
+        acp_backend("kimi".to_string(), None, None)
+    );
+}
+
+#[test]
 fn backend_is_required_without_an_acp_backed_role() {
-    let error = resolve_backend(AcpBackendOverrides::default(), None)
+    let error = resolve_backend_candidate(AcpBackendOverrides::default(), &[], None)
         .expect_err("missing backend must fail");
     assert!(
         matches!(error, FunctionCallError::RespondToModel(message) if message.contains("harness is required"))
+    );
+}
+
+#[test]
+fn fallback_selects_next_pool_candidate_without_backend_names() {
+    let pool = vec![
+        acp_backend(
+            "grok-build".to_string(),
+            Some("grok-4.6".to_string()),
+            Some("high".to_string()),
+        ),
+        acp_backend("kimi".to_string(), Some("kimi-code/k3".to_string()), None),
+    ];
+    let selection = resolve_backend_candidate(AcpBackendOverrides::default(), &pool, Some(1))
+        .expect("next pool candidate");
+    assert_eq!(selection.backend, pool[1]);
+    assert_eq!(selection.candidate_index, Some(1));
+}
+
+#[test]
+fn fallback_fails_after_last_pool_candidate() {
+    let pool = vec![acp_backend("grok-build".to_string(), None, None)];
+    let error = resolve_backend_candidate(AcpBackendOverrides::default(), &pool, Some(1))
+        .expect_err("exhausted pool must fail");
+    assert!(
+        matches!(error, FunctionCallError::RespondToModel(message) if message.contains("no remaining ACP backend candidate"))
+    );
+}
+
+#[test]
+fn fallback_requires_prior_candidate_to_reach_terminal_status() {
+    for status in [
+        AgentStatus::PendingInit,
+        AgentStatus::Running,
+        AgentStatus::Interrupted,
+    ] {
+        let error = ensure_fallback_source_terminal(status)
+            .expect_err("non-final source must not overlap with fallback");
+        assert!(
+            matches!(error, FunctionCallError::RespondToModel(message) if message.contains("still active"))
+        );
+    }
+    ensure_fallback_source_terminal(AgentStatus::Completed(Some("done".to_string())))
+        .expect("completed source may fall back");
+}
+
+#[test]
+fn spawn_spec_accepts_observer_metadata_string_map() {
+    let ToolSpec::Function(spec) = spawn_spec() else {
+        panic!("acp spawn should be a function tool");
+    };
+    let properties = spec
+        .parameters
+        .properties
+        .as_ref()
+        .expect("spawn parameters");
+    assert!(properties.contains_key("metadata"));
+}
+
+#[test]
+fn reserved_acp_delivery_specs_keep_their_model_visible_contract() {
+    for (name, description) in [
+        (
+            "send_message",
+            "Queue a plain-text message for an existing ACP agent without starting a turn.",
+        ),
+        (
+            "followup_task",
+            "Send a plain-text follow-up to an existing ACP agent and start its next turn when idle.",
+        ),
+    ] {
+        let ToolSpec::Function(spec) = message_spec(name, description) else {
+            panic!("{name} must remain a function tool");
+        };
+        assert_eq!(spec.name, name);
+        assert_eq!(spec.description, description);
+        let properties = spec.parameters.properties.as_ref().expect("parameters");
+        assert_eq!(
+            properties.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["message", "target"]
+        );
+        assert_eq!(
+            spec.parameters.required.as_ref(),
+            Some(&vec!["target".to_string(), "message".to_string()])
+        );
+    }
+}
+
+#[test]
+fn cross_team_acp_guidance_uses_target_authority_via_unbound_root() {
+    let caller = codex_team_runtime::TeamSessionId::parse("team-a").expect("caller Team");
+    let target = codex_team_runtime::TeamSessionId::parse("team-b").expect("target Team");
+
+    for mode in [DeliveryMode::QueueOnly, DeliveryMode::TriggerTurn] {
+        let guidance = team_bound_external_delivery_guidance(Some(&caller), Some(&target), mode)
+            .expect("cross-Team raw delivery must be rejected");
+        assert!(guidance.contains("target is governed by team_session_id=team-b"));
+        assert!(guidance.contains("unbound root coordinator"));
+        assert!(guidance.contains(&format!(
+            "{}(team_session_id=team-b, ...)",
+            mode.team_tool()
+        )));
+    }
+}
+
+#[test]
+fn same_team_and_bound_to_unbound_acp_guidance_remain_distinct() {
+    let team = codex_team_runtime::TeamSessionId::parse("team-a").expect("Team");
+    let same_team =
+        team_bound_external_delivery_guidance(Some(&team), Some(&team), DeliveryMode::QueueOnly)
+            .expect("same-Team raw delivery must be rejected");
+    assert!(same_team.contains("Same-Team"));
+    assert!(same_team.contains("team.send_message(team_session_id=team-a, ...)"));
+    assert!(!same_team.contains("unbound root coordinator"));
+
+    let target_unbound =
+        team_bound_external_delivery_guidance(Some(&team), None, DeliveryMode::TriggerTurn)
+            .expect("bound caller raw delivery must be rejected");
+    assert!(target_unbound.contains("unbound root coordinator"));
+    assert!(target_unbound.contains("acp.followup_task"));
+}
+
+#[test]
+fn spawn_output_reports_first_fallback_explicit_and_default_model() {
+    let path = AgentPath::try_from("/root/worker").expect("agent path");
+    let pool = [
+        acp_backend("grok-build".to_string(), Some("grok-4.6".to_string()), None),
+        acp_backend(
+            "cursor".to_string(),
+            Some("cursor-grok-4.6-high".to_string()),
+            None,
+        ),
+    ];
+    let cases = [(None, &pool[0]), (Some(1), &pool[1])];
+    for (fallback_index, expected) in cases {
+        let selected =
+            resolve_backend_candidate(AcpBackendOverrides::default(), &pool, fallback_index)
+                .expect("pool candidate");
+        assert_eq!(selected.backend, *expected);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&acp_spawn_output(
+                &path,
+                &selected.backend.harness,
+                selected.backend.model.as_deref(),
+            ))
+            .expect("output json"),
+            json!({
+                "task_name": "/root/worker",
+                "harness": expected.harness,
+                "model": expected.model,
+            })
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&acp_spawn_output(&path, "kimi", Some("k3"),))
+            .expect("output json"),
+        json!({"task_name": "/root/worker", "harness": "kimi", "model": "k3"})
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&acp_spawn_output(
+            &path, "cursor", /*model*/ None,
+        ))
+        .expect("output json"),
+        json!({"task_name": "/root/worker", "harness": "cursor", "model": null})
     );
 }

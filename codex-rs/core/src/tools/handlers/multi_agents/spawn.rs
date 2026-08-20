@@ -54,12 +54,17 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+    let observer_metadata = parse_spawn_observer_metadata(args.metadata)?;
     let role_name = args
         .agent_type
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
     let input_items = parse_collab_input(args.message, args.items)?;
+    let caller_thread_id = session.thread_id.to_string();
+    reject_team_bound_raw_collaboration_v1(&session, &caller_thread_id, &[], V1RawOp::Spawn)
+        .await?;
+    reject_unbound_raw_spawn_when_teams_open_v1(&session, &caller_thread_id).await?;
     let prompt = render_input_preview(&input_items);
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
@@ -139,6 +144,8 @@ async fn handle_spawn_agent(
             root_turn_id: turn.turn_metadata_state.root_turn_id(),
             environments: Some(step_context.environments.to_selections()),
             multi_agent_v2_usage_hints: None,
+            metadata: observer_metadata,
+            pending_team_binding: None,
         },
     ))
     .await
@@ -228,6 +235,10 @@ async fn handle_spawn_agent(
 }
 
 impl CoreToolRuntime for Handler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -243,6 +254,7 @@ struct SpawnAgentArgs {
     service_tier: Option<String>,
     #[serde(default)]
     fork_context: bool,
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

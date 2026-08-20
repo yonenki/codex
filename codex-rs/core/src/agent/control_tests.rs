@@ -69,6 +69,42 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 use toml::Value as TomlValue;
 
+#[test]
+fn external_backend_route_claims_fallback_once_and_releases_failed_spawn() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.record_external_backend_route(agent_id, "worker".to_string(), 0);
+
+    assert_eq!(
+        control
+            .claim_next_external_backend_candidate(agent_id, "worker")
+            .expect("next candidate"),
+        1
+    );
+    let error = control
+        .claim_next_external_backend_candidate(agent_id, "worker")
+        .expect_err("duplicate fallback must fail");
+    assert!(error.to_string().contains("already been consumed"));
+
+    control.release_external_backend_fallback(agent_id);
+    assert_eq!(
+        control
+            .claim_next_external_backend_candidate(agent_id, "worker")
+            .expect("failed spawn releases the claim"),
+        1
+    );
+    control.release_external_backend_fallback(agent_id);
+
+    let error = control
+        .claim_next_external_backend_candidate(agent_id, "reviewer")
+        .expect_err("role mismatch must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("uses agent_type 'worker', not 'reviewer'")
+    );
+}
+
 async fn test_config_with_cli_overrides(
     mut cli_overrides: Vec<(String, TomlValue)>,
 ) -> (TempDir, Config) {
@@ -249,6 +285,7 @@ fn register_test_agent_metadata(
         agent_path: Some(agent_path),
         agent_nickname: Some(agent_nickname.to_string()),
         agent_role: Some(agent_role.to_string()),
+        metadata: None,
     });
 }
 
@@ -776,6 +813,701 @@ async fn legacy_completion_watcher_notifies_terminal_transitions_once() {
 }
 
 #[tokio::test]
+async fn external_followup_emits_second_terminal_with_backend_identity() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "reviewer",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        },
+    );
+    harness.control.start_completion_watcher(
+        child_thread_id,
+        parent_thread_id,
+        child_agent_path.to_string(),
+        /*child_agent_path*/ None,
+    );
+
+    harness
+        .control
+        .external_agents
+        .set_status_for_tests(child_thread_id, AgentStatus::Running);
+    harness.control.external_agents.set_status_for_tests(
+        child_thread_id,
+        AgentStatus::Completed(Some("first done".to_string())),
+    );
+    let first = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(first[0].status, SubAgentTerminalStatus::Completed);
+    assert_eq!(first[0].harness.as_deref(), Some("cursor"));
+    assert_eq!(first[0].model.as_deref(), Some("cursor-grok-4.6-high"));
+
+    harness
+        .control
+        .external_agents
+        .set_status_for_tests(child_thread_id, AgentStatus::Running);
+    harness.control.external_agents.set_status_for_tests(
+        child_thread_id,
+        AgentStatus::Completed(Some("second done".to_string())),
+    );
+    let second = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(second[0].status, SubAgentTerminalStatus::Completed);
+    assert_eq!(second[0].harness.as_deref(), Some("cursor"));
+    assert_eq!(second[0].model.as_deref(), Some("cursor-grok-4.6-high"));
+    assert_eq!(second[0].agent_path, Some(child_agent_path));
+}
+
+#[tokio::test]
+async fn queued_followup_emits_start_after_current_generation_stops() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "reviewer",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "grok-build".to_string(),
+            model: Some("grok-test".to_string()),
+        },
+    );
+    harness.control.start_completion_watcher(
+        child_thread_id,
+        parent_thread_id,
+        child_agent_path.to_string(),
+        Some(child_agent_path),
+    );
+    harness
+        .control
+        .external_agents
+        .begin_turn_for_tests(child_thread_id);
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let hook_events = std::sync::Arc::clone(&events);
+    let (hook_entered_tx, hook_entered_rx) = tokio::sync::oneshot::channel();
+    let (release_hook_tx, release_hook_rx) = tokio::sync::oneshot::channel();
+    let send = tokio::spawn({
+        let control = harness.control.clone();
+        async move {
+            control
+                .send_external_inter_agent_communication_with_start_hook(
+                    child_thread_id,
+                    InterAgentCommunication::new(
+                        AgentPath::root(),
+                        AgentPath::root().join("worker").expect("worker path"),
+                        Vec::new(),
+                        "queued follow-up".to_string(),
+                        /*trigger_turn*/ true,
+                    ),
+                    AgentCommunicationContext::new(
+                        AgentCommunicationKind::Followup,
+                        ThreadId::new(),
+                    ),
+                    move || {
+                        let hook_events = std::sync::Arc::clone(&hook_events);
+                        async move {
+                            hook_events.lock().expect("event log").push("start");
+                            let _ = hook_entered_tx.send(());
+                            let _ = release_hook_rx.await;
+                        }
+                    },
+                )
+                .await
+        }
+    });
+
+    timeout(Duration::from_millis(200), hook_entered_rx)
+        .await
+        .expect_err("queued follow-up must not fire Start before the current generation stops");
+    let (_, requests_turn) = send.await.expect("send task").expect("queued follow-up");
+    assert!(requests_turn);
+    assert!(
+        events.lock().expect("event log").is_empty(),
+        "Start must wait for the real next generation: {:?}",
+        events.lock().expect("event log")
+    );
+
+    harness.control.external_agents.finish_turn_for_tests(
+        child_thread_id,
+        AgentStatus::Completed(Some("current turn done".to_string())),
+    );
+    let stopped = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(stopped[0].status, SubAgentTerminalStatus::Completed);
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if events.lock().expect("event log").as_slice() == ["start"] {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Start should run after Stop");
+    release_hook_tx.send(()).expect("release start hook");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                harness.control.get_status(child_thread_id).await,
+                AgentStatus::Running | AgentStatus::Errored(_)
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("next generation should start after the deferred Start hook");
+    assert_eq!(*events.lock().expect("event log"), ["start"]);
+}
+
+#[tokio::test]
+async fn followup_after_terminal_waits_for_watcher_stop_before_next_start() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "reviewer",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "grok-build".to_string(),
+            model: Some("grok-test".to_string()),
+        },
+    );
+    harness
+        .control
+        .external_agents
+        .begin_turn_for_tests(child_thread_id);
+    harness.control.external_agents.finish_turn_for_tests(
+        child_thread_id,
+        AgentStatus::Completed(Some("generation-one".to_string())),
+    );
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(vec!["start-n"]));
+    let hook_events = std::sync::Arc::clone(&events);
+    let (hook_entered_tx, hook_entered_rx) = tokio::sync::oneshot::channel();
+    let (release_hook_tx, release_hook_rx) = tokio::sync::oneshot::channel();
+    let (_, requests_turn) = harness
+        .control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "follow-up after terminal".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            move || {
+                let hook_events = std::sync::Arc::clone(&hook_events);
+                async move {
+                    hook_events.lock().expect("event log").push("start-n1");
+                    let _ = hook_entered_tx.send(());
+                    let _ = release_hook_rx.await;
+                }
+            },
+        )
+        .await
+        .expect("follow-up after terminal should queue");
+    assert!(requests_turn);
+    assert_eq!(
+        *events.lock().expect("event log"),
+        ["start-n"],
+        "Start(N+1) must not run before the watcher confirms Stop(N)"
+    );
+    assert_matches!(
+        harness.control.get_status(child_thread_id).await,
+        AgentStatus::Completed(_)
+    );
+
+    let first_stop = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(first_stop[0].status, SubAgentTerminalStatus::Completed);
+    timeout(Duration::from_secs(2), hook_entered_rx)
+        .await
+        .expect("Start(N+1) should run after Stop(N)")
+        .expect("start hook sender");
+    release_hook_tx.send(()).expect("release start hook");
+
+    let second_stop = receive_terminal_events(&parent_thread, child_thread_id, 1).await;
+    assert_eq!(second_stop[0].status, SubAgentTerminalStatus::Errored);
+    assert_eq!(*events.lock().expect("event log"), ["start-n", "start-n1"]);
+}
+
+#[tokio::test]
+async fn external_interrupted_generation_keeps_watcher_for_queued_followup() {
+    let (home, mut config) = test_config().await;
+    config.ephemeral = true;
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    harness
+        .control
+        .register_session_root(parent_thread_id, None);
+    let child_thread_id = ThreadId::new();
+    let child_agent_path = AgentPath::root().join("worker").expect("child path");
+    register_test_agent_metadata(
+        &harness.control,
+        child_thread_id,
+        child_agent_path.clone(),
+        "Luna",
+        "worker",
+    );
+    harness.control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        },
+    );
+    harness.control.start_completion_watcher(
+        child_thread_id,
+        parent_thread_id,
+        child_agent_path.to_string(),
+        Some(child_agent_path),
+    );
+    harness
+        .control
+        .external_agents
+        .begin_turn_for_tests(child_thread_id);
+
+    harness
+        .control
+        .external_agents
+        .interrupt(child_thread_id)
+        .expect("interrupt generation one");
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let starts_for_hook = Arc::clone(&starts);
+    let (_, requests_turn) = harness
+        .control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "follow-up while interrupted Stop is pending".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            move || async move {
+                starts_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("queue follow-up behind interrupted terminal");
+    assert!(requests_turn);
+
+    let terminals = receive_terminal_events(&parent_thread, child_thread_id, 2).await;
+    assert_eq!(
+        terminals
+            .iter()
+            .map(|event| event.status)
+            .collect::<Vec<_>>(),
+        vec![
+            SubAgentTerminalStatus::Interrupted,
+            SubAgentTerminalStatus::Errored,
+        ]
+    );
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn external_turn_start_hook_precedes_running_status() {
+    let control = AgentControl::default();
+    let child_thread_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: Some("cursor-grok-4.6-high".to_string()),
+        },
+    );
+    let hook_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_observed_for_callback = Arc::clone(&hook_observed);
+    let control_for_callback = control.clone();
+
+    let (_, started_turn) = control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "follow up".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            move || async move {
+                assert_eq!(
+                    control_for_callback.get_status(child_thread_id).await,
+                    AgentStatus::PendingInit
+                );
+                hook_observed_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("external follow-up should start");
+
+    assert!(started_turn);
+    assert!(hook_observed.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn external_queue_only_message_does_not_invoke_start_hook() {
+    let control = AgentControl::default();
+    let child_thread_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        child_thread_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+    let hook_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_observed_for_callback = Arc::clone(&hook_observed);
+
+    let (_, started_turn) = control
+        .send_external_inter_agent_communication_with_start_hook(
+            child_thread_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "queued message".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
+            move || async move {
+                hook_observed_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("external message should queue");
+
+    assert!(!started_turn);
+    assert!(!hook_observed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        control.get_status(child_thread_id).await,
+        AgentStatus::PendingInit
+    );
+}
+
+async fn hold_external_submission_before_start(
+    control: &AgentControl,
+    agent_id: ThreadId,
+    message: &str,
+) -> (
+    tokio::task::JoinHandle<CodexResult<(String, bool)>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (hook_entered_tx, hook_entered_rx) = tokio::sync::oneshot::channel();
+    let (release_hook_tx, release_hook_rx) = tokio::sync::oneshot::channel();
+    let task_control = control.clone();
+    let message = message.to_string();
+    let task = tokio::spawn(async move {
+        task_control
+            .send_external_inter_agent_communication_with_start_hook(
+                agent_id,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::root().join("worker").expect("worker path"),
+                    Vec::new(),
+                    message,
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+                move || async move {
+                    let _ = hook_entered_tx.send(());
+                    let _ = release_hook_rx.await;
+                },
+            )
+            .await
+    });
+    hook_entered_rx.await.expect("start hook should be entered");
+    (task, release_hook_tx)
+}
+
+async fn cancel_external_submission_before_start(control: &AgentControl, agent_id: ThreadId) {
+    let (task, _release_hook) =
+        hold_external_submission_before_start(control, agent_id, "cancelled follow-up").await;
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("cancelled submission task should not complete")
+            .is_cancelled()
+    );
+}
+
+async fn start_followup_and_wait_for_test_harness_terminal(
+    control: &AgentControl,
+    agent_id: ThreadId,
+) -> AgentStatus {
+    let mut status_rx = control
+        .subscribe_status(agent_id)
+        .await
+        .expect("external status subscription");
+    let (_, requests_turn) = control
+        .send_external_inter_agent_communication_with_start_hook(
+            agent_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "next follow-up".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            || std::future::ready(()),
+        )
+        .await
+        .expect("next follow-up should start");
+    assert!(requests_turn);
+    loop {
+        let status = status_rx.borrow().clone();
+        if is_final(&status) {
+            return status;
+        }
+        status_rx
+            .changed()
+            .await
+            .expect("test harness terminal status");
+    }
+}
+
+#[tokio::test]
+async fn external_immediate_reservation_rolls_back_when_start_hook_is_cancelled() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+
+    cancel_external_submission_before_start(&control, agent_id).await;
+    assert_eq!(control.get_status(agent_id).await, AgentStatus::PendingInit);
+
+    assert_matches!(
+        start_followup_and_wait_for_test_harness_terminal(&control, agent_id).await,
+        AgentStatus::Errored(_)
+    );
+}
+
+#[tokio::test]
+async fn external_queued_generation_rolls_back_when_deferred_start_hook_is_cancelled() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+    control.external_agents.begin_turn_for_tests(agent_id);
+
+    let (_, requests_turn) = control
+        .send_external_inter_agent_communication_with_start_hook(
+            agent_id,
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "queued follow-up".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+            || std::future::ready(()),
+        )
+        .await
+        .expect("queued follow-up should reserve");
+    assert!(requests_turn);
+
+    control.external_agents.finish_turn_for_tests(
+        agent_id,
+        AgentStatus::Completed(Some("current turn done".to_string())),
+    );
+    control.external_agents.ack_terminal_observer(agent_id, 1);
+    let pending = control
+        .external_agents
+        .take_ready_pending_start(agent_id)
+        .expect("queued generation should be ready after Stop");
+    drop(pending);
+    assert_matches!(
+        control.get_status(agent_id).await,
+        AgentStatus::Completed(_)
+    );
+
+    assert_matches!(
+        start_followup_and_wait_for_test_harness_terminal(&control, agent_id).await,
+        AgentStatus::Errored(_)
+    );
+}
+
+#[tokio::test]
+async fn two_queued_followups_start_together_after_current_generation_stops() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+    control.external_agents.begin_turn_for_tests(agent_id);
+    for message in ["follow-up A", "follow-up B"] {
+        let (_, requests_turn) = control
+            .send_external_inter_agent_communication_with_start_hook(
+                agent_id,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::root().join("worker").expect("worker path"),
+                    Vec::new(),
+                    message.to_string(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+                || std::future::ready(()),
+            )
+            .await
+            .expect("queued follow-up should reserve");
+        assert!(requests_turn);
+    }
+    assert_eq!(
+        control
+            .external_agents
+            .queued_message_contents_for_tests(agent_id),
+        vec!["follow-up A".to_string(), "follow-up B".to_string()]
+    );
+
+    control.external_agents.finish_turn_for_tests(
+        agent_id,
+        AgentStatus::Completed(Some("current turn done".to_string())),
+    );
+    control.external_agents.ack_terminal_observer(agent_id, 1);
+    let pending = control
+        .external_agents
+        .take_ready_pending_start(agent_id)
+        .expect("queued follow-ups should start after Stop");
+    pending.start().await;
+    let mut status_rx = control
+        .subscribe_status(agent_id)
+        .await
+        .expect("external status subscription");
+    let status = loop {
+        let status = status_rx.borrow().clone();
+        if is_final(&status) {
+            break status;
+        }
+        status_rx
+            .changed()
+            .await
+            .expect("test harness terminal status");
+    };
+    assert_matches!(status, AgentStatus::Errored(_));
+}
+
+#[tokio::test]
+async fn dropping_a_ready_queued_generation_does_not_block_later_followup() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+    control.external_agents.begin_turn_for_tests(agent_id);
+    for message in ["follow-up A", "follow-up B"] {
+        control
+            .send_external_inter_agent_communication_with_start_hook(
+                agent_id,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::root().join("worker").expect("worker path"),
+                    Vec::new(),
+                    message.to_string(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Followup, ThreadId::new()),
+                || std::future::ready(()),
+            )
+            .await
+            .expect("queued follow-up should reserve");
+    }
+
+    control.external_agents.finish_turn_for_tests(
+        agent_id,
+        AgentStatus::Completed(Some("current turn done".to_string())),
+    );
+    control.external_agents.ack_terminal_observer(agent_id, 1);
+    drop(
+        control
+            .external_agents
+            .take_ready_pending_start(agent_id)
+            .expect("queued generation should be ready after Stop"),
+    );
+    assert!(
+        control
+            .external_agents
+            .queued_message_contents_for_tests(agent_id)
+            .is_empty()
+    );
+
+    assert_matches!(
+        start_followup_and_wait_for_test_harness_terminal(&control, agent_id).await,
+        AgentStatus::Errored(_)
+    );
+}
+
+#[tokio::test]
 async fn spawn_agent_errors_when_manager_dropped() {
     let control = AgentControl::default();
     let (_home, config) = test_config().await;
@@ -801,6 +1533,178 @@ async fn resume_agent_errors_when_manager_dropped() {
         err.to_string(),
         "unsupported operation: thread manager dropped"
     );
+}
+
+#[tokio::test]
+async fn existence_authority_preserves_manager_upgrade_failure() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+
+    for error in [
+        control
+            .is_agent_known(agent_id)
+            .await
+            .expect_err("live existence lookup should preserve manager failure"),
+        control
+            .is_agent_known_or_resumable(agent_id)
+            .await
+            .expect_err("resumable existence lookup should preserve manager failure"),
+    ] {
+        assert_eq!(
+            error.to_string(),
+            "unsupported operation: thread manager dropped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_active_agent() {
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, _) = harness.start_thread().await;
+
+    assert!(
+        harness
+            .control
+            .is_agent_known(agent_id)
+            .await
+            .expect("active lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_external_agent_without_manager() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    control.external_agents.register_for_tests(
+        agent_id,
+        super::external::ExternalAgentIdentity {
+            harness: "cursor".to_string(),
+            model: None,
+        },
+    );
+
+    assert!(
+        control
+            .is_agent_known(agent_id)
+            .await
+            .expect("external lookup should not require the thread manager")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_agent_metadata_without_manager() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    register_test_agent_metadata(
+        &control,
+        agent_id,
+        AgentPath::root().join("worker").expect("agent path"),
+        "Luna",
+        "worker",
+    );
+
+    assert!(
+        control
+            .is_agent_known(agent_id)
+            .await
+            .expect("metadata lookup should not require the thread manager")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_reports_normal_unknown() {
+    let harness = AgentControlHarness::new().await;
+    let agent_id = ThreadId::new();
+
+    assert!(
+        !harness
+            .control
+            .is_agent_known(agent_id)
+            .await
+            .expect("live unknown lookup should succeed")
+    );
+    assert!(
+        !harness
+            .control
+            .is_agent_known_or_resumable(agent_id)
+            .await
+            .expect("stored unknown lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_stored_resumable_agent() {
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, thread) = harness.start_thread().await;
+    persist_thread_for_tree_resume(&thread, "stored context").await;
+    harness
+        .control
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown stored thread");
+
+    assert!(
+        harness
+            .control
+            .is_agent_known_or_resumable(agent_id)
+            .await
+            .expect("stored resumable lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn existence_authority_preserves_stored_thread_read_failure() {
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, thread) = harness.start_thread().await;
+    persist_thread_for_tree_resume(&thread, "stored context").await;
+    let rollout_path = thread
+        .rollout_path()
+        .expect("stored thread should have rollout path");
+    harness
+        .control
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown stored thread");
+    std::fs::write(&rollout_path, [0xff]).expect("corrupt stored thread metadata");
+
+    let error = harness
+        .control
+        .is_agent_known_or_resumable(agent_id)
+        .await
+        .expect_err("stored thread read failure must not become unknown");
+    assert_matches!(error.details(), CodexErrorDetails::Fatal(_));
+    assert!(error.to_string().contains("failed to read stored thread"));
+}
+
+#[tokio::test]
+async fn existence_authority_preserves_history_read_failure() {
+    use std::io::Write;
+
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, thread) = harness.start_thread().await;
+    persist_thread_for_tree_resume(&thread, "stored context").await;
+    let rollout_path = thread
+        .rollout_path()
+        .expect("stored thread should have rollout path");
+    harness
+        .control
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown stored thread");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .expect("open rollout for corruption")
+        .write_all(&[0xff])
+        .expect("corrupt stored history");
+
+    let error = harness
+        .control
+        .is_agent_known_or_resumable(agent_id)
+        .await
+        .expect_err("history read failure must not become unknown");
+    assert_matches!(error.details(), CodexErrorDetails::Fatal(_));
+    assert!(error.to_string().contains("failed to read stored thread"));
 }
 
 #[tokio::test]
@@ -4605,4 +5509,1860 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
         .shutdown_agent_tree(parent_thread_id)
         .await
         .expect("tree shutdown after partial subtree resume should succeed");
+}
+
+#[tokio::test]
+async fn team_spawn_binds_native_agent_before_first_turn() {
+    let harness = AgentControlHarness::new().await;
+    let graph = sample_team_graph();
+    harness
+        .control
+        .team()
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([graph]))
+        .await;
+    let started = harness
+        .control
+        .team()
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    harness
+        .control
+        .team()
+        .start_node(codex_team_runtime::StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+    let mut pending = harness
+        .control
+        .team()
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    let exact_message = "do the work\nwith exact  spacing";
+    pending.attach_metadata = Some(codex_team_runtime::PendingAgentAttachMetadata::new(
+        exact_message.into(),
+    ));
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let spawn = harness
+        .control
+        .spawn_agent_with_communication(
+            harness.config.clone(),
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("path"),
+                Vec::new(),
+                exact_message.into(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(AgentPath::try_from("/root/worker").expect("path")),
+                agent_nickname: None,
+                agent_role: Some("worker".into()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                pending_team_binding: Some(pending),
+                ..SpawnAgentOptions::default()
+            },
+        )
+        .await;
+    let thread_id = spawn
+        .as_ref()
+        .map(|agent| agent.thread_id)
+        .unwrap_or_else(|_| {
+            harness
+                .control
+                .team()
+                .binding_snapshot("unused")
+                .map(|_| ThreadId::new())
+                .unwrap_or_else(ThreadId::new)
+        });
+    if let Ok(agent) = spawn {
+        let expected_model = harness.config.model.clone();
+        let binding = harness
+            .control
+            .team()
+            .binding_for(&agent.thread_id.to_string())
+            .await
+            .expect("binding must exist before the child turn starts");
+        assert_eq!(binding.role, "worker");
+        assert_eq!(binding.team_session_id, started.team_session_id);
+        assert_eq!(agent.thread_id, thread_id);
+        let store = codex_team_runtime::SqliteTeamStore::open(
+            &codex_team_runtime::TeamControl::team_store_path(
+                &harness.config.codex_home.to_path_buf(),
+            ),
+        )
+        .await
+        .expect("open team store");
+        let attached = codex_team_runtime::TeamStore::load_events(&store, &started.team_session_id)
+            .await
+            .expect("load team events")
+            .into_iter()
+            .find(|event| event.kind == codex_team_runtime::TeamEventKind::AgentAttached)
+            .expect("agent_attached");
+        let codex_team_runtime::TeamEventPayload::AgentAttached {
+            backend,
+            harness: attached_harness,
+            model,
+            delegation_message,
+            ..
+        } = attached.payload
+        else {
+            panic!("agent_attached payload");
+        };
+        assert_eq!(backend, Some(codex_team_runtime::AgentBackend::Native));
+        assert_eq!(attached_harness, None);
+        assert_eq!(model.as_deref(), expected_model.as_deref());
+        assert_eq!(delegation_message.as_deref(), Some(exact_message));
+    } else {
+        let bindings_exist = harness.control.team().open_team_count() > 0;
+        assert!(bindings_exist);
+    }
+}
+
+#[tokio::test]
+async fn team_spawn_persists_acp_identity_and_message_before_start_hook() {
+    let (home, mut config) = test_config().await;
+    config.permissions.shell_environment_policy.r#set.insert(
+        "CODEX_ACP_HARNESS_HOST_COMMAND".to_string(),
+        std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    harness
+        .control
+        .team()
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([
+            sample_team_graph(),
+        ]))
+        .await;
+    let started = harness
+        .control
+        .team()
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    harness
+        .control
+        .team()
+        .start_node(codex_team_runtime::StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+    let exact_message = "ACP delegation\nwith exact  spacing";
+    let mut pending = harness
+        .control
+        .team()
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    pending.attach_metadata = Some(codex_team_runtime::PendingAgentAttachMetadata::new(
+        exact_message.into(),
+    ));
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let trace_seen_by_start_hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_flag = Arc::clone(&trace_seen_by_start_hook);
+    let hook_store_path =
+        codex_team_runtime::TeamControl::team_store_path(&harness.config.codex_home.to_path_buf());
+    let hook_team_id = started.team_session_id.clone();
+    let hook_message = exact_message.to_string();
+
+    let spawn = timeout(
+        Duration::from_secs(5),
+        harness.control.spawn_external_agent_with_communication(
+            harness.config.clone(),
+            crate::agent::role::ExternalAgentBackend {
+                harness: "cursor".into(),
+                model: Some("cursor-model".into()),
+                effort: None,
+            },
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker_acp").expect("path"),
+                Vec::new(),
+                exact_message.into(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(AgentPath::try_from("/root/worker_acp").expect("path")),
+                agent_nickname: None,
+                agent_role: Some("worker".into()),
+            }),
+            None,
+            Some(pending),
+            move |_| async move {
+                let store = codex_team_runtime::SqliteTeamStore::open(&hook_store_path)
+                    .await
+                    .expect("open team store from start hook");
+                let saw_exact_trace =
+                    codex_team_runtime::TeamStore::load_events(&store, &hook_team_id)
+                        .await
+                        .expect("load team events from start hook")
+                        .into_iter()
+                        .any(|event| {
+                            matches!(
+                                event.payload,
+                                codex_team_runtime::TeamEventPayload::AgentAttached {
+                                    backend: Some(codex_team_runtime::AgentBackend::Acp),
+                                    harness: Some(ref harness),
+                                    model: Some(ref model),
+                                    delegation_message: Some(ref message),
+                                    ..
+                                } if harness == "cursor"
+                                    && model == "cursor-model"
+                                    && message == &hook_message
+                            )
+                        });
+                hook_flag.store(saw_exact_trace, std::sync::atomic::Ordering::SeqCst);
+            },
+        ),
+    )
+    .await
+    .expect("external start attempt should terminate");
+    spawn.expect("external agent registration");
+    assert!(trace_seen_by_start_hook.load(std::sync::atomic::Ordering::SeqCst));
+
+    let store = codex_team_runtime::SqliteTeamStore::open(
+        &codex_team_runtime::TeamControl::team_store_path(&harness.config.codex_home.to_path_buf()),
+    )
+    .await
+    .expect("open team store");
+    let attached = codex_team_runtime::TeamStore::load_events(&store, &started.team_session_id)
+        .await
+        .expect("load events")
+        .into_iter()
+        .find(|event| event.kind == codex_team_runtime::TeamEventKind::AgentAttached)
+        .expect("agent_attached persisted before start hook");
+    let codex_team_runtime::TeamEventPayload::AgentAttached {
+        backend,
+        harness: attached_harness,
+        model,
+        delegation_message,
+        ..
+    } = attached.payload
+    else {
+        panic!("agent_attached payload");
+    };
+    assert_eq!(backend, Some(codex_team_runtime::AgentBackend::Acp));
+    assert_eq!(attached_harness.as_deref(), Some("cursor"));
+    assert_eq!(model.as_deref(), Some("cursor-model"));
+    assert_eq!(delegation_message.as_deref(), Some(exact_message));
+}
+
+#[tokio::test]
+async fn existence_authority_recognizes_team_binding_without_other_authority() {
+    let harness = AgentControlHarness::new().await;
+    harness
+        .control
+        .team()
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([
+            sample_team_graph(),
+        ]))
+        .await;
+    let started = harness
+        .control
+        .team()
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    harness
+        .control
+        .team()
+        .start_node(codex_team_runtime::StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+    let pending = harness
+        .control
+        .team()
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending binding");
+    let agent_id = ThreadId::new();
+    harness
+        .control
+        .team()
+        .bind_agent_before_start(agent_id.to_string(), pending)
+        .await
+        .expect("bind synthetic agent");
+
+    assert!(
+        harness
+            .control
+            .is_agent_known(agent_id)
+            .await
+            .expect("Team binding lookup should not require another authority")
+    );
+}
+
+#[tokio::test]
+async fn thread_manager_shares_persistent_team_control() {
+    let harness = AgentControlHarness::new().await;
+    harness
+        .control
+        .team()
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([
+            sample_team_graph(),
+        ]))
+        .await;
+    let started = harness
+        .control
+        .team()
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    let other = harness.manager.agent_control();
+    let status = other
+        .team()
+        .status(&started.team_session_id)
+        .await
+        .expect("shared team registry");
+    assert_eq!(status.task_ref.as_deref(), Some("issue/1"));
+}
+
+#[tokio::test]
+async fn root_coordinator_team_wait_traces_target_agent_wait_events() {
+    let harness = AgentControlHarness::new().await;
+    let team = harness.control.team();
+    team.replace_catalog(codex_team_graph::TeamGraphCatalog::new([
+        sample_team_graph(),
+    ]))
+    .await;
+
+    let started = team
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("task/root".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+
+    let node = team
+        .start_node(codex_team_runtime::StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+
+    // Root coordinator is not bound to any team.
+    let root_thread = ThreadId::new();
+    assert!(team.binding_snapshot(&root_thread.to_string()).is_none());
+
+    // Bind child agent to team.
+    let child_thread = ThreadId::new();
+    let pending = team
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending binding");
+    team.bind_agent_before_start(child_thread.to_string(), pending)
+        .await
+        .expect("bind child");
+
+    // Target validation under team authority.
+    team.require_same_team(&started.team_session_id, &child_thread.to_string())
+        .await
+        .expect("target belongs to team");
+    let unrelated_thread = ThreadId::new();
+    team.require_same_team(&started.team_session_id, &unrelated_thread.to_string())
+        .await
+        .expect_err("unrelated target rejected");
+
+    // Agent-target wait trace entered.
+    let waited = team
+        .record_agent_wait_entered(
+            &started.team_session_id,
+            &child_thread.to_string(),
+            "worker result",
+        )
+        .await
+        .expect("wait entered");
+    assert_eq!(
+        waited.lifecycle,
+        codex_team_runtime::TeamLifecycle::WaitingAgent
+    );
+    assert_eq!(waited.waiting_reason, None);
+
+    // Agent-target wait trace resolved.
+    let resolved = team
+        .record_agent_wait_resolved(
+            &started.team_session_id,
+            &child_thread.to_string(),
+            "worker result",
+        )
+        .await
+        .expect("wait resolved");
+    // With child agent still attached, resolving the wait remains WaitingAgent.
+    assert_eq!(
+        resolved.lifecycle,
+        codex_team_runtime::TeamLifecycle::WaitingAgent
+    );
+    assert_eq!(resolved.waiting_reason, None);
+
+    // Child completes.
+    team.record_agent_terminal(&child_thread.to_string(), "completed")
+        .await
+        .expect("child terminal");
+    let after_terminal = team.status(&started.team_session_id).await.expect("status");
+    assert_eq!(
+        after_terminal.lifecycle,
+        codex_team_runtime::TeamLifecycle::Running
+    );
+    assert_eq!(node.revision.get(), 2);
+}
+
+async fn seed_sample_team(
+    harness: &AgentControlHarness,
+) -> (
+    codex_team_runtime::TeamView,
+    codex_team_runtime::PendingTeamBinding,
+) {
+    harness
+        .control
+        .team()
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([
+            sample_team_graph(),
+        ]))
+        .await;
+    let started = harness
+        .control
+        .team()
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    harness
+        .control
+        .team()
+        .start_node(codex_team_runtime::StartNodeCommand {
+            team_session_id: started.team_session_id.clone(),
+            node_id: None,
+            expected_revision: started.revision,
+        })
+        .await
+        .expect("start node");
+    let pending = harness
+        .control
+        .team()
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("pending");
+    (started, pending)
+}
+
+async fn load_team_events(
+    harness: &AgentControlHarness,
+    team_session_id: &codex_team_runtime::TeamSessionId,
+) -> Vec<codex_team_runtime::TeamEvent> {
+    let store = codex_team_runtime::SqliteTeamStore::open(
+        &codex_team_runtime::TeamControl::team_store_path(&harness.config.codex_home.to_path_buf()),
+    )
+    .await
+    .expect("open team store");
+    codex_team_runtime::TeamStore::load_events(&store, team_session_id)
+        .await
+        .expect("load team events")
+}
+
+fn terminal_statuses(events: &[codex_team_runtime::TeamEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            codex_team_runtime::TeamEventPayload::AgentTerminal { status } => Some(status.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn wait_for_attached_agent(
+    harness: &AgentControlHarness,
+    team_session_id: &codex_team_runtime::TeamSessionId,
+) -> String {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let events = load_team_events(harness, team_session_id).await;
+            if let Some(agent_thread_id) = events.iter().find_map(|event| {
+                (event.kind == codex_team_runtime::TeamEventKind::AgentAttached)
+                    .then(|| event.agent_thread_id.clone())
+                    .flatten()
+            }) {
+                return agent_thread_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("agent_attached should persist")
+}
+
+async fn wait_for_terminal_statuses(
+    harness: &AgentControlHarness,
+    team_session_id: &codex_team_runtime::TeamSessionId,
+) -> Vec<String> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let statuses = terminal_statuses(&load_team_events(harness, team_session_id).await)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !statuses.is_empty() {
+                return statuses;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("agent terminal should persist")
+}
+
+async fn restored_team_status(
+    harness: &AgentControlHarness,
+    team_session_id: &codex_team_runtime::TeamSessionId,
+) -> codex_team_runtime::TeamView {
+    let store = codex_team_runtime::SqliteTeamStore::open(
+        &codex_team_runtime::TeamControl::team_store_path(&harness.config.codex_home.to_path_buf()),
+    )
+    .await
+    .expect("reopen team store");
+    let restored = codex_team_runtime::TeamControl::with_store(
+        codex_team_graph::TeamGraphCatalog::new([sample_team_graph()]),
+        store,
+        codex_team_runtime::RecordingSink::default(),
+    );
+    restored.restore().await.expect("restore");
+    restored
+        .status(team_session_id)
+        .await
+        .expect("restored status")
+}
+
+fn thread_spawn_source(parent_thread_id: ThreadId, role: &str, path: &str) -> SessionSource {
+    SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: Some(AgentPath::try_from(path).expect("path")),
+        agent_nickname: None,
+        agent_role: Some(role.into()),
+    })
+}
+
+async fn acp_spawn_harness() -> AgentControlHarness {
+    let (home, mut config) = test_config().await;
+    config.permissions.shell_environment_policy.r#set.insert(
+        "CODEX_ACP_HARNESS_HOST_COMMAND".to_string(),
+        std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    AgentControlHarness::new_with_config(home, config).await
+}
+
+#[tokio::test]
+async fn native_initial_delivery_failure_after_attach_records_one_errored_terminal() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    harness.control.fail_next_spawn_initial_delivery();
+
+    let error = harness
+        .control
+        .spawn_agent_with_communication(
+            harness.config.clone(),
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("path"),
+                Vec::new(),
+                "do the work".into(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+            Some(thread_spawn_source(
+                parent_thread_id,
+                "worker",
+                "/root/worker",
+            )),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                pending_team_binding: Some(pending),
+                ..SpawnAgentOptions::default()
+            },
+        )
+        .await
+        .expect_err("forced initial delivery failure");
+    assert!(
+        error
+            .to_string()
+            .contains("forced spawn initial delivery failure"),
+        "spawn must return the original start error, got {error}"
+    );
+
+    let events = load_team_events(&harness, &started.team_session_id).await;
+    assert_eq!(terminal_statuses(&events), ["errored"]);
+    let status = harness
+        .control
+        .team()
+        .status(&started.team_session_id)
+        .await
+        .expect("status");
+    assert!(status.agents.is_empty());
+    harness
+        .control
+        .team()
+        .record_agent_terminal(
+            events
+                .iter()
+                .find(|event| event.kind == codex_team_runtime::TeamEventKind::AgentAttached)
+                .and_then(|event| event.agent_thread_id.as_deref())
+                .expect("attached agent"),
+            "interrupted",
+        )
+        .await
+        .expect("duplicate terminal is ignored");
+    assert_eq!(
+        terminal_statuses(&load_team_events(&harness, &started.team_session_id).await),
+        ["errored"]
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn native_spawn_cancel_after_attach_records_one_interrupted_terminal() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.hold_next_spawn_after_attach();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should block after attach")
+        .expect("attach-to-start hold entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must be cancelled");
+    drop(hold);
+
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    harness
+        .control
+        .team()
+        .record_agent_terminal(&agent_thread_id, "errored")
+        .await
+        .expect("duplicate terminal is ignored");
+    assert_eq!(
+        terminal_statuses(&load_team_events(&harness, &started.team_session_id).await),
+        ["interrupted"]
+    );
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn acp_start_hook_failure_after_attach_records_one_errored_terminal() {
+    let harness = acp_spawn_harness().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+
+    let error = harness
+        .control
+        .spawn_external_agent_with_communication(
+            harness.config.clone(),
+            crate::agent::role::ExternalAgentBackend {
+                harness: "cursor".into(),
+                model: Some("cursor-model".into()),
+                effort: None,
+            },
+            InterAgentCommunication::new_encrypted(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker_acp").expect("path"),
+                Vec::new(),
+                "encrypted".into(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+            thread_spawn_source(parent_thread_id, "worker", "/root/worker_acp"),
+            None,
+            Some(pending),
+            |_| async {},
+        )
+        .await
+        .expect_err("encrypted ACP communication is unsupported");
+    assert!(
+        error
+            .to_string()
+            .contains("encrypted inter-agent messages are not supported"),
+        "spawn must return the original start-hook error, got {error}"
+    );
+
+    let events = load_team_events(&harness, &started.team_session_id).await;
+    assert_eq!(terminal_statuses(&events), ["errored"]);
+    let agent_thread_id = events
+        .iter()
+        .find(|event| event.kind == codex_team_runtime::TeamEventKind::AgentAttached)
+        .and_then(|event| event.agent_thread_id.as_deref())
+        .expect("attached agent");
+    let thread_id = ThreadId::from_string(agent_thread_id).expect("thread id");
+    assert!(
+        !harness.control.is_external_agent(thread_id),
+        "ACP state must be removed after start-hook failure"
+    );
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn acp_spawn_cancel_after_attach_records_one_interrupted_terminal() {
+    let harness = acp_spawn_harness().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.hold_next_spawn_after_attach();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_external_agent_with_communication(
+                config,
+                crate::agent::role::ExternalAgentBackend {
+                    harness: "cursor".into(),
+                    model: Some("cursor-model".into()),
+                    effort: None,
+                },
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker_acp").expect("path"),
+                    Vec::new(),
+                    "ACP delegation".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                thread_spawn_source(parent_thread_id, "worker", "/root/worker_acp"),
+                None,
+                Some(pending),
+                |_| async {},
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("ACP spawn should block after attach")
+        .expect("attach-to-start hold entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled ACP spawn should not wait indefinitely");
+    assert!(join.is_err(), "ACP spawn future must be cancelled");
+    drop(hold);
+
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    let thread_id = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if !harness.control.is_external_agent(thread_id) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled ACP agent must be removed");
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+fn hold_next_team_event_publish(
+    harness: &AgentControlHarness,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let sink = codex_team_runtime::HoldNextPublishSink::default();
+    let (release, entered) = sink.hold_next();
+    harness.control.team().replace_event_sink(sink);
+    (release, entered)
+}
+
+#[tokio::test]
+async fn native_spawn_cancel_during_attach_publish_records_one_interrupted_terminal() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = hold_next_team_event_publish(&harness);
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should block on attach publish")
+        .expect("attach publish hold entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must keep the cancel outcome");
+    drop(hold);
+
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    harness
+        .control
+        .team()
+        .record_agent_terminal(&agent_thread_id, "errored")
+        .await
+        .expect("duplicate terminal is ignored");
+    assert_eq!(
+        terminal_statuses(&load_team_events(&harness, &started.team_session_id).await),
+        ["interrupted"]
+    );
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn acp_spawn_cancel_during_attach_publish_records_one_interrupted_terminal() {
+    let harness = acp_spawn_harness().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = hold_next_team_event_publish(&harness);
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_external_agent_with_communication(
+                config,
+                crate::agent::role::ExternalAgentBackend {
+                    harness: "cursor".into(),
+                    model: Some("cursor-model".into()),
+                    effort: None,
+                },
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker_acp").expect("path"),
+                    Vec::new(),
+                    "ACP delegation".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                thread_spawn_source(parent_thread_id, "worker", "/root/worker_acp"),
+                None,
+                Some(pending),
+                |_| async {},
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("ACP spawn should block on attach publish")
+        .expect("attach publish hold entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled ACP spawn should not wait indefinitely");
+    assert!(
+        join.is_err(),
+        "ACP spawn future must keep the cancel outcome"
+    );
+    drop(hold);
+
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    let thread_id = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if !harness.control.is_external_agent(thread_id) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled ACP agent must be removed");
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+async fn wait_for_child_thread(
+    harness: &AgentControlHarness,
+    parent_thread_id: ThreadId,
+) -> ThreadId {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(child) = harness
+                .manager
+                .list_thread_ids()
+                .await
+                .into_iter()
+                .find(|thread_id| *thread_id != parent_thread_id)
+            {
+                return child;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native child thread should exist")
+}
+
+async fn wait_until_thread_gone(harness: &AgentControlHarness, thread_id: ThreadId) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if harness.manager.get_thread(thread_id).await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native child thread should be cleaned up")
+}
+
+async fn wait_for_registered_external_agent(harness: &AgentControlHarness) -> ThreadId {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(agent_id) = harness
+                .control
+                .registered_external_agent_ids()
+                .into_iter()
+                .next()
+            {
+                return agent_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ACP agent should be registered")
+}
+
+async fn wait_until_external_gone(harness: &AgentControlHarness, thread_id: ThreadId) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if !harness.control.is_external_agent(thread_id) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ACP agent must be removed")
+}
+
+async fn assert_no_agent_terminals(
+    harness: &AgentControlHarness,
+    team_session_id: &codex_team_runtime::TeamSessionId,
+) {
+    for _ in 0..20 {
+        assert!(
+            terminal_statuses(&load_team_events(harness, team_session_id).await).is_empty(),
+            "uncommitted cancel must not record a terminal"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn native_spawn_cancel_before_attach_commit_cleans_up_without_terminal() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.team().hold_next_bind_before_attach_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should block before attach commit")
+        .expect("pre-commit hold entered");
+    let child = wait_for_child_thread(&harness, parent_thread_id).await;
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must keep the cancel outcome");
+    drop(hold);
+
+    wait_until_thread_gone(&harness, child).await;
+    assert_no_agent_terminals(&harness, &started.team_session_id).await;
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn acp_spawn_cancel_before_attach_commit_cleans_up_without_terminal() {
+    let harness = acp_spawn_harness().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.team().hold_next_bind_before_attach_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_external_agent_with_communication(
+                config,
+                crate::agent::role::ExternalAgentBackend {
+                    harness: "cursor".into(),
+                    model: Some("cursor-model".into()),
+                    effort: None,
+                },
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker_acp").expect("path"),
+                    Vec::new(),
+                    "ACP delegation".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                thread_spawn_source(parent_thread_id, "worker", "/root/worker_acp"),
+                None,
+                Some(pending),
+                |_| async {},
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("ACP spawn should block before attach commit")
+        .expect("pre-commit hold entered");
+    let agent_thread_id = wait_for_registered_external_agent(&harness).await;
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled ACP spawn should not wait indefinitely");
+    assert!(
+        join.is_err(),
+        "ACP spawn future must keep the cancel outcome"
+    );
+    drop(hold);
+
+    wait_until_external_gone(&harness, agent_thread_id).await;
+    assert_no_agent_terminals(&harness, &started.team_session_id).await;
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn native_spawn_cancel_after_durable_commit_before_observe_records_one_interrupted_terminal()
+{
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.team().hold_next_bind_after_durable_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should block after durable commit")
+        .expect("indeterminate-commit hold entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    let child = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must keep the cancel outcome");
+    drop(hold);
+
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    wait_until_thread_gone(&harness, child).await;
+    harness
+        .control
+        .team()
+        .record_agent_terminal(&agent_thread_id, "errored")
+        .await
+        .expect("duplicate terminal is ignored");
+    assert_eq!(
+        terminal_statuses(&load_team_events(&harness, &started.team_session_id).await),
+        ["interrupted"]
+    );
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn native_cancel_retries_terminal_after_cleanup_failure_and_releases_resources() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.team().hold_next_bind_after_durable_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should reach committed result seam")
+        .expect("committed seam entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    let child = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    harness.control.team().fail_next_terminal_persist_for_test();
+    harness.control.fail_next_native_shutdown_before_send();
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must keep the cancel outcome");
+    drop(hold);
+
+    wait_until_thread_gone(&harness, child).await;
+    assert!(
+        harness.control.get_agent_metadata(child).is_none(),
+        "spawn registry must be released even when pre-shutdown cleanup fails"
+    );
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty(),
+        "bounded local retry must persist a transient terminal failure"
+    );
+}
+
+#[tokio::test]
+async fn native_cancel_bounded_terminal_persist_failure_cleans_resources_without_resident_retry() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.team().hold_next_bind_after_durable_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should reach committed result seam")
+        .expect("committed seam entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    let child = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    harness.control.team().fail_terminal_persists_for_test(8);
+    harness.control.fail_next_native_shutdown_before_send();
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must keep the cancel outcome");
+    drop(hold);
+
+    wait_until_thread_gone(&harness, child).await;
+    assert!(
+        harness.control.get_agent_metadata(child).is_none(),
+        "spawn registry must be released even when terminal persist stays failed"
+    );
+    assert_no_agent_terminals(&harness, &started.team_session_id).await;
+    assert!(
+        !harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty(),
+        "persistent store failure is not auto-recovered"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_no_agent_terminals(&harness, &started.team_session_id).await;
+    assert!(
+        !restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty(),
+        "durable active may remain after bounded persist attempts end"
+    );
+}
+
+#[tokio::test]
+async fn acp_spawn_cancel_after_durable_commit_before_observe_records_one_interrupted_terminal() {
+    let harness = acp_spawn_harness().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.team().hold_next_bind_after_durable_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_external_agent_with_communication(
+                config,
+                crate::agent::role::ExternalAgentBackend {
+                    harness: "cursor".into(),
+                    model: Some("cursor-model".into()),
+                    effort: None,
+                },
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker_acp").expect("path"),
+                    Vec::new(),
+                    "ACP delegation".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                thread_spawn_source(parent_thread_id, "worker", "/root/worker_acp"),
+                None,
+                Some(pending),
+                |_| async {},
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("ACP spawn should block after durable commit")
+        .expect("indeterminate-commit hold entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    let thread_id = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled ACP spawn should not wait indefinitely");
+    assert!(
+        join.is_err(),
+        "ACP spawn future must keep the cancel outcome"
+    );
+    drop(hold);
+
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    wait_until_external_gone(&harness, thread_id).await;
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn acp_inherited_binding_cancel_before_attach_commit_cleans_up_without_terminal() {
+    let harness = acp_spawn_harness().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    harness
+        .control
+        .team()
+        .bind_agent_before_start(parent_thread_id.to_string(), pending)
+        .await
+        .expect("parent inherited binding");
+    let (hold, entered) = harness.control.team().hold_next_bind_before_attach_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_external_agent_with_communication(
+                config,
+                crate::agent::role::ExternalAgentBackend {
+                    harness: "cursor".into(),
+                    model: Some("cursor-model".into()),
+                    effort: None,
+                },
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker_acp").expect("path"),
+                    Vec::new(),
+                    "ACP inherited".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                thread_spawn_source(parent_thread_id, "worker", "/root/worker_acp"),
+                None,
+                None,
+                |_| async {},
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("inherited ACP spawn should block before attach commit")
+        .expect("pre-commit hold entered");
+    let agent_thread_id = wait_for_registered_external_agent(&harness).await;
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled inherited ACP spawn should not wait indefinitely");
+    assert!(
+        join.is_err(),
+        "inherited ACP spawn future must keep the cancel outcome"
+    );
+    drop(hold);
+
+    wait_until_external_gone(&harness, agent_thread_id).await;
+    assert_no_agent_terminals(&harness, &started.team_session_id).await;
+    let status = harness
+        .control
+        .team()
+        .status(&started.team_session_id)
+        .await
+        .expect("status");
+    assert_eq!(status.agents.len(), 1);
+    assert_eq!(
+        status.agents[0].agent_thread_id,
+        parent_thread_id.to_string()
+    );
+    assert_eq!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn native_spawn_unobserved_commit_serializes_concurrent_team_mutation() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let (hold, entered) = harness.control.team().hold_next_bind_after_durable_commit();
+    let spawn_control = harness.control.clone();
+    let config = harness.config.clone();
+    let task = tokio::spawn(async move {
+        spawn_control
+            .spawn_agent_with_communication(
+                config,
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::try_from("/root/worker").expect("path"),
+                    Vec::new(),
+                    "do the work".into(),
+                    /*trigger_turn*/ true,
+                ),
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+                Some(thread_spawn_source(
+                    parent_thread_id,
+                    "worker",
+                    "/root/worker",
+                )),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    pending_team_binding: Some(pending),
+                    ..SpawnAgentOptions::default()
+                },
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("spawn should block after durable commit")
+        .expect("indeterminate-commit hold entered");
+    let agent_thread_id = wait_for_attached_agent(&harness, &started.team_session_id).await;
+    let child = ThreadId::from_string(&agent_thread_id).expect("thread id");
+    task.abort();
+    let join = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled spawn should not wait indefinitely");
+    assert!(join.is_err(), "spawn future must keep the cancel outcome");
+
+    let mutate_control = harness.control.clone();
+    let team_session_id = started.team_session_id.clone();
+    let mutate = tokio::spawn(async move {
+        mutate_control
+            .team()
+            .record_deviation(&team_session_id, "concurrent-after-unobserved-commit")
+            .await
+    });
+    drop(hold);
+    mutate.await.expect("mutate task").expect("deviation");
+
+    assert_eq!(
+        wait_for_terminal_statuses(&harness, &started.team_session_id).await,
+        ["interrupted"]
+    );
+    wait_until_thread_gone(&harness, child).await;
+    let events = load_team_events(&harness, &started.team_session_id).await;
+    let sequences: Vec<_> = events.iter().map(|event| event.sequence).collect();
+    let mut ordered = sequences.clone();
+    ordered.sort_unstable();
+    ordered.dedup();
+    assert_eq!(
+        sequences, ordered,
+        "concurrent mutation must not rewind or duplicate sequences: {sequences:?}"
+    );
+    assert_eq!(terminal_statuses(&events), ["interrupted"]);
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.kind == codex_team_runtime::TeamEventKind::DeviationRecorded })
+    );
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+    assert!(
+        restored_team_status(&harness, &started.team_session_id)
+            .await
+            .agents
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn successful_native_team_spawn_does_not_emit_premature_terminal() {
+    let harness = AgentControlHarness::new().await;
+    let (started, pending) = seed_sample_team(&harness).await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let spawned = harness
+        .control
+        .spawn_agent_with_communication(
+            harness.config.clone(),
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("path"),
+                Vec::new(),
+                "do the work".into(),
+                /*trigger_turn*/ true,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Spawn, parent_thread_id),
+            Some(thread_spawn_source(
+                parent_thread_id,
+                "worker",
+                "/root/worker",
+            )),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                pending_team_binding: Some(pending),
+                ..SpawnAgentOptions::default()
+            },
+        )
+        .await
+        .expect("native spawn");
+
+    let events = load_team_events(&harness, &started.team_session_id).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == codex_team_runtime::TeamEventKind::AgentAttached)
+    );
+    let terminal_count = terminal_statuses(&events).len();
+    assert!(
+        terminal_count <= 1,
+        "successful start must not append extra terminals: {events:?}"
+    );
+    harness
+        .control
+        .team()
+        .record_agent_terminal(&spawned.thread_id.to_string(), "completed")
+        .await
+        .expect("watcher-style terminal");
+    harness
+        .control
+        .team()
+        .record_agent_terminal(&spawned.thread_id.to_string(), "errored")
+        .await
+        .expect("duplicate terminal is ignored");
+    let after_events = load_team_events(&harness, &started.team_session_id).await;
+    let after = terminal_statuses(&after_events);
+    assert_eq!(after.len(), 1);
+    assert!(
+        harness
+            .control
+            .team()
+            .status(&started.team_session_id)
+            .await
+            .expect("status")
+            .agents
+            .is_empty()
+    );
+}
+
+fn sample_team_graph() -> codex_team_graph::TeamGraph {
+    let dto: codex_team_graph::TeamGraphToml = toml::from_str(
+        r#"
+schema_version = 1
+name = "sample"
+version = "1"
+description = "Sample team graph."
+start = "work"
+terminals = ["completed"]
+[[nodes]]
+id = "work"
+purpose = "Implement the candidate."
+role = "worker"
+prompt = "Implement the approved scope."
+completion = "A candidate exists."
+available_tools = ["spawn_agent", "record_team_result", "transition_team"]
+recommended_tools = ["spawn_agent"]
+[[nodes.transitions]]
+on = "candidate_ready"
+to = "completed"
+recommended = true
+guide = "Worker returned a candidate."
+[[nodes]]
+id = "completed"
+purpose = "Team finished."
+prompt = "Stop. The team is complete."
+completion = "The team session is closed."
+"#,
+    )
+    .expect("toml");
+    let graph = codex_team_graph::TeamGraph::try_from(dto).expect("graph");
+    codex_team_graph::validate_team_graph(&graph, &["worker".into()].into_iter().collect())
+        .expect("valid");
+    graph
 }

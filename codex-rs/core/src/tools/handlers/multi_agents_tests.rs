@@ -14,12 +14,16 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents_v2::FollowupAcpAgentHandler;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
+use crate::tools::handlers::multi_agents_v2::MessageAcpAgentHandler;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::handlers::team::TeamAgentToolHandler;
+use crate::tools::handlers::team::TeamLifecycleToolHandler;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
@@ -252,6 +256,23 @@ async fn spawn_agent_rejects_empty_message() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel("Empty message can't be sent to an agent".to_string())
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_rejects_non_string_metadata() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({"message": "hello", "metadata": {"a": 1}})),
+    );
+    let Err(err) = SpawnAgentHandler::default().handle(invocation).await else {
+        panic!("non-string metadata should be rejected");
+    };
+    assert!(
+        matches!(err, FunctionCallError::RespondToModel(message) if message.contains("metadata"))
     );
 }
 
@@ -2574,6 +2595,71 @@ async fn send_input_reports_missing_agent() {
 }
 
 #[tokio::test]
+async fn v1_handlers_preserve_manager_failure_before_operation_or_team_guidance() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let agent_id = ThreadId::new();
+
+    let errors = [
+        expect_model_err(
+            SendInputHandler
+                .handle(invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "send_input",
+                    function_payload(json!({
+                        "target": agent_id.to_string(),
+                        "message": "hello"
+                    })),
+                ))
+                .await,
+            "send_input manager failure",
+        ),
+        expect_model_err(
+            CloseAgentHandler
+                .handle(invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "close_agent",
+                    function_payload(json!({"target": agent_id.to_string()})),
+                ))
+                .await,
+            "close_agent manager failure",
+        ),
+        expect_model_err(
+            ResumeAgentHandler
+                .handle(invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "resume_agent",
+                    function_payload(json!({"id": agent_id.to_string()})),
+                ))
+                .await,
+            "resume_agent manager failure",
+        ),
+        expect_model_err(
+            WaitAgentHandler::default()
+                .handle(invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "wait_agent",
+                    function_payload(json!({"targets": [agent_id.to_string()]})),
+                ))
+                .await,
+            "wait_agent manager failure",
+        ),
+    ];
+
+    for error in errors {
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel("collab manager unavailable".to_string())
+        );
+    }
+}
+
+#[tokio::test]
 async fn send_input_interrupts_before_prompt() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -2708,6 +2794,83 @@ async fn resume_agent_reports_missing_agent() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(format!("agent with id {agent_id} not found"))
+    );
+}
+
+#[tokio::test]
+async fn resume_agent_preserves_stored_history_failure() {
+    use std::io::Write;
+
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let thread = manager
+        .resume_thread_with_history(
+            turn.config.as_ref().clone(),
+            InitialHistory::Forked(vec![RolloutItem::ResponseItem(
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "materialized".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            )]),
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+        )
+        .await
+        .expect("start stored thread");
+    let agent_id = thread.thread_id;
+    let rollout_path = thread
+        .thread
+        .rollout_path()
+        .expect("stored thread should have rollout path");
+    manager
+        .agent_control()
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown stored thread");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(rollout_path)
+        .expect("open rollout for corruption")
+        .write_all(&[0xff])
+        .expect("corrupt stored history");
+
+    let error = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::new(session),
+                Arc::new(turn),
+                "resume_agent",
+                function_payload(json!({"id": agent_id.to_string()})),
+            ))
+            .await,
+        "resume_agent history failure",
+    );
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("expected model error");
+    };
+    assert!(
+        message.starts_with("collab tool failed: Fatal error:"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("failed to read stored thread"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !message.contains("not found"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !message.contains("team_session_id"),
+        "unexpected error: {message}"
     );
 }
 
@@ -3903,7 +4066,10 @@ async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
     let (mut session, mut turn) = make_session_and_context().await;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
     let mut config = (*turn.config).clone();
+    config.codex_home = temp_dir.path().to_path_buf().try_into().unwrap();
+    config.sqlite = codex_state::SqliteConfig::from_sqlite_home(config.codex_home.clone());
     config.multi_agent_v2.max_concurrent_threads_per_session = 2;
     config
         .features
@@ -4236,7 +4402,10 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 #[tokio::test]
 async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed() {
     let (_session, turn) = make_session_and_context().await;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
     let mut config = turn.config.as_ref().clone();
+    config.codex_home = temp_dir.path().to_path_buf().try_into().unwrap();
+    config.sqlite = codex_state::SqliteConfig::from_sqlite_home(config.codex_home.clone());
     config.agent_max_depth = 3;
     config
         .features
@@ -4599,4 +4768,2581 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .set_permission_profile(environment_permission_profile)
         .expect("permission profile set");
     assert_eq!(config, expected);
+}
+
+fn sample_team_catalog() -> codex_team_graph::TeamGraphCatalog {
+    let dto: codex_team_graph::TeamGraphToml = toml::from_str(
+        r#"
+schema_version = 1
+name = "sample"
+version = "1"
+description = "Sample team graph."
+start = "work"
+terminals = ["completed"]
+[[nodes]]
+id = "work"
+purpose = "Implement the candidate."
+role = "worker"
+prompt = "Implement the approved scope."
+completion = "A candidate exists."
+available_tools = ["spawn_agent", "send_message", "wait", "record_team_result", "transition_team"]
+recommended_tools = ["spawn_agent"]
+[[nodes.transitions]]
+on = "candidate_ready"
+to = "completed"
+recommended = true
+guide = "Worker returned a candidate."
+[[nodes]]
+id = "completed"
+purpose = "Team finished."
+prompt = "Stop. The team is complete."
+completion = "The team session is closed."
+"#,
+    )
+    .expect("toml");
+    let graph = codex_team_graph::TeamGraph::try_from(dto).expect("graph");
+    codex_team_graph::validate_team_graph(&graph, &["worker".into()].into_iter().collect())
+        .expect("valid");
+    codex_team_graph::TeamGraphCatalog::new([graph])
+}
+
+async fn prepare_v1_session() -> (crate::session::session::Session, TurnContext, ThreadManager) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .disable(Feature::MultiAgentV2)
+        .expect("disable v2");
+    config.features.enable(Feature::Collab).expect("enable v1");
+    set_turn_config(&mut turn, config);
+    (session, turn, manager)
+}
+
+async fn prepare_v2_session() -> (crate::session::session::Session, TurnContext, ThreadManager) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    set_turn_config(&mut turn, config);
+    (session, turn, manager)
+}
+
+async fn prepare_registry_v2_session() -> (
+    crate::session::session::Session,
+    TurnContext,
+    codex_team_runtime::RecordingSink,
+) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    set_turn_config(&mut turn, config);
+    let sink = codex_team_runtime::RecordingSink::default();
+    let team = Arc::new(codex_team_runtime::TeamControl::with_memory_store(
+        sample_team_catalog(),
+        sink.clone(),
+    ));
+    session.services.agent_control = crate::agent::control::AgentControl::with_team_for_tests(team);
+    (session, turn, sink)
+}
+
+fn build_registry_router(
+    session: &crate::session::session::Session,
+    turn: Arc<TurnContext>,
+) -> (
+    crate::tools::router::ToolRouter,
+    Arc<crate::session::step_context::StepContext>,
+) {
+    let step_context = StepContext::for_test(turn);
+    let step_store = codex_extension_api::ExtensionData::new("team-registry-test");
+    let router = crate::tools::spec_plan::build_tool_router(
+        session,
+        step_context.turn.as_ref(),
+        &step_context.environments,
+        &step_context.mcp,
+        false,
+        &step_store,
+        None,
+    )
+    .expect("build Team registry");
+    (router, step_context)
+}
+
+async fn dispatch_registry_tool(
+    router: &crate::tools::router::ToolRouter,
+    session: Arc<crate::session::session::Session>,
+    step_context: Arc<StepContext>,
+    tool_name: codex_tools::ToolName,
+    call_id: &str,
+    payload: ToolPayload,
+) -> Result<crate::tools::registry::AnyToolResult, FunctionCallError> {
+    router
+        .dispatch_tool_call_with_code_mode_result(
+            session,
+            step_context,
+            CancellationToken::new(),
+            Arc::new(Mutex::new(TurnDiffTracker::default())),
+            crate::tools::router::ToolCall {
+                tool_name,
+                call_id: call_id.to_string(),
+                payload,
+                encrypted_function_args: None,
+            },
+            crate::tools::context::ToolCallSource::Direct,
+        )
+        .await
+}
+
+fn operation_events<'a>(
+    events: &'a [codex_team_runtime::TeamEventEnvelope],
+    call_id: &str,
+) -> Vec<&'a codex_team_runtime::TeamEventEnvelope> {
+    events
+        .iter()
+        .filter(|event| {
+            event
+                .payload
+                .get("call_id")
+                .and_then(|value| value.as_str())
+                == Some(call_id)
+        })
+        .collect()
+}
+
+fn expect_registry_err(
+    result: Result<crate::tools::registry::AnyToolResult, FunctionCallError>,
+    context: &str,
+) -> FunctionCallError {
+    match result {
+        Ok(_) => panic!("{context}: expected registry dispatch error"),
+        Err(error) => error,
+    }
+}
+
+struct RegistryGenericTeamTraceHandler;
+
+impl crate::tools::registry::ToolExecutor<ToolInvocation> for RegistryGenericTeamTraceHandler {
+    fn tool_name(&self) -> codex_tools::ToolName {
+        codex_tools::ToolName::plain("registry_generic_probe")
+    }
+
+    fn spec(&self) -> codex_tools::ToolSpec {
+        codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: "registry_generic_probe".to_string(),
+            description: "Registry lifecycle probe.".to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::default(),
+            output_schema: None,
+        })
+    }
+
+    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async {
+            Ok(boxed_tool_output(
+                crate::tools::context::FunctionToolOutput::from_text("ok".to_string(), Some(true)),
+            ))
+        })
+    }
+}
+
+impl crate::tools::registry::CoreToolRuntime for RegistryGenericTeamTraceHandler {}
+
+async fn start_sample_team(
+    session: &crate::session::session::Session,
+) -> codex_team_runtime::TeamSessionId {
+    let team = session.services.agent_control.team();
+    team.replace_catalog(sample_team_catalog()).await;
+    let started = team
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("issue/1".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("start team");
+    team.start_node(codex_team_runtime::StartNodeCommand {
+        team_session_id: started.team_session_id.clone(),
+        node_id: None,
+        expected_revision: started.revision,
+    })
+    .await
+    .expect("start node");
+    started.team_session_id
+}
+
+fn register_external_target(
+    session: &crate::session::session::Session,
+    task_name: &str,
+) -> ThreadId {
+    let agent_id = ThreadId::new();
+    let agent_path = AgentPath::root()
+        .join(task_name)
+        .expect("external agent path");
+    session
+        .services
+        .agent_control
+        .register_external_agent_for_tests(agent_id, agent_path);
+    agent_id
+}
+
+async fn bind_agent_to_team(
+    session: &crate::session::session::Session,
+    team_session_id: &codex_team_runtime::TeamSessionId,
+    agent_id: ThreadId,
+) {
+    let team = session.services.agent_control.team();
+    let pending = team
+        .pending_binding_for_node(team_session_id, "worker")
+        .await
+        .expect("pending Team binding");
+    team.bind_agent_before_start(agent_id.to_string(), pending)
+        .await
+        .expect("bind Team agent");
+}
+
+async fn invoke_team_agent_delivery(
+    session: Arc<crate::session::session::Session>,
+    turn: Arc<TurnContext>,
+    capability: codex_team_graph::ToolCapability,
+    team_session_id: &codex_team_runtime::TeamSessionId,
+    target: ThreadId,
+    message: &str,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    TeamAgentToolHandler::new(capability)
+        .handle(invocation(
+            session,
+            turn,
+            capability.as_str(),
+            function_payload(json!({
+                "team_session_id": team_session_id,
+                "target": target.to_string(),
+                "message": message,
+            })),
+        ))
+        .await
+}
+
+async fn invoke_acp_delivery(
+    session: Arc<crate::session::session::Session>,
+    turn: Arc<TurnContext>,
+    tool_name: &str,
+    target: &str,
+    message: &str,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    let invocation = invocation(
+        session,
+        turn,
+        tool_name,
+        function_payload(json!({"target": target, "message": message})),
+    );
+    match tool_name {
+        "send_message" => MessageAcpAgentHandler.handle(invocation).await,
+        "followup_task" => FollowupAcpAgentHandler.handle(invocation).await,
+        _ => panic!("unsupported ACP delivery tool"),
+    }
+}
+
+fn assert_v2_team_tool_guidance(err: FunctionCallError, team_tool: &str) {
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected model-facing error");
+    };
+    assert!(
+        message.contains(team_tool),
+        "error should name {team_tool}: {message}"
+    );
+    assert!(
+        message.contains("team_session_id"),
+        "error should require team_session_id: {message}"
+    );
+}
+
+fn assert_v1_team_delegation_guidance(
+    err: FunctionCallError,
+    v1_tool: &str,
+    is_close_or_resume: bool,
+) {
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected model-facing error");
+    };
+    assert!(
+        message.contains(v1_tool),
+        "error should name {v1_tool}: {message}"
+    );
+    assert!(
+        message.contains("unbound root coordinator"),
+        "error should guide delegating to unbound root coordinator: {message}"
+    );
+    assert!(
+        message.contains("multi_agent_v2"),
+        "error should mention multi_agent_v2: {message}"
+    );
+    assert!(
+        message.contains("team_session_id"),
+        "error should require team_session_id: {message}"
+    );
+    assert!(
+        !message.contains("team.spawn_agent")
+            && !message.contains("team.send_message")
+            && !message.contains("team.followup_agent")
+            && !message.contains("team.wait")
+            && !message.contains("team.interrupt_agent"),
+        "error must not guide calling team.* directly in v1: {message}"
+    );
+    if is_close_or_resume {
+        assert!(
+            message.contains("has no equivalent Team operation"),
+            "error should state no equivalent Team operation: {message}"
+        );
+    }
+}
+
+fn expect_model_err(
+    result: Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError>,
+    context: &str,
+) -> FunctionCallError {
+    match result {
+        Ok(_) => panic!("{context}: expected a model-facing error"),
+        Err(err) => err,
+    }
+}
+
+#[tokio::test]
+async fn raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let open_team = expect_model_err(
+        SpawnAgentHandlerV2::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "spawn_agent",
+                function_payload(json!({"task_name": "worker", "message": "do work"})),
+            ))
+            .await,
+        "unbound root with open Team",
+    );
+    assert_v2_team_tool_guidance(open_team, "team.spawn_agent");
+
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(session.thread_id.to_string(), pending)
+        .await
+        .expect("bind caller");
+
+    let bound_caller = expect_model_err(
+        SpawnAgentHandlerV2::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "spawn_agent",
+                function_payload(json!({"task_name": "child", "message": "do work"})),
+            ))
+            .await,
+        "Team-bound child raw spawn",
+    );
+    assert_v2_team_tool_guidance(bound_caller, "team.spawn_agent");
+}
+
+#[tokio::test]
+async fn raw_collaboration_allows_unbound_caller_and_target() {
+    let (session, _turn, _manager) = prepare_v2_session().await;
+    let caller = session.thread_id.to_string();
+    reject_unbound_raw_spawn_when_teams_open(&session, &caller, "collaboration.spawn_agent")
+        .await
+        .expect("no open Team");
+    reject_team_bound_raw_collaboration(&session, &caller, &[], RawCollaborationOp::Spawn)
+        .await
+        .expect("unbound spawn");
+    reject_team_bound_raw_collaboration(
+        &session,
+        &caller,
+        &[caller.as_str()],
+        RawCollaborationOp::SendMessage,
+    )
+    .await
+    .expect("unbound send");
+}
+
+#[tokio::test]
+async fn raw_delivery_checks_persisted_binding_before_any_mutation() {
+    let dir = tempfile::tempdir().expect("Team store tempdir");
+    let target = ThreadId::new();
+    let seed = codex_team_runtime::TeamControl::for_codex_home(
+        dir.path(),
+        codex_team_runtime::RecordingSink::default(),
+    );
+    seed.replace_catalog(sample_team_catalog()).await;
+    let started = seed
+        .start_team(codex_team_runtime::StartTeamCommand {
+            graph_name: "sample".into(),
+            task_ref: Some("persistent-raw-guard".into()),
+            worktree: None,
+            branch: None,
+        })
+        .await
+        .expect("seed Team");
+    seed.start_node(codex_team_runtime::StartNodeCommand {
+        team_session_id: started.team_session_id.clone(),
+        node_id: None,
+        expected_revision: started.revision,
+    })
+    .await
+    .expect("seed node");
+    let pending = seed
+        .pending_binding_for_node(&started.team_session_id, "worker")
+        .await
+        .expect("seed binding");
+    seed.bind_agent_before_start(target.to_string(), pending)
+        .await
+        .expect("persist target binding");
+    drop(seed);
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    set_turn_config(&mut turn, config);
+    let restored = Arc::new(codex_team_runtime::TeamControl::for_codex_home(
+        dir.path(),
+        codex_team_runtime::RecordingSink::default(),
+    ));
+    restored.replace_catalog(sample_team_catalog()).await;
+    let control = crate::agent::control::AgentControl::with_team_for_tests(restored);
+    control.register_external_agent_for_tests(
+        target,
+        AgentPath::root()
+            .join("persisted_target")
+            .expect("target path"),
+    );
+    session.services.agent_control = control;
+    let session = Arc::new(session);
+    let result = SendMessageHandlerV2
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::new(turn),
+            "send_message",
+            function_payload(json!({
+                "target": "persisted_target",
+                "message": "must not queue",
+            })),
+        ))
+        .await;
+    let error = expect_model_err(result, "persisted target binding");
+    assert_v2_team_tool_guidance(error, "team.send_message");
+    assert!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target)
+            .is_empty(),
+        "checked restore must reject before queue mutation"
+    );
+}
+
+#[tokio::test]
+async fn raw_guard_propagates_restore_failure_instead_of_treating_caller_as_unbound() {
+    let dir = tempfile::tempdir().expect("Team store tempdir");
+    let blocked_home = dir.path().join("not-a-directory");
+    std::fs::write(&blocked_home, b"blocks sqlite parent").expect("create blocking file");
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable v2");
+    set_turn_config(&mut turn, config);
+    let team = Arc::new(codex_team_runtime::TeamControl::for_codex_home(
+        &blocked_home,
+        codex_team_runtime::RecordingSink::default(),
+    ));
+    session.services.agent_control = crate::agent::control::AgentControl::with_team_for_tests(team);
+
+    let error = expect_model_err(
+        WaitAgentHandlerV2::default()
+            .handle(invocation(
+                Arc::new(session),
+                Arc::new(turn),
+                "wait_agent",
+                function_payload(json!({"timeout_ms": 0})),
+            ))
+            .await,
+        "restore failure",
+    );
+    assert!(
+        error.to_string().contains("team store failed"),
+        "restore error must remain authoritative: {error}"
+    );
+}
+
+#[tokio::test]
+async fn acp_delivery_allows_unbound_agents_and_preserves_send_and_followup_semantics() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let send_target = register_external_target(&session, "send_target");
+    let followup_target = register_external_target(&session, "followup_target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    invoke_acp_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "send_message",
+        &send_target.to_string(),
+        "queued payload",
+    )
+    .await
+    .expect("unbound ACP send");
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(send_target),
+        vec!["queued payload".to_string()]
+    );
+
+    invoke_acp_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "followup_task",
+        &followup_target.to_string(),
+        "activate payload",
+    )
+    .await
+    .expect("unbound ACP followup");
+    let (_, generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(followup_target)
+        .expect("followup target lifecycle");
+    assert_eq!(generation, 1, "followup must activate one generation");
+}
+
+#[tokio::test]
+async fn acp_delivery_rejects_bound_caller_for_unbound_target_without_mutation() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let target = register_external_target(&session, "unbound_target");
+    bind_agent_to_team(&session, &team_session_id, session.thread_id).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    for tool_name in ["send_message", "followup_task"] {
+        let err = expect_model_err(
+            invoke_acp_delivery(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                tool_name,
+                &target.to_string(),
+                "must reject",
+            )
+            .await,
+            "bound caller must not use raw ACP delivery",
+        );
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected model-facing Team boundary error");
+        };
+        assert!(message.contains("unbound root coordinator"), "{message}");
+        assert!(message.contains(&format!("acp.{tool_name}")), "{message}");
+        assert!(!message.contains("team_session_id="), "{message}");
+    }
+    assert!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target)
+            .is_empty()
+    );
+    let (_, generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target)
+        .expect("target lifecycle");
+    assert_eq!(generation, 0, "rejection must not activate the target");
+}
+
+#[tokio::test]
+async fn acp_delivery_uses_target_team_authority_for_bound_same_and_cross_team_targets() {
+    for cross_team in [false, true] {
+        let (session, turn, _manager) = prepare_v2_session().await;
+        let caller_team = start_sample_team(&session).await;
+        let target_team = if cross_team {
+            start_sample_team(&session).await
+        } else {
+            caller_team.clone()
+        };
+        let target = register_external_target(&session, "bound_target");
+        bind_agent_to_team(&session, &caller_team, session.thread_id).await;
+        bind_agent_to_team(&session, &target_team, target).await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+
+        for (tool_name, team_tool) in [
+            ("send_message", "team.send_message"),
+            ("followup_task", "team.followup_agent"),
+        ] {
+            let err = expect_model_err(
+                invoke_acp_delivery(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    tool_name,
+                    &target.to_string(),
+                    "must reject",
+                )
+                .await,
+                "Team-bound target must reject raw ACP delivery",
+            );
+            let FunctionCallError::RespondToModel(message) = err else {
+                panic!("expected model-facing Team boundary error");
+            };
+            assert!(message.contains(team_tool), "{message}");
+            assert!(
+                message.contains(&format!("team_session_id={target_team}")),
+                "target Team must own the operation: {message}"
+            );
+            if cross_team {
+                assert!(
+                    !message.contains(&format!("team_session_id={caller_team}")),
+                    "caller Team must not override target authority: {message}"
+                );
+            }
+        }
+        assert!(
+            session
+                .services
+                .agent_control
+                .external_queued_message_contents_for_tests(target)
+                .is_empty()
+        );
+        let (_, generation) = session
+            .services
+            .agent_control
+            .external_lifecycle_status_for_tests(target)
+            .expect("target lifecycle");
+        assert_eq!(generation, 0, "rejection must not activate the target");
+    }
+}
+
+#[tokio::test]
+async fn acp_delivery_keeps_unknown_target_lookup_error_ahead_of_team_guidance() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    bind_agent_to_team(&session, &team_session_id, session.thread_id).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    for tool_name in ["send_message", "followup_task"] {
+        let err = expect_model_err(
+            invoke_acp_delivery(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                tool_name,
+                "missing-external-agent",
+                "must keep lookup error",
+            )
+            .await,
+            "unknown target must fail lookup",
+        );
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("lookup should stay model-facing");
+        };
+        assert!(!message.contains("team."), "{message}");
+        assert!(!message.contains("unbound root coordinator"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn team_delivery_enforces_bound_caller_team_before_external_mutation() {
+    use codex_team_graph::ToolCapability;
+
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    let target_a_send = register_external_target(&session, "team_a_send");
+    let target_a_followup = register_external_target(&session, "team_a_followup");
+    let target_b_send = register_external_target(&session, "team_b_send");
+    let target_b_followup = register_external_target(&session, "team_b_followup");
+    bind_agent_to_team(&session, &team_a, target_a_send).await;
+    bind_agent_to_team(&session, &team_a, target_a_followup).await;
+    bind_agent_to_team(&session, &team_b, target_b_send).await;
+    bind_agent_to_team(&session, &team_b, target_b_followup).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    // An unbound root coordinator can operate an explicitly selected Team.
+    invoke_team_agent_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        ToolCapability::SendMessage,
+        &team_b,
+        target_b_send,
+        "root queue",
+    )
+    .await
+    .expect("unbound root explicit Team send");
+    invoke_team_agent_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        ToolCapability::FollowupAgent,
+        &team_b,
+        target_b_followup,
+        "root activate",
+    )
+    .await
+    .expect("unbound root explicit Team followup");
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_b_send),
+        vec!["root queue".to_string()]
+    );
+    let (_, root_generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target_b_followup)
+        .expect("root followup lifecycle");
+    assert_eq!(root_generation, 1);
+
+    bind_agent_to_team(&session, &team_a, session.thread_id).await;
+
+    // A bound caller retains the same-Team send/followup path.
+    invoke_team_agent_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        ToolCapability::SendMessage,
+        &team_a,
+        target_a_send,
+        "same Team queue",
+    )
+    .await
+    .expect("same-Team send");
+    invoke_team_agent_delivery(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        ToolCapability::FollowupAgent,
+        &team_a,
+        target_a_followup,
+        "same Team activate",
+    )
+    .await
+    .expect("same-Team followup");
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_a_send),
+        vec!["same Team queue".to_string()]
+    );
+    let (_, same_team_generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target_a_followup)
+        .expect("same-Team followup lifecycle");
+    assert_eq!(same_team_generation, 1);
+
+    let b_send_before = session
+        .services
+        .agent_control
+        .external_queued_message_contents_for_tests(target_b_send);
+    let b_followup_before = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target_b_followup)
+        .expect("Team B lifecycle before rejection");
+    for (capability, target) in [
+        (ToolCapability::SendMessage, target_b_send),
+        (ToolCapability::FollowupAgent, target_b_followup),
+    ] {
+        let error = expect_model_err(
+            invoke_team_agent_delivery(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                capability,
+                &team_b,
+                target,
+                "cross Team reject",
+            )
+            .await,
+            "bound Team A caller must not select Team B",
+        );
+        assert!(matches!(
+            error,
+            FunctionCallError::RespondToModel(message)
+                if message.contains("team session") && message.contains("another team")
+        ));
+    }
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_b_send),
+        b_send_before
+    );
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_lifecycle_status_for_tests(target_b_followup),
+        Some(b_followup_before)
+    );
+}
+
+#[tokio::test]
+async fn registry_routes_team_lifecycle_after_semantic_authority_and_keeps_generic_tools() {
+    use codex_team_graph::ToolCapability;
+
+    let (session, turn, sink) = prepare_registry_v2_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    let target_a = register_external_target(&session, "registry_target_a");
+    let target_b_send = register_external_target(&session, "registry_target_b_send");
+    let target_b_followup = register_external_target(&session, "registry_target_b_followup");
+    bind_agent_to_team(&session, &team_a, target_a).await;
+    bind_agent_to_team(&session, &team_b, target_b_send).await;
+    bind_agent_to_team(&session, &team_b, target_b_followup).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let (router, step_context) = build_registry_router(session.as_ref(), Arc::clone(&turn));
+
+    dispatch_registry_tool(
+        &router,
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        codex_tools::ToolName::namespaced("team", ToolCapability::SendMessage.as_str()),
+        "root-send-b",
+        function_payload(json!({
+            "team_session_id": team_b,
+            "target": target_b_send.to_string(),
+            "message": "root queue",
+        })),
+    )
+    .await
+    .expect("unbound root Team B send through registry");
+    dispatch_registry_tool(
+        &router,
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        codex_tools::ToolName::namespaced("team", ToolCapability::FollowupAgent.as_str()),
+        "root-followup-b",
+        function_payload(json!({
+            "team_session_id": team_b,
+            "target": target_b_followup.to_string(),
+            "message": "root activate",
+        })),
+    )
+    .await
+    .expect("unbound root Team B followup through registry");
+
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_b_send),
+        vec!["root queue".to_string()]
+    );
+    let (_, generation) = session
+        .services
+        .agent_control
+        .external_lifecycle_status_for_tests(target_b_followup)
+        .expect("followup target lifecycle");
+    assert_eq!(generation, 1);
+    for call_id in ["root-send-b", "root-followup-b"] {
+        let events = sink.envelopes();
+        let operation = operation_events(&events, call_id);
+        assert_eq!(
+            operation
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_operation_started", "tool_operation_completed"]
+        );
+        assert!(
+            operation
+                .iter()
+                .all(|event| event.team_session_id == team_b)
+        );
+        assert!(operation[0].sequence < operation[1].sequence);
+    }
+
+    let failure = expect_registry_err(
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            codex_tools::ToolName::namespaced("team", ToolCapability::SendMessage.as_str()),
+            "root-send-b-failed",
+            function_payload(json!({
+                "team_session_id": team_b,
+                "target": "missing-registry-target",
+                "message": "fail after authority",
+            })),
+        )
+        .await,
+        "unknown target fails after Team authority",
+    );
+    assert!(!failure.to_string().is_empty());
+    let events = sink.envelopes();
+    let failure_events = operation_events(&events, "root-send-b-failed");
+    assert_eq!(
+        failure_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tool_operation_started", "tool_operation_failed"]
+    );
+    assert!(
+        failure_events
+            .iter()
+            .all(|event| event.team_session_id == team_b)
+    );
+
+    bind_agent_to_team(&session, &team_a, session.thread_id).await;
+    let same_team_start = sink.envelopes().len();
+    dispatch_registry_tool(
+        &router,
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        codex_tools::ToolName::namespaced("team", ToolCapability::SendMessage.as_str()),
+        "bound-send-a",
+        function_payload(json!({
+            "team_session_id": team_a,
+            "target": target_a.to_string(),
+            "message": "same Team",
+        })),
+    )
+    .await
+    .expect("bound Team A send");
+    let events = sink.envelopes();
+    assert_eq!(
+        events[same_team_start..]
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "tool_operation_started",
+            "deviation_recorded",
+            "tool_operation_completed",
+        ],
+        "deprecated same-Team dispatch records lifecycle start before deviation and completes after delivery"
+    );
+    assert_eq!(
+        session
+            .services
+            .agent_control
+            .external_queued_message_contents_for_tests(target_a),
+        vec!["same Team".to_string()],
+        "semantic delivery completed between the deviation and terminal lifecycle"
+    );
+    let same_team_events = operation_events(&events, "bound-send-a");
+    assert_eq!(same_team_events.len(), 2);
+    assert!(
+        same_team_events
+            .iter()
+            .all(|event| event.team_session_id == team_a)
+    );
+
+    let same_team_wait_start = sink.envelopes().len();
+    dispatch_registry_tool(
+        &router,
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        codex_tools::ToolName::namespaced("team", ToolCapability::Wait.as_str()),
+        "bound-wait-a",
+        function_payload(json!({
+            "team_session_id": team_a,
+            "target": target_a.to_string(),
+            "timeout_ms": 1,
+            "reason": "same-Team semantic ordering",
+        })),
+    )
+    .await
+    .expect("bound Team A wait");
+    let events = sink.envelopes();
+    assert_eq!(
+        events[same_team_wait_start..]
+            .iter()
+            .map(|event| event.kind.as_str())
+            .filter(|kind| {
+                matches!(
+                    *kind,
+                    "tool_operation_started"
+                        | "deviation_recorded"
+                        | "agent_wait_entered"
+                        | "agent_wait_resolved"
+                        | "tool_operation_completed"
+                        | "tool_operation_failed"
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            "tool_operation_started",
+            "deviation_recorded",
+            "agent_wait_entered",
+            "agent_wait_resolved",
+            "tool_operation_completed",
+        ],
+        "deprecated same-Team dispatch records semantic events between deviation and terminal"
+    );
+
+    let before_cross = sink.envelopes();
+    expect_registry_err(
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            codex_tools::ToolName::namespaced("team", ToolCapability::SendMessage.as_str()),
+            "cross-send-b",
+            function_payload(json!({
+                "team_session_id": team_b,
+                "target": target_b_send.to_string(),
+                "message": "must reject",
+            })),
+        )
+        .await,
+        "bound Team A cannot select Team B",
+    );
+    let after_cross = sink.envelopes();
+    assert!(operation_events(&after_cross, "cross-send-b").is_empty());
+    assert_eq!(before_cross.len(), after_cross.len());
+
+    let before_raw = sink.envelopes();
+    expect_registry_err(
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            codex_tools::ToolName::namespaced("collaboration", "send_message"),
+            "raw-bound-send",
+            function_payload(json!({
+                "target": target_b_send.to_string(),
+                "message": "must reject raw",
+            })),
+        )
+        .await,
+        "raw collaboration rejects Team-bound caller and target",
+    );
+    let after_raw = sink.envelopes();
+    assert!(operation_events(&after_raw, "raw-bound-send").is_empty());
+    assert_eq!(before_raw.len(), after_raw.len());
+
+    for (call_id, tool_name, payload) in [
+        (
+            "catalog-read",
+            codex_tools::ToolName::namespaced("team", ToolCapability::ListTeamGraphs.as_str()),
+            function_payload(json!({})),
+        ),
+        (
+            "team-list",
+            codex_tools::ToolName::namespaced("team", ToolCapability::ListTeams.as_str()),
+            function_payload(json!({})),
+        ),
+    ] {
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            tool_name,
+            call_id,
+            payload,
+        )
+        .await
+        .expect("non-scoped Team read");
+        let events = sink.envelopes();
+        assert!(operation_events(&events, call_id).is_empty());
+    }
+    expect_registry_err(
+        dispatch_registry_tool(
+            &router,
+            Arc::clone(&session),
+            Arc::clone(&step_context),
+            codex_tools::ToolName::namespaced("team", ToolCapability::StartTeam.as_str()),
+            "bound-start-rejected",
+            function_payload(json!({"graph_name": "sample"})),
+        )
+        .await,
+        "bound caller cannot start Team",
+    );
+    let events = sink.envelopes();
+    assert!(operation_events(&events, "bound-start-rejected").is_empty());
+
+    let generic_registry =
+        crate::tools::registry::ToolRegistry::from_tools([
+            Arc::new(RegistryGenericTeamTraceHandler)
+                as Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        ]);
+    generic_registry
+        .dispatch_any_with_terminal_outcome(
+            ToolInvocation {
+                call_id: "generic-bound-tool".to_string(),
+                tool_name: codex_tools::ToolName::plain("registry_generic_probe"),
+                ..invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "registry_generic_probe",
+                    function_payload(json!({})),
+                )
+            },
+            None,
+        )
+        .await
+        .expect("ordinary caller-bound tool keeps generic Team trace");
+    let events = sink.envelopes();
+    let generic_events = operation_events(&events, "generic-bound-tool");
+    assert_eq!(
+        generic_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tool_operation_started", "tool_operation_completed"]
+    );
+    assert!(
+        generic_events
+            .iter()
+            .all(|event| event.team_session_id == team_a)
+    );
+}
+
+#[tokio::test]
+async fn registry_cancellation_terminalizes_handler_owned_team_tool_after_semantic_mutation() {
+    use codex_team_graph::ToolCapability;
+
+    let (session, turn, sink) = prepare_registry_v2_session().await;
+    let team = start_sample_team(&session).await;
+    let target = register_external_target(&session, "registry_cancel_target");
+    bind_agent_to_team(&session, &team, target).await;
+    bind_agent_to_team(&session, &team, session.thread_id).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let (router, step_context) = build_registry_router(session.as_ref(), Arc::clone(&turn));
+    let step_context = step_context.with_tool_router_for_test(Arc::new(router));
+    let runtime = crate::tools::parallel::ToolCallRuntime::new(
+        Arc::clone(&session),
+        step_context,
+        Arc::new(Mutex::new(TurnDiffTracker::default())),
+    );
+    let cancellation = CancellationToken::new();
+    let call_id = "cancel-team-wait";
+    let event_start = sink.envelopes().len();
+    let mut response_task = tokio::spawn(runtime.handle_tool_call(
+        crate::tools::router::ToolCall {
+            tool_name: codex_tools::ToolName::namespaced("team", ToolCapability::Wait.as_str()),
+            call_id: call_id.to_string(),
+            payload: function_payload(json!({
+                "team_session_id": team,
+                "target": target.to_string(),
+                "timeout_ms": 30_000,
+                "reason": "cancellation boundary",
+            })),
+            encrypted_function_args: None,
+        },
+        cancellation.clone(),
+    ));
+
+    let entered_wait = timeout(Duration::from_secs(2), async {
+        loop {
+            if sink
+                .envelopes()
+                .iter()
+                .skip(event_start)
+                .any(|event| event.kind == "agent_wait_entered")
+            {
+                break true;
+            }
+            if response_task.is_finished() {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if matches!(entered_wait, Ok(false)) {
+        panic!(
+            "Team wait finished before its semantic mutation: {:?}",
+            (&mut response_task).await
+        );
+    }
+    assert!(
+        matches!(entered_wait, Ok(true)),
+        "real Team wait should reach its semantic mutation; events: {:?}",
+        sink.envelopes()
+            .iter()
+            .skip(event_start)
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>()
+    );
+    cancellation.cancel();
+
+    let response = timeout(Duration::from_secs(2), response_task)
+        .await
+        .expect("cancelled registry dispatch should finish")
+        .expect("registry task should join")
+        .expect("cancellation returns a model-visible abort response");
+    let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+        panic!("cancelled Team tool should return function output");
+    };
+    assert!(
+        output
+            .body
+            .to_text()
+            .is_some_and(|text| text.contains("aborted by user"))
+    );
+
+    let events = sink.envelopes();
+    let cancellation_events = &events[event_start..];
+    assert_eq!(
+        cancellation_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "tool_operation_started",
+            "deviation_recorded",
+            "agent_wait_entered",
+            "tool_operation_failed",
+        ],
+        "the authorized target Team gets one failed terminal after mutation, without a generic duplicate"
+    );
+    let operation = operation_events(cancellation_events, call_id);
+    assert_eq!(operation.len(), 2);
+    assert_eq!(
+        operation
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tool_operation_started", "tool_operation_failed"]
+    );
+    assert!(operation.iter().all(|event| event.team_session_id == team));
+}
+
+#[tokio::test]
+async fn bound_team_caller_cannot_escape_through_any_team_tool_class() {
+    use codex_team_graph::ToolCapability;
+
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    bind_agent_to_team(&session, &team_a, session.thread_id).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let team_a_before = session
+        .services
+        .agent_control
+        .team()
+        .status(&team_a)
+        .await
+        .expect("Team A before authority probes");
+    let team_b_before = session
+        .services
+        .agent_control
+        .team()
+        .status(&team_b)
+        .await
+        .expect("Team B before authority probes");
+
+    let agent_capabilities = [
+        ToolCapability::SpawnAgent,
+        ToolCapability::SendMessage,
+        ToolCapability::FollowupAgent,
+        ToolCapability::Wait,
+        ToolCapability::InterruptAgent,
+        ToolCapability::ListAgents,
+    ];
+    let lifecycle_capabilities = [
+        ToolCapability::GetTeamStatus,
+        ToolCapability::StartTeamNode,
+        ToolCapability::RecordTeamResult,
+        ToolCapability::GetTeamNext,
+        ToolCapability::TransitionTeam,
+        ToolCapability::EndTeam,
+        ToolCapability::RecordEvidence,
+        ToolCapability::InvalidateEvidence,
+        ToolCapability::ReuseEvidence,
+    ];
+
+    for capability in agent_capabilities {
+        let result = TeamAgentToolHandler::new(capability)
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                capability.as_str(),
+                function_payload(json!({"team_session_id": team_b.as_str()})),
+            ))
+            .await;
+        expect_model_err(result, capability.as_str());
+    }
+    for capability in lifecycle_capabilities {
+        let result = TeamLifecycleToolHandler::new(capability)
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                capability.as_str(),
+                function_payload(json!({"team_session_id": team_b.as_str()})),
+            ))
+            .await;
+        expect_model_err(result, capability.as_str());
+    }
+
+    let start_error = expect_model_err(
+        TeamLifecycleToolHandler::new(ToolCapability::StartTeam)
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                ToolCapability::StartTeam.as_str(),
+                function_payload(json!({"graph_name": "sample"})),
+            ))
+            .await,
+        "bound caller must not start another Team",
+    );
+    assert!(matches!(
+        start_error,
+        FunctionCallError::RespondToModel(message)
+            if message.contains("unbound root coordinator")
+    ));
+
+    let list_payload = function_payload(json!({}));
+    let listed = TeamLifecycleToolHandler::new(ToolCapability::ListTeams)
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            ToolCapability::ListTeams.as_str(),
+            list_payload.clone(),
+        ))
+        .await
+        .expect("bound caller may list its own Team");
+    let listed_json = listed.code_mode_result(&list_payload).to_string();
+    assert!(listed_json.contains(team_a.as_str()));
+    assert!(!listed_json.contains(team_b.as_str()));
+
+    for (team_id, before) in [(&team_a, team_a_before), (&team_b, team_b_before)] {
+        let after = session
+            .services
+            .agent_control
+            .team()
+            .status(team_id)
+            .await
+            .expect("Team after authority probes");
+        assert_eq!(
+            after.revision, before.revision,
+            "authority probes must not mutate or trace Team state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_message_followup_and_interrupt_reject_bound_caller_or_target() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let target = ThreadId::new();
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(target.to_string(), pending)
+        .await
+        .expect("bind target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let target = target.to_string();
+
+    for (handler_name, payload, expected_tool) in [
+        (
+            "send_message",
+            json!({"target": target, "message": "hello"}),
+            "team.send_message",
+        ),
+        (
+            "followup_task",
+            json!({"target": target, "message": "continue"}),
+            "team.followup_agent",
+        ),
+        (
+            "interrupt_agent",
+            json!({"target": target}),
+            "team.interrupt_agent",
+        ),
+    ] {
+        let invocation = invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            handler_name,
+            function_payload(payload),
+        );
+        let err = match handler_name {
+            "send_message" => expect_model_err(
+                SendMessageHandlerV2.handle(invocation).await,
+                "bound target send",
+            ),
+            "followup_task" => expect_model_err(
+                FollowupTaskHandlerV2.handle(invocation).await,
+                "bound target followup",
+            ),
+            _ => expect_model_err(
+                InterruptAgentHandler.handle(invocation).await,
+                "bound target interrupt",
+            ),
+        };
+        assert_v2_team_tool_guidance(err, expected_tool);
+    }
+}
+
+#[tokio::test]
+async fn raw_same_team_message_is_rejected_and_unknown_target_keeps_lookup_error() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let target = ThreadId::new();
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller");
+    let target_pending = team
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("target pending");
+    team.bind_agent_before_start(target.to_string(), target_pending)
+        .await
+        .expect("bind same-team target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let target = target.to_string();
+
+    let same_team = expect_model_err(
+        SendMessageHandlerV2
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_message",
+                function_payload(json!({"target": target, "message": "hello"})),
+            ))
+            .await,
+        "same-team raw send",
+    );
+    assert_v2_team_tool_guidance(same_team, "team.send_message");
+
+    let missing = expect_model_err(
+        SendMessageHandlerV2
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_message",
+                function_payload(json!({"target": "missing-agent", "message": "hello"})),
+            ))
+            .await,
+        "unknown target",
+    );
+    let FunctionCallError::RespondToModel(message) = missing else {
+        panic!("lookup should stay model-facing");
+    };
+    assert!(
+        !message.contains("team.send_message"),
+        "unknown target must keep the existing lookup error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn raw_wait_rejects_bound_caller_and_multi_target_atomically() {
+    let (session, turn, _manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(session.thread_id.to_string(), pending)
+        .await
+        .expect("bind caller");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let bound_wait = expect_model_err(
+        WaitAgentHandlerV2::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({})),
+            ))
+            .await,
+        "bound caller wait",
+    );
+    assert_v2_team_tool_guidance(bound_wait, "team.wait");
+
+    let (unbound_session, unbound_turn, unbound_manager) = prepare_v2_session().await;
+    let team_session_id = start_sample_team(&unbound_session).await;
+    let bound_target = ThreadId::new();
+    let unbound_thread = unbound_manager
+        .start_thread(StartThreadOptions::new((*unbound_turn.config).clone()))
+        .await
+        .expect("start unbound thread");
+    let unbound_target = unbound_thread.thread_id;
+    let pending = unbound_session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending target");
+    unbound_session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(bound_target.to_string(), pending)
+        .await
+        .expect("bind one wait target");
+    let multi = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::new(unbound_session),
+                Arc::new(unbound_turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [bound_target.to_string(), unbound_target.to_string()]
+                })),
+            ))
+            .await,
+        "multi-target wait",
+    );
+    assert_v1_team_delegation_guidance(multi, "multi_agent_v1.wait_agent", false);
+}
+
+#[tokio::test]
+async fn v1_raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let open_team = expect_model_err(
+        SpawnAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "spawn_agent",
+                function_payload(json!({"message": "do work"})),
+            ))
+            .await,
+        "unbound root with open Team",
+    );
+    assert_v1_team_delegation_guidance(open_team, "multi_agent_v1.spawn_agent", false);
+
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(session.thread_id.to_string(), pending)
+        .await
+        .expect("bind caller");
+
+    let bound_caller = expect_model_err(
+        SpawnAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "spawn_agent",
+                function_payload(json!({"message": "do work"})),
+            ))
+            .await,
+        "Team-bound child raw spawn",
+    );
+    assert_v1_team_delegation_guidance(bound_caller, "multi_agent_v1.spawn_agent", false);
+}
+
+#[tokio::test]
+async fn v1_send_input_rejects_bound_caller_or_target_for_send_and_interrupt() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let same_team_target = ThreadId::new();
+    let cross_team = start_sample_team(&session).await;
+    let cross_target = ThreadId::new();
+    let team = session.services.agent_control.team();
+    let same_pending = team
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("same pending");
+    team.bind_agent_before_start(same_team_target.to_string(), same_pending)
+        .await
+        .expect("bind same-team target");
+    let cross_pending = team
+        .pending_binding_for_node(&cross_team, "worker")
+        .await
+        .expect("cross pending");
+    team.bind_agent_before_start(cross_target.to_string(), cross_pending)
+        .await
+        .expect("bind cross-team target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let same_send = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": same_team_target.to_string(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "same-team send_input",
+    );
+    assert_v1_team_delegation_guidance(same_send, "multi_agent_v1.send_input", false);
+
+    let cross_interrupt = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": cross_target.to_string(),
+                    "message": "stop",
+                    "interrupt": true
+                })),
+            ))
+            .await,
+        "cross-team interrupt send_input",
+    );
+    assert_v1_team_delegation_guidance(cross_interrupt, "multi_agent_v1.send_input", false);
+}
+
+#[tokio::test]
+async fn v1_close_and_resume_reject_team_bound_without_bypass() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let target = ThreadId::new();
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(target.to_string(), pending)
+        .await
+        .expect("bind target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let close = expect_model_err(
+        CloseAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "close_agent",
+                function_payload(json!({"target": target.to_string()})),
+            ))
+            .await,
+        "bound close_agent",
+    );
+    assert_v1_team_delegation_guidance(close, "multi_agent_v1.close_agent", true);
+
+    let resume = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "resume_agent",
+                function_payload(json!({"id": target.to_string()})),
+            ))
+            .await,
+        "bound resume_agent",
+    );
+    assert_v1_team_delegation_guidance(resume, "multi_agent_v1.resume_agent", true);
+}
+
+#[tokio::test]
+async fn v1_wait_rejects_bound_caller_and_bound_target() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_session_id = start_sample_team(&session).await;
+    let bound_target = ThreadId::new();
+    let pending = session
+        .services
+        .agent_control
+        .team()
+        .pending_binding_for_node(&team_session_id, "worker")
+        .await
+        .expect("pending");
+    session
+        .services
+        .agent_control
+        .team()
+        .bind_agent_before_start(bound_target.to_string(), pending)
+        .await
+        .expect("bind target");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let bound_target_wait = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [bound_target.to_string()]
+                })),
+            ))
+            .await,
+        "bound target wait_agent v1",
+    );
+    assert_v1_team_delegation_guidance(bound_target_wait, "multi_agent_v1.wait_agent", false);
+}
+
+#[tokio::test]
+async fn v1_raw_ops_keep_unknown_target_and_allow_unbound_success_path() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let caller = session.thread_id.to_string();
+    reject_unbound_raw_spawn_when_teams_open_v1(&session, &caller)
+        .await
+        .expect("no open Team");
+    reject_team_bound_raw_collaboration_v1(&session, &caller, &[], V1RawOp::Spawn)
+        .await
+        .expect("unbound spawn");
+    reject_team_bound_raw_collaboration_v1(
+        &session,
+        &caller,
+        &[caller.as_str()],
+        V1RawOp::SendInput,
+    )
+    .await
+    .expect("unbound send");
+    reject_team_bound_raw_collaboration_v1(&session, &caller, &[caller.as_str()], V1RawOp::Close)
+        .await
+        .expect("unbound close");
+    reject_team_bound_raw_collaboration_v1(&session, &caller, &[caller.as_str()], V1RawOp::Resume)
+        .await
+        .expect("unbound resume");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let missing = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": ThreadId::new().to_string(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "unknown target",
+    );
+    let FunctionCallError::RespondToModel(message) = missing else {
+        panic!("lookup should stay model-facing");
+    };
+    assert!(
+        !message.contains("multi_agent_v2") && !message.contains("unbound root coordinator"),
+        "unknown target must keep the existing lookup error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn tool_plan_hides_team_tools_in_v1_and_exposes_team_tools_in_v2() {
+    let (v1_session, v1_turn, _manager) = prepare_v1_session().await;
+    let step_store = codex_extension_api::ExtensionData::new("test");
+    let v1_turn = Arc::new(v1_turn);
+    let v1_step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&v1_turn));
+    let v1_router = crate::tools::spec_plan::build_tool_router(
+        &v1_session,
+        &v1_turn,
+        &v1_step_context.environments,
+        &v1_step_context.mcp,
+        false,
+        &step_store,
+        None,
+    )
+    .expect("v1 router");
+
+    let v1_visible = v1_router.model_visible_specs();
+    assert!(
+        !v1_visible.iter().any(|spec| spec.name() == "team"),
+        "v1 must not expose team namespace: {v1_visible:?}"
+    );
+    assert!(
+        !v1_visible
+            .iter()
+            .any(|spec| spec.name().starts_with("team.")),
+        "v1 must not expose team.* tools: {v1_visible:?}"
+    );
+    assert!(
+        v1_visible
+            .iter()
+            .any(|spec| spec.name() == MULTI_AGENT_V1_NAMESPACE),
+        "v1 must expose multi_agent_v1 namespace: {v1_visible:?}"
+    );
+    assert!(
+        !v1_router
+            .registered_tool_names_for_test()
+            .iter()
+            .any(|name| name.name.starts_with("team.") || name.name == "team"),
+        "v1 must not register team tools"
+    );
+
+    let (v2_session, v2_turn, _manager) = prepare_v2_session().await;
+    let step_store = codex_extension_api::ExtensionData::new("test");
+    let v2_turn = Arc::new(v2_turn);
+    let v2_step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&v2_turn));
+    let v2_router = crate::tools::spec_plan::build_tool_router(
+        &v2_session,
+        &v2_turn,
+        &v2_step_context.environments,
+        &v2_step_context.mcp,
+        false,
+        &step_store,
+        None,
+    )
+    .expect("v2 router");
+
+    let v2_visible = v2_router.model_visible_specs();
+    assert!(
+        !v2_visible
+            .iter()
+            .any(|spec| spec.name() == MULTI_AGENT_V1_NAMESPACE),
+        "v2 must not expose multi_agent_v1 namespace: {v2_visible:?}"
+    );
+    let team_spec = v2_visible
+        .iter()
+        .find(|spec| spec.name() == "team")
+        .expect("v2 unbound root must expose team namespace");
+    let codex_tools::ToolSpec::Namespace(team_namespace) = team_spec else {
+        panic!("team spec must be a namespace tool");
+    };
+    let team_function_names = team_namespace
+        .tools
+        .iter()
+        .map(|tool| match tool {
+            codex_tools::ResponsesApiNamespaceTool::Function(f) => f.name.as_str(),
+            codex_tools::ResponsesApiNamespaceTool::Custom(c) => c.name.as_str(),
+        })
+        .collect::<Vec<_>>();
+    assert!(team_function_names.contains(&"spawn_agent"));
+    assert!(team_function_names.contains(&"send_message"));
+    assert!(team_function_names.contains(&"followup_agent"));
+    assert!(team_function_names.contains(&"wait"));
+    assert!(team_function_names.contains(&"interrupt_agent"));
+    assert!(team_function_names.contains(&"list_agents"));
+    assert!(team_function_names.contains(&"list_team_graphs"));
+    assert!(team_function_names.contains(&"list_teams"));
+    assert!(team_function_names.contains(&"start_team"));
+    assert!(team_function_names.contains(&"get_team_status"));
+}
+
+#[tokio::test]
+async fn v1_target_ops_follow_target_team_binding_authority_from_different_caller_team() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    let target_b = ThreadId::new();
+
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller to team A");
+
+    let target_pending = team
+        .pending_binding_for_node(&team_b, "worker")
+        .await
+        .expect("target pending");
+    team.bind_agent_before_start(target_b.to_string(), target_pending)
+        .await
+        .expect("bind target to team B");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let target_b_str = target_b.to_string();
+
+    // 1. send_input targeting B from caller in A -> authority must be Team B
+    let send_err = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": target_b_str.clone(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "send_input A->B",
+    );
+    let FunctionCallError::RespondToModel(msg) = send_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_b}")),
+        "send_input must reference target's team_b: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "send_input must not reference caller's team_a: {msg}"
+    );
+    assert!(msg.contains("multi_agent_v1.send_input"));
+    assert!(msg.contains("unbound root coordinator"));
+    assert!(msg.contains("multi_agent_v2"));
+
+    // 2. wait_agent targeting B from caller in A -> authority must be Team B
+    let wait_err = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [target_b_str.clone()]
+                })),
+            ))
+            .await,
+        "wait_agent A->B",
+    );
+    let FunctionCallError::RespondToModel(msg) = wait_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_b}")),
+        "wait_agent must reference target's team_b: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "wait_agent must not reference caller's team_a: {msg}"
+    );
+    assert!(msg.contains("multi_agent_v1.wait_agent"));
+
+    // 3. close_agent targeting B from caller in A -> authority must be Team B and state no equivalent
+    let close_err = expect_model_err(
+        CloseAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "close_agent",
+                function_payload(json!({
+                    "target": target_b_str.clone()
+                })),
+            ))
+            .await,
+        "close_agent A->B",
+    );
+    let FunctionCallError::RespondToModel(msg) = close_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_b}")),
+        "close_agent must reference target's team_b: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "close_agent must not reference caller's team_a: {msg}"
+    );
+    assert!(msg.contains("has no equivalent Team operation"));
+    assert!(msg.contains("multi_agent_v1.close_agent"));
+
+    // 4. resume_agent targeting B from caller in A -> authority must be Team B and state no equivalent
+    let resume_err = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "resume_agent",
+                function_payload(json!({
+                    "id": target_b_str
+                })),
+            ))
+            .await,
+        "resume_agent A->B",
+    );
+    let FunctionCallError::RespondToModel(msg) = resume_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_b}")),
+        "resume_agent must reference target's team_b: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "resume_agent must not reference caller's team_a: {msg}"
+    );
+    assert!(msg.contains("has no equivalent Team operation"));
+    assert!(msg.contains("multi_agent_v1.resume_agent"));
+}
+
+#[tokio::test]
+async fn v1_wait_splits_multi_team_targets_with_explicit_stable_ids() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_1 = start_sample_team(&session).await;
+    let team_2 = start_sample_team(&session).await;
+    let target_1 = ThreadId::new();
+    let target_2 = ThreadId::new();
+
+    let team = session.services.agent_control.team();
+    let pending_1 = team
+        .pending_binding_for_node(&team_1, "worker")
+        .await
+        .expect("pending 1");
+    team.bind_agent_before_start(target_1.to_string(), pending_1)
+        .await
+        .expect("bind target 1");
+
+    let pending_2 = team
+        .pending_binding_for_node(&team_2, "worker")
+        .await
+        .expect("pending 2");
+    team.bind_agent_before_start(target_2.to_string(), pending_2)
+        .await
+        .expect("bind target 2");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let mut sorted_teams = vec![team_1.clone(), team_2.clone()];
+    sorted_teams.sort();
+
+    let multi_wait = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [target_2.to_string(), target_1.to_string()]
+                })),
+            ))
+            .await,
+        "multi-team wait_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = multi_wait else {
+        panic!("expected model err");
+    };
+
+    assert!(
+        msg.contains("splitting targets per Team"),
+        "multi-team wait must guide splitting targets per Team: {msg}"
+    );
+    assert!(
+        msg.contains("multi_agent_v2"),
+        "multi-team wait must mention multi_agent_v2: {msg}"
+    );
+    assert!(
+        msg.contains("unbound root coordinator"),
+        "multi-team wait must mention unbound root coordinator: {msg}"
+    );
+    assert!(
+        msg.contains("multi_agent_v1.wait_agent"),
+        "multi-team wait must mention multi_agent_v1.wait_agent: {msg}"
+    );
+    let expected_guidance = format!(
+        "team_session_id={}, team_session_id={}",
+        sorted_teams[0], sorted_teams[1]
+    );
+    assert!(
+        msg.contains(&expected_guidance),
+        "multi-team wait must list explicit IDs in stable sorted order: expected '{expected_guidance}', got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn v1_bound_caller_to_unbound_target_guides_to_unbound_root_raw_without_fabricated_team_id() {
+    let (session, turn, manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let unbound_thread = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("start unbound target thread");
+    let unbound_target = unbound_thread.thread_id.to_string();
+
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    // 1. send_input: bound caller -> unbound target
+    let send_err = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": unbound_target.clone(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "bound caller to unbound send_input",
+    );
+    let FunctionCallError::RespondToModel(msg) = send_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("Delegate non-Team raw operations to an unbound root coordinator using multi_agent_v1.send_input"),
+        "guidance should route to unbound root raw without fabricating team id: {msg}"
+    );
+    assert!(
+        !msg.contains("team_session_id"),
+        "must not fabricate team_session_id for unbound target: {msg}"
+    );
+    assert!(
+        !msg.contains(team_a.as_str()),
+        "must not attribute unbound target to caller's team_a: {msg}"
+    );
+
+    // 2. wait_agent: bound caller -> unbound target
+    let wait_err = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [unbound_target.clone()]
+                })),
+            ))
+            .await,
+        "bound caller to unbound wait_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = wait_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("Delegate non-Team raw operations to an unbound root coordinator using multi_agent_v1.wait_agent"),
+        "guidance should route to unbound root raw without fabricating team id: {msg}"
+    );
+    assert!(
+        !msg.contains("team_session_id"),
+        "must not fabricate team_session_id for unbound target: {msg}"
+    );
+
+    // 3. close_agent: bound caller -> unbound target (unbound is root raw possible)
+    let close_err = expect_model_err(
+        CloseAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "close_agent",
+                function_payload(json!({
+                    "target": unbound_target.clone()
+                })),
+            ))
+            .await,
+        "bound caller to unbound close_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = close_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("Delegate non-Team raw operations to an unbound root coordinator using multi_agent_v1.close_agent"),
+        "unbound close should route to root raw operation: {msg}"
+    );
+    assert!(
+        !msg.contains("team_session_id"),
+        "must not fabricate team_session_id for unbound target: {msg}"
+    );
+
+    // 4. resume_agent: bound caller -> unbound target (unbound is root raw possible)
+    let resume_err = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "resume_agent",
+                function_payload(json!({
+                    "id": unbound_target
+                })),
+            ))
+            .await,
+        "bound caller to unbound resume_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = resume_err else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("Delegate non-Team raw operations to an unbound root coordinator using multi_agent_v1.resume_agent"),
+        "unbound resume should route to root raw operation: {msg}"
+    );
+    assert!(
+        !msg.contains("team_session_id"),
+        "must not fabricate team_session_id for unbound target: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn v1_mixed_targets_split_into_team_managed_and_unbound_raw() {
+    let (session, turn, manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let bound_target = ThreadId::new();
+    let unbound_thread = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("start unbound target thread");
+    let unbound_target = unbound_thread.thread_id;
+
+    let team = session.services.agent_control.team();
+    let pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("pending");
+    team.bind_agent_before_start(bound_target.to_string(), pending)
+        .await
+        .expect("bind target");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let mixed_wait = expect_model_err(
+        crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "wait_agent",
+                function_payload(json!({
+                    "targets": [bound_target.to_string(), unbound_target.to_string()]
+                })),
+            ))
+            .await,
+        "mixed targets wait_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = mixed_wait else {
+        panic!("expected model err");
+    };
+
+    assert!(
+        msg.contains(
+            "splitting into Team-managed operations using multi_agent_v2 Team tools with explicit"
+        ),
+        "mixed wait must guide splitting into Team-managed and unbound raw: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("team_session_id={team_a}")),
+        "mixed wait must include bound target's team_a: {msg}"
+    );
+    assert!(
+        msg.contains("unbound raw operations using multi_agent_v1.wait_agent"),
+        "mixed wait must include unbound raw guidance: {msg}"
+    );
+    assert!(
+        msg.contains("unbound root coordinator"),
+        "mixed wait must mention unbound root coordinator: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn v1_bound_caller_to_unknown_targets_yield_lookup_error_or_not_found() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let unknown_target = ThreadId::new();
+    let unknown_target_str = unknown_target.to_string();
+
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    // 1. send_input: bound caller -> unknown target must yield lookup error, not team guidance
+    let send_err = expect_model_err(
+        SendInputHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_input",
+                function_payload(json!({
+                    "target": unknown_target_str.clone(),
+                    "message": "hello"
+                })),
+            ))
+            .await,
+        "bound caller to unknown send_input",
+    );
+    let FunctionCallError::RespondToModel(send_msg) = send_err else {
+        panic!("expected model err");
+    };
+    assert_eq!(
+        send_msg,
+        format!("agent with id {unknown_target} not found"),
+        "send_input to unknown agent must return exact not found error"
+    );
+    assert!(
+        !send_msg.contains("multi_agent_v2")
+            && !send_msg.contains("team_session_id")
+            && !send_msg.contains("unbound root coordinator"),
+        "send_input must not contain team guidance: {send_msg}"
+    );
+
+    // 2. close_agent: bound caller -> unknown target must yield lookup error, not team guidance
+    let close_err = expect_model_err(
+        CloseAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "close_agent",
+                function_payload(json!({
+                    "target": unknown_target_str.clone()
+                })),
+            ))
+            .await,
+        "bound caller to unknown close_agent",
+    );
+    let FunctionCallError::RespondToModel(close_msg) = close_err else {
+        panic!("expected model err");
+    };
+    assert_eq!(
+        close_msg,
+        format!("agent with id {unknown_target} not found"),
+        "close_agent to unknown agent must return exact not found error"
+    );
+    assert!(
+        !close_msg.contains("multi_agent_v2")
+            && !close_msg.contains("team_session_id")
+            && !close_msg.contains("unbound root coordinator"),
+        "close_agent must not contain team guidance: {close_msg}"
+    );
+
+    // 3. resume_agent: bound caller -> unknown target must yield lookup error, not team guidance
+    let resume_err = expect_model_err(
+        ResumeAgentHandler
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "resume_agent",
+                function_payload(json!({
+                    "id": unknown_target_str.clone()
+                })),
+            ))
+            .await,
+        "bound caller to unknown resume_agent",
+    );
+    let FunctionCallError::RespondToModel(resume_msg) = resume_err else {
+        panic!("expected model err");
+    };
+    assert_eq!(
+        resume_msg,
+        format!("agent with id {unknown_target} not found"),
+        "resume_agent to unknown agent must return exact not found error"
+    );
+    assert!(
+        !resume_msg.contains("multi_agent_v2")
+            && !resume_msg.contains("team_session_id")
+            && !resume_msg.contains("unbound root coordinator"),
+        "resume_agent must not contain team guidance: {resume_msg}"
+    );
+
+    // 4. wait_agent: bound caller -> unknown target must succeed with NotFound status, not team guidance
+    let wait_output = crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "wait_agent",
+            function_payload(json!({
+                "targets": [unknown_target_str.clone()]
+            })),
+        ))
+        .await
+        .expect("wait_agent on unknown target should succeed with NotFound status");
+    let (content, _success) = expect_text_output(wait_output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        wait::WaitAgentResult {
+            status: HashMap::from([(unknown_target_str.clone(), AgentStatus::NotFound)]),
+            timed_out: false,
+        }
+    );
+}
+
+#[tokio::test]
+async fn v1_multi_wait_partially_unknown_is_atomic_without_team_guidance() {
+    let (session, turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&session).await;
+    let team_b = start_sample_team(&session).await;
+    let bound_target_b = ThreadId::new();
+    let unknown_target = ThreadId::new();
+
+    let team = session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller to team A");
+
+    let target_pending = team
+        .pending_binding_for_node(&team_b, "worker")
+        .await
+        .expect("target pending");
+    team.bind_agent_before_start(bound_target_b.to_string(), target_pending)
+        .await
+        .expect("bind target to team B");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    // Multi wait containing both bound target B and an unknown target:
+    // Because 1 target is unknown, existing lookup takes precedence atomically; no Team guidance is returned.
+    let wait_output = crate::tools::handlers::multi_agents::WaitAgentHandler::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "wait_agent",
+            function_payload(json!({
+                "targets": [bound_target_b.to_string(), unknown_target.to_string()]
+            })),
+        ))
+        .await
+        .expect("wait_agent with partially unknown target should succeed with NotFound status for unknown");
+    let (content, _success) = expect_text_output(wait_output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result.status.get(&unknown_target.to_string()),
+        Some(&AgentStatus::NotFound),
+        "unknown target should have NotFound status"
+    );
+    assert!(
+        result.status.contains_key(&bound_target_b.to_string()),
+        "bound target should be present in statuses"
+    );
+}
+
+#[tokio::test]
+async fn v1_spawn_guidance_uses_caller_team_id_when_bound_and_open_team_when_unbound() {
+    // 1. Bound caller spawn -> uses caller's team_session_id
+    let (bound_session, bound_turn, _manager) = prepare_v1_session().await;
+    let team_a = start_sample_team(&bound_session).await;
+    let team = bound_session.services.agent_control.team();
+    let caller_pending = team
+        .pending_binding_for_node(&team_a, "worker")
+        .await
+        .expect("caller pending");
+    team.bind_agent_before_start(bound_session.thread_id.to_string(), caller_pending)
+        .await
+        .expect("bind caller");
+
+    let bound_spawn = expect_model_err(
+        SpawnAgentHandler::default()
+            .handle(invocation(
+                Arc::new(bound_session),
+                Arc::new(bound_turn),
+                "spawn_agent",
+                function_payload(json!({"message": "do work"})),
+            ))
+            .await,
+        "bound spawn_agent",
+    );
+    let FunctionCallError::RespondToModel(msg) = bound_spawn else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains(&format!("team_session_id={team_a}")),
+        "bound spawn must use caller's team_session_id: {msg}"
+    );
+    assert!(msg.contains("multi_agent_v1.spawn_agent"));
+    assert!(msg.contains("unbound root coordinator"));
+    assert!(msg.contains("multi_agent_v2"));
+
+    // 2. Unbound caller with open Team -> uses open team guard
+    let (unbound_session, unbound_turn, _manager) = prepare_v1_session().await;
+    let _open_team = start_sample_team(&unbound_session).await;
+    let open_spawn = expect_model_err(
+        SpawnAgentHandler::default()
+            .handle(invocation(
+                Arc::new(unbound_session),
+                Arc::new(unbound_turn),
+                "spawn_agent",
+                function_payload(json!({"message": "do work"})),
+            ))
+            .await,
+        "unbound spawn with open team",
+    );
+    let FunctionCallError::RespondToModel(msg) = open_spawn else {
+        panic!("expected model err");
+    };
+    assert!(
+        msg.contains("open Team sessions require delegating to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id"),
+        "open team spawn must give open team delegation guidance: {msg}"
+    );
+    assert!(
+        msg.contains("multi_agent_v1.spawn_agent cannot infer Team identity"),
+        "open team spawn must note that v1 spawn cannot infer Team identity: {msg}"
+    );
 }

@@ -1,5 +1,8 @@
 use super::AgentControl;
 use crate::agent::AgentStatus;
+use crate::agent::role::ACP_ROLE_NAME;
+use crate::external_subagent_hooks::ExternalSubagentHookIdentity;
+use crate::external_subagent_hooks::run_external_subagent_stop_hook;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::Event;
@@ -22,12 +25,25 @@ fn terminal_status(status: &AgentStatus) -> Option<SubAgentTerminalStatus> {
 #[derive(Default)]
 pub(super) struct TerminalStatusTracker {
     last_notified: Option<SubAgentTerminalStatus>,
+    last_external_generation: Option<u64>,
 }
 
 impl TerminalStatusTracker {
-    pub(super) fn should_notify(&mut self, status: &AgentStatus) -> bool {
+    pub(super) fn should_notify(
+        &mut self,
+        status: &AgentStatus,
+        external_generation: Option<u64>,
+    ) -> bool {
         match terminal_status(status) {
             Some(status) => {
+                if let Some(generation) = external_generation {
+                    if self.last_external_generation == Some(generation) {
+                        return false;
+                    }
+                    self.last_external_generation = Some(generation);
+                    self.last_notified = Some(status);
+                    return true;
+                }
                 if self.last_notified == Some(status) {
                     false
                 } else {
@@ -55,6 +71,22 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
     let Some(status) = terminal_status(status) else {
         return;
     };
+    let status_label = match status {
+        SubAgentTerminalStatus::Completed => "completed",
+        SubAgentTerminalStatus::Errored => "errored",
+        SubAgentTerminalStatus::Interrupted => "interrupted",
+    };
+    if let Err(error) = control
+        .team
+        .record_agent_terminal(&child_thread_id.to_string(), status_label)
+        .await
+    {
+        tracing::warn!(
+            %child_thread_id,
+            %error,
+            "Team terminal persistence failed before parent notification"
+        );
+    }
     let Some(metadata) = control.state.agent_metadata_for_thread(child_thread_id) else {
         return;
     };
@@ -77,6 +109,19 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
     let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
         return;
     };
+    let external_identity = control.external_agents.identity(child_thread_id);
+    let hook_identity = external_identity
+        .as_ref()
+        .map(|identity| ExternalSubagentHookIdentity {
+            agent_id: child_thread_id,
+            agent_type: metadata
+                .agent_role
+                .clone()
+                .unwrap_or_else(|| ACP_ROLE_NAME.to_string()),
+            harness: identity.harness.clone(),
+            model: identity.model.clone(),
+            metadata: None,
+        });
 
     let event = Event {
         id: child_thread_id.to_string(),
@@ -85,10 +130,23 @@ pub(super) async fn maybe_notify_parent_of_terminal_status(
             agent_path: Some(agent_path),
             agent_nickname: metadata.agent_nickname,
             agent_role: metadata.agent_role,
+            harness: external_identity
+                .as_ref()
+                .map(|identity| identity.harness.clone()),
+            model: external_identity.and_then(|identity| identity.model),
             status,
         }),
     };
     parent_thread.send_subagent_terminal_event(event).await;
+    if let Some(identity) = hook_identity {
+        let turn = parent_thread.session.new_default_turn().await;
+        Box::pin(run_external_subagent_stop_hook(
+            &parent_thread.session,
+            &turn,
+            identity,
+        ))
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -118,16 +176,25 @@ mod tests {
     #[test]
     fn interrupted_running_terminal_transitions_notify_once() {
         let mut tracker = TerminalStatusTracker::default();
-        assert!(tracker.should_notify(&AgentStatus::Interrupted));
-        assert!(!tracker.should_notify(&AgentStatus::Interrupted));
-        assert!(!tracker.should_notify(&AgentStatus::Running));
-        assert!(tracker.should_notify(&AgentStatus::Completed(None)));
-        assert!(!tracker.should_notify(&AgentStatus::Completed(None)));
-        assert!(tracker.should_notify(&AgentStatus::Errored("late".to_string())));
-        assert!(!tracker.should_notify(&AgentStatus::Errored("late".to_string())));
+        assert!(tracker.should_notify(&AgentStatus::Interrupted, None));
+        assert!(!tracker.should_notify(&AgentStatus::Interrupted, None));
+        assert!(!tracker.should_notify(&AgentStatus::Running, None));
+        assert!(tracker.should_notify(&AgentStatus::Completed(None), None));
+        assert!(!tracker.should_notify(&AgentStatus::Completed(None), None));
+        assert!(tracker.should_notify(&AgentStatus::Errored("late".to_string()), None));
+        assert!(!tracker.should_notify(&AgentStatus::Errored("late".to_string()), None));
 
-        tracker.should_notify(&AgentStatus::Running);
-        assert!(tracker.should_notify(&AgentStatus::Errored("late".to_string())));
-        assert!(!tracker.should_notify(&AgentStatus::Errored("late".to_string())));
+        tracker.should_notify(&AgentStatus::Running, None);
+        assert!(tracker.should_notify(&AgentStatus::Errored("late".to_string()), None));
+        assert!(!tracker.should_notify(&AgentStatus::Errored("late".to_string()), None));
+    }
+
+    #[test]
+    fn external_generation_distinguishes_terminal_lifecycles_without_running_observation() {
+        let mut tracker = TerminalStatusTracker::default();
+        assert!(tracker.should_notify(&AgentStatus::Completed(None), Some(1)));
+        assert!(!tracker.should_notify(&AgentStatus::Completed(None), Some(1)));
+        assert!(tracker.should_notify(&AgentStatus::Completed(None), Some(2)));
+        assert!(!tracker.should_notify(&AgentStatus::Completed(None), Some(2)));
     }
 }

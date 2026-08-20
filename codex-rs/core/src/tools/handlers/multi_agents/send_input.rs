@@ -43,6 +43,27 @@ impl Handler {
         let args: SendInputArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = parse_agent_id_target(&args.target)?;
         let input_items = parse_collab_input(args.message, args.items)?;
+        let caller_thread_id = session.thread_id.to_string();
+        let receiver_thread = receiver_thread_id.to_string();
+        if !session
+            .services
+            .agent_control
+            .is_agent_known(receiver_thread_id)
+            .await
+            .map_err(|err| collab_agent_error(receiver_thread_id, err))?
+        {
+            return Err(collab_agent_error(
+                receiver_thread_id,
+                CodexErr::ThreadNotFound(receiver_thread_id),
+            ));
+        }
+        reject_team_bound_raw_collaboration_v1(
+            &session,
+            &caller_thread_id,
+            &[receiver_thread.as_str()],
+            V1RawOp::SendInput,
+        )
+        .await?;
         let prompt = render_input_preview(&input_items);
         let receiver_agent = session
             .services
@@ -127,6 +148,10 @@ impl Handler {
 }
 
 impl CoreToolRuntime for Handler {
+    fn team_lifecycle_routing(&self) -> TeamLifecycleRouting {
+        TeamLifecycleRouting::HandlerOwned
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

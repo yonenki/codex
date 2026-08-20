@@ -50,8 +50,10 @@ use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::ReadThreadParams;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 use tokio::sync::watch;
 use tracing::warn;
@@ -61,6 +63,7 @@ pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
 use self::residency::V2Residency;
 
+mod attach_to_start;
 mod execution;
 mod external;
 mod legacy;
@@ -83,6 +86,8 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) root_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
     pub(crate) multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
+    pub(crate) metadata: Option<std::collections::BTreeMap<String, String>>,
+    pub(crate) pending_team_binding: Option<codex_team_runtime::PendingTeamBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +101,13 @@ pub(crate) struct LiveAgent {
 pub(crate) struct ListedAgent {
     pub(crate) agent_name: String,
     pub(crate) agent_status: AgentStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalBackendRoute {
+    role_name: String,
+    candidate_index: usize,
+    fallback_claimed: bool,
 }
 
 /// Control-plane handle for multi-agent operations.
@@ -117,10 +129,15 @@ pub(crate) struct AgentControl {
     thread_id_generator: ThreadIdGenerator,
     state: Arc<AgentRegistry>,
     external_agents: Arc<external::ExternalAgentManager>,
+    external_backend_routes: Arc<Mutex<HashMap<ThreadId, ExternalBackendRoute>>>,
+    external_completion_watchers: Arc<Mutex<HashSet<ThreadId>>>,
     v2_residency: Arc<V2Residency>,
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
     rollout_budget: Arc<RolloutBudget>,
+    team: Arc<codex_team_runtime::TeamControl>,
+    #[cfg(test)]
+    attach_to_start_test: Arc<attach_to_start::AttachToStartTestControl>,
 }
 
 impl Default for AgentControl {
@@ -138,11 +155,39 @@ impl AgentControl {
         self.external_agents.contains(agent_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn registered_external_agent_ids(&self) -> Vec<ThreadId> {
+        self.external_agents.registered_ids()
+    }
+
+    pub(crate) fn external_backend_identity(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<(String, Option<String>)> {
+        self.external_agents
+            .identity(agent_id)
+            .map(|identity| (identity.harness, identity.model))
+    }
+
     /// Construct a new `AgentControl` that can spawn/message agents via the given manager state.
     pub(crate) fn new(
         manager: Weak<ThreadManagerState>,
         thread_id_generator: ThreadIdGenerator,
         rollout_budget: Option<RolloutBudgetConfig>,
+    ) -> Self {
+        Self::with_team(
+            manager,
+            thread_id_generator,
+            rollout_budget,
+            Arc::new(codex_team_runtime::TeamControl::empty()),
+        )
+    }
+
+    pub(crate) fn with_team(
+        manager: Weak<ThreadManagerState>,
+        thread_id_generator: ThreadIdGenerator,
+        rollout_budget: Option<RolloutBudgetConfig>,
+        team: Arc<codex_team_runtime::TeamControl>,
     ) -> Self {
         let control = Self {
             session_id: SessionId::default(),
@@ -150,14 +195,24 @@ impl AgentControl {
             thread_id_generator,
             state: Arc::default(),
             external_agents: Arc::default(),
+            external_backend_routes: Arc::default(),
+            external_completion_watchers: Arc::default(),
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
+            team,
+            #[cfg(test)]
+            attach_to_start_test: Arc::default(),
         };
         if let Some(rollout_budget) = rollout_budget {
             control.rollout_budget.configure(rollout_budget);
         }
         control
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_team_for_tests(team: Arc<codex_team_runtime::TeamControl>) -> Self {
+        Self::with_team(Weak::default(), default_thread_id_generator(), None, team)
     }
 
     pub(crate) fn with_session_id(mut self, session_id: SessionId, max_threads: usize) -> Self {
@@ -170,8 +225,75 @@ impl AgentControl {
         self.session_id
     }
 
+    pub(crate) fn team(&self) -> &codex_team_runtime::TeamControl {
+        &self.team
+    }
+
+    pub(crate) fn team_handle(&self) -> Arc<codex_team_runtime::TeamControl> {
+        Arc::clone(&self.team)
+    }
+
     pub(crate) fn generate_thread_id(&self) -> ThreadId {
         (self.thread_id_generator)()
+    }
+
+    pub(crate) fn record_external_backend_route(
+        &self,
+        agent_id: ThreadId,
+        role_name: String,
+        candidate_index: usize,
+    ) {
+        self.external_backend_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                agent_id,
+                ExternalBackendRoute {
+                    role_name,
+                    candidate_index,
+                    fallback_claimed: false,
+                },
+            );
+    }
+
+    pub(crate) fn claim_next_external_backend_candidate(
+        &self,
+        agent_id: ThreadId,
+        role_name: &str,
+    ) -> CodexResult<usize> {
+        let mut routes = self
+            .external_backend_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let route = routes.get_mut(&agent_id).ok_or_else(|| {
+            CodexErr::UnsupportedOperation(
+                "fallback source was not spawned from an ACP backend pool".to_string(),
+            )
+        })?;
+        if route.role_name != role_name {
+            return Err(CodexErr::UnsupportedOperation(format!(
+                "fallback source uses agent_type '{}', not '{role_name}'",
+                route.role_name
+            )));
+        }
+        if route.fallback_claimed {
+            return Err(CodexErr::UnsupportedOperation(
+                "fallback source has already been consumed".to_string(),
+            ));
+        }
+        route.fallback_claimed = true;
+        Ok(route.candidate_index.saturating_add(1))
+    }
+
+    pub(crate) fn release_external_backend_fallback(&self, agent_id: ThreadId) {
+        if let Some(route) = self
+            .external_backend_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&agent_id)
+        {
+            route.fallback_claimed = false;
+        }
     }
 
     pub(crate) fn rollout_budget(&self) -> &RolloutBudget {
@@ -224,33 +346,14 @@ impl AgentControl {
         root_turn_id: Option<String>,
     ) -> CodexResult<String> {
         if self.external_agents.contains(agent_id) {
-            if communication.encrypted_content.is_some() {
-                return Err(CodexErr::UnsupportedOperation(
-                    "encrypted inter-agent messages are not supported by external agents"
-                        .to_string(),
-                ));
-            }
-            let communication_for_log =
-                crate::agent_communication::logging_enabled().then(|| communication.clone());
-            let result = self.external_agents.submit_message(
-                agent_id,
-                communication.content,
-                communication.trigger_turn,
-            );
-            if let (Some(communication), Ok((communication_id, _))) =
-                (communication_for_log, result.as_ref())
-            {
-                crate::agent_communication::emit_agent_communication_send(
-                    communication_id,
-                    &agent_communication_context,
-                    &communication,
+            let (communication_id, _) = self
+                .send_external_inter_agent_communication_with_start_hook(
                     agent_id,
-                );
-            }
-            let (communication_id, started_turn) = result?;
-            if started_turn {
-                self.maybe_start_external_completion_watcher(agent_id);
-            }
+                    communication,
+                    agent_communication_context,
+                    || std::future::ready(()),
+                )
+                .await?;
             return Ok(communication_id);
         }
         let state = self.upgrade()?;
@@ -268,6 +371,93 @@ impl AgentControl {
             root_turn_id,
         )
         .await
+    }
+
+    pub(crate) async fn send_external_inter_agent_communication_with_start_hook<F, Fut>(
+        &self,
+        agent_id: ThreadId,
+        communication: InterAgentCommunication,
+        agent_communication_context: AgentCommunicationContext,
+        on_started: F,
+    ) -> CodexResult<(String, bool)>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if !self.external_agents.contains(agent_id) {
+            return Err(CodexErr::ThreadNotFound(agent_id));
+        }
+        if communication.encrypted_content.is_some() {
+            return Err(CodexErr::UnsupportedOperation(
+                "encrypted inter-agent messages are not supported by external agents".to_string(),
+            ));
+        }
+        let communication_for_log =
+            crate::agent_communication::logging_enabled().then(|| communication.clone());
+        let submission = self.external_agents.submit_message(
+            agent_id,
+            communication.content,
+            communication.trigger_turn,
+        )?;
+        if let Some(communication) = communication_for_log {
+            crate::agent_communication::emit_agent_communication_send(
+                submission.submission_id(),
+                &agent_communication_context,
+                &communication,
+                agent_id,
+            );
+        }
+        let communication_id = submission.submission_id().to_string();
+        let requests_turn = submission.requests_turn();
+        if submission.starts_generation_now() {
+            on_started().await;
+            let _ = submission.start();
+        } else if requests_turn {
+            // 実行中の queued follow-up は次generationの予約にすぎない。
+            // Start は現turnのStopのあと、そのgenerationが実際に始まるときに出す。
+            submission.defer_start_hook(Box::new(move || Box::pin(on_started())));
+            if let Some(pending) = submission.start() {
+                pending.start().await;
+            }
+        } else {
+            let _ = submission.start();
+        }
+        if requests_turn {
+            self.maybe_start_external_completion_watcher(agent_id);
+        }
+        Ok((communication_id, requests_turn))
+    }
+
+    pub(super) async fn promote_ready_external_generation(&self, agent_id: ThreadId) {
+        if let Some(pending) = self.external_agents.take_ready_pending_start(agent_id) {
+            pending.start().await;
+        }
+    }
+
+    async fn confirm_external_terminal_and_promote(
+        &self,
+        child_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        child_agent_path: Option<AgentPath>,
+        status: &AgentStatus,
+        generation: Option<u64>,
+        forward_completion: bool,
+    ) {
+        if forward_completion && let Some(child_agent_path) = child_agent_path {
+            self.forward_v2_child_completion_to_parent(
+                child_thread_id,
+                parent_thread_id,
+                child_agent_path,
+                status,
+            )
+            .await;
+        }
+        if let Some(generation) = generation {
+            self.external_agents
+                .ack_terminal_observer(child_thread_id, generation);
+        }
+        self.promote_ready_external_generation(child_thread_id)
+            .await;
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -401,6 +591,127 @@ impl AgentControl {
         self.state
             .agent_metadata_for_thread(agent_id)
             .ok_or_else(|| CodexErr::ThreadNotFound(agent_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_external_agent_for_tests(
+        &self,
+        agent_id: ThreadId,
+        agent_path: AgentPath,
+    ) {
+        let mut reservation = self
+            .state
+            .reserve_spawn_slot(None)
+            .expect("reserve test external agent slot");
+        reservation
+            .reserve_agent_path(&agent_path)
+            .expect("reserve test external agent path");
+        reservation.commit(AgentMetadata {
+            agent_id: Some(agent_id),
+            agent_path: Some(agent_path),
+            agent_nickname: None,
+            agent_role: Some("worker".to_string()),
+            metadata: None,
+        });
+        self.external_agents.register_for_tests(
+            agent_id,
+            external::ExternalAgentIdentity {
+                harness: "test-harness".to_string(),
+                model: Some("test-model".to_string()),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_queued_message_contents_for_tests(
+        &self,
+        agent_id: ThreadId,
+    ) -> Vec<String> {
+        self.external_agents
+            .queued_message_contents_for_tests(agent_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_lifecycle_status_for_tests(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<(AgentStatus, u64)> {
+        self.external_agents.lifecycle_status(agent_id)
+    }
+
+    pub(crate) async fn is_agent_known(&self, agent_id: ThreadId) -> CodexResult<bool> {
+        if self.external_agents.contains(agent_id) {
+            return Ok(true);
+        }
+        if self.state.agent_metadata_for_thread(agent_id).is_some() {
+            return Ok(true);
+        }
+        if self
+            .team()
+            .binding_for_checked(&agent_id.to_string())
+            .await
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let state = self.upgrade()?;
+        match state.get_thread(agent_id).await {
+            Ok(_) => Ok(true),
+            Err(err)
+                if matches!(
+                    err.details(),
+                    CodexErrorDetails::ThreadNotFound(id) if *id == agent_id
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) async fn is_agent_known_or_resumable(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<bool> {
+        if self.is_agent_known(agent_id).await? {
+            return Ok(true);
+        }
+        let state = self.upgrade()?;
+        let stored_thread = match state
+            .read_stored_thread(ReadThreadParams {
+                thread_id: agent_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+        {
+            Ok(stored_thread) => stored_thread,
+            Err(err)
+                if matches!(
+                    err.details(),
+                    CodexErrorDetails::ThreadNotFound(id) if *id == agent_id
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        };
+        match self::spawn::load_agent_model_context(&state, agent_id, stored_thread.history_mode)
+            .await
+        {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(err)
+                if matches!(
+                    err.details(),
+                    CodexErrorDetails::ThreadNotFound(id) if *id == agent_id
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub(crate) async fn list_live_agent_subtree_thread_ids(
@@ -609,9 +920,39 @@ impl AgentControl {
         child_reference: String,
         child_agent_path: Option<AgentPath>,
     ) {
+        if self.is_external_agent(child_thread_id) {
+            let mut watchers = self
+                .external_completion_watchers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !watchers.insert(child_thread_id) {
+                return;
+            }
+        }
         let control = self.clone();
         tokio::spawn(async move {
             let is_external = control.is_external_agent(child_thread_id);
+            struct ClearExternalWatcher {
+                control: AgentControl,
+                child_thread_id: ThreadId,
+                is_external: bool,
+            }
+            impl Drop for ClearExternalWatcher {
+                fn drop(&mut self) {
+                    if self.is_external {
+                        self.control
+                            .external_completion_watchers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&self.child_thread_id);
+                    }
+                }
+            }
+            let _clear_external_watcher = ClearExternalWatcher {
+                control: control.clone(),
+                child_thread_id,
+                is_external,
+            };
             // Native V2 turns emit the live terminal transition from Session so it is adjacent
             // to the typed terminal turn event. Legacy native agents and ACP agents use this
             // watcher as their transition source instead. A missing native child is treated as
@@ -636,30 +977,45 @@ impl AgentControl {
                 Ok(mut status_rx) => {
                     let mut status = status_rx.borrow().clone();
                     loop {
-                        if matches!(status, AgentStatus::Interrupted) {
-                            if terminal_status_tracker.should_notify(&status) && !native_v2 {
-                                control
-                                    .maybe_notify_parent_of_terminal_status(
-                                        child_thread_id,
-                                        &status,
-                                    )
-                                    .await;
-                            }
-                            // ACP agents finish their current lifecycle at interruption. Legacy
-                            // native agents remain watchable and may transition back to Running.
-                            if is_external {
+                        let external_lifecycle = is_external
+                            .then(|| control.external_agents.lifecycle_status(child_thread_id))
+                            .flatten();
+                        if let Some((external_status, _)) = &external_lifecycle {
+                            status = external_status.clone();
+                        }
+                        let external_generation =
+                            external_lifecycle.map(|(_, generation)| generation);
+                        let should_notify =
+                            terminal_status_tracker.should_notify(&status, external_generation);
+                        if should_notify && !native_v2 {
+                            control
+                                .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
+                                .await;
+                        }
+                        if should_notify && is_external {
+                            let interrupted = matches!(status, AgentStatus::Interrupted);
+                            control
+                                .confirm_external_terminal_and_promote(
+                                    child_thread_id,
+                                    parent_thread_id,
+                                    child_agent_path.clone(),
+                                    &status,
+                                    external_generation,
+                                    !interrupted,
+                                )
+                                .await;
+                        }
+                        // An ACP terminal closes one generation, not the watcher. Follow-ups can
+                        // promote the same agent immediately after observer acknowledgement.
+                        let keep_watching_external = is_external
+                            && is_final(&status)
+                            && !matches!(status, AgentStatus::Shutdown);
+                        if keep_watching_external {
+                            if status_rx.changed().await.is_err() {
                                 return;
                             }
-                        } else {
-                            let should_notify = terminal_status_tracker.should_notify(&status);
-                            if should_notify && !native_v2 {
-                                control
-                                    .maybe_notify_parent_of_terminal_status(
-                                        child_thread_id,
-                                        &status,
-                                    )
-                                    .await;
-                            }
+                            status = status_rx.borrow().clone();
+                            continue;
                         }
 
                         if is_final(&status) {
@@ -677,13 +1033,32 @@ impl AgentControl {
                     }
                 }
                 Err(_) => {
-                    let status = control.get_status(child_thread_id).await;
-                    if terminal_status_tracker.should_notify(&status) && !native_v2 {
-                        control
-                            .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
-                            .await;
-                        if matches!(status, AgentStatus::Interrupted) && is_external {
-                            return;
+                    let mut status = control.get_status(child_thread_id).await;
+                    let external_lifecycle = is_external
+                        .then(|| control.external_agents.lifecycle_status(child_thread_id))
+                        .flatten();
+                    if let Some((external_status, _)) = &external_lifecycle {
+                        status = external_status.clone();
+                    }
+                    let external_generation = external_lifecycle.map(|(_, generation)| generation);
+                    if terminal_status_tracker.should_notify(&status, external_generation) {
+                        if !native_v2 {
+                            control
+                                .maybe_notify_parent_of_terminal_status(child_thread_id, &status)
+                                .await;
+                        }
+                        if is_external {
+                            let interrupted = matches!(status, AgentStatus::Interrupted);
+                            control
+                                .confirm_external_terminal_and_promote(
+                                    child_thread_id,
+                                    parent_thread_id,
+                                    child_agent_path.clone(),
+                                    &status,
+                                    external_generation,
+                                    !interrupted,
+                                )
+                                .await;
                         }
                     }
                     if !is_final(&status) {
@@ -693,6 +1068,9 @@ impl AgentControl {
                 }
             };
 
+            if is_external {
+                return;
+            }
             let Ok(state) = control.upgrade() else {
                 return;
             };
@@ -707,38 +1085,12 @@ impl AgentControl {
                 let Some(child_agent_path) = child_agent_path.clone() else {
                     return;
                 };
-                let Some(parent_agent_path) = child_agent_path
-                    .as_str()
-                    .rsplit_once('/')
-                    .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
-                else {
-                    return;
-                };
-                let Some(message) = format_inter_agent_completion_message(
-                    parent_agent_path.clone(),
-                    child_agent_path.clone(),
-                    &status,
-                ) else {
-                    return;
-                };
-                // Terminal results request a parent turn so an idle parent
-                // resumes without wait_agent or new user input.
-                let communication = InterAgentCommunication::new(
-                    child_agent_path,
-                    parent_agent_path,
-                    Vec::new(),
-                    message,
-                    /*trigger_turn*/ true,
-                );
-                let context =
-                    AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
-                let _ = control
-                    .send_inter_agent_communication(
+                control
+                    .forward_v2_child_completion_to_parent(
+                        child_thread_id,
                         parent_thread_id,
-                        communication,
-                        context,
-                        /*parent_turn_id*/ None,
-                        /*root_turn_id*/ None,
+                        child_agent_path,
+                        &status,
                     )
                     .await;
                 return;
@@ -751,6 +1103,49 @@ impl AgentControl {
                 .inject_user_message_without_turn(message)
                 .await;
         });
+    }
+
+    async fn forward_v2_child_completion_to_parent(
+        &self,
+        child_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        child_agent_path: AgentPath,
+        status: &AgentStatus,
+    ) {
+        let Some(parent_agent_path) = child_agent_path
+            .as_str()
+            .rsplit_once('/')
+            .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
+        else {
+            return;
+        };
+        let Some(message) = format_inter_agent_completion_message(
+            parent_agent_path.clone(),
+            child_agent_path.clone(),
+            status,
+        ) else {
+            return;
+        };
+        // Terminal results request a parent turn so an idle parent
+        // resumes without wait_agent or new user input.
+        let communication = InterAgentCommunication::new(
+            child_agent_path,
+            parent_agent_path,
+            Vec::new(),
+            message,
+            /*trigger_turn*/ true,
+        );
+        let context =
+            AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
+        let _ = self
+            .send_inter_agent_communication(
+                parent_thread_id,
+                communication,
+                context,
+                /*parent_turn_id*/ None,
+                /*root_turn_id*/ None,
+            )
+            .await;
     }
 
     fn maybe_start_external_completion_watcher(&self, child_thread_id: ThreadId) {
@@ -800,6 +1195,7 @@ impl AgentControl {
             agent_path,
             agent_nickname,
             agent_role,
+            metadata: None,
         })
     }
 

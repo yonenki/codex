@@ -960,6 +960,12 @@ impl App {
         if self.abandoned_side_threads.contains(&thread_id) {
             return Ok(());
         }
+        if let ServerNotification::SubAgentTerminal(terminal) = &notification
+            && let Ok(child_thread_id) = ThreadId::from_string(&terminal.agent_thread_id)
+        {
+            self.agent_navigation.mark_stopped(child_thread_id);
+            self.refresh_status_line();
+        }
         if matches!(notification, ServerNotification::SubAgentTerminal(_))
             && self.active_thread_id != Some(thread_id)
         {
@@ -1021,6 +1027,9 @@ impl App {
         } else if turn_stopped {
             self.agent_navigation.mark_stopped(thread_id);
         }
+        if is_turn_started || turn_stopped {
+            self.refresh_status_line();
+        }
 
         if let Some(notification) = notification {
             match sender.try_send(ThreadBufferedEvent::Notification(Box::new(notification))) {
@@ -1059,8 +1068,14 @@ impl App {
         if let Some(activity) =
             sub_agent_activity_item(notification).and_then(sub_agent_activity_display)
         {
+            let started = activity.is_running_hint;
+            let thread_id = activity.thread_id;
             self.agent_navigation.record_sub_agent_activity(activity);
+            if started {
+                self.agent_navigation.mark_running(thread_id);
+            }
             self.sync_active_agent_label();
+            self.refresh_status_line();
             return;
         }
 
@@ -1089,6 +1104,39 @@ impl App {
                 thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
                 /*is_closed*/ false,
             );
+        }
+
+        let agents_states = match notification {
+            ServerNotification::ItemStarted(notification) => match &notification.item {
+                ThreadItem::CollabAgentToolCall { agents_states, .. } => Some(agents_states),
+                _ => None,
+            },
+            ServerNotification::ItemCompleted(notification) => match &notification.item {
+                ThreadItem::CollabAgentToolCall { agents_states, .. } => Some(agents_states),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(agents_states) = agents_states {
+            for (receiver_thread_id, state) in agents_states {
+                let Ok(thread_id) = ThreadId::from_string(receiver_thread_id) else {
+                    continue;
+                };
+                match state.status {
+                    codex_app_server_protocol::CollabAgentStatus::PendingInit
+                    | codex_app_server_protocol::CollabAgentStatus::Running => {
+                        self.agent_navigation.mark_running_hint(thread_id);
+                    }
+                    codex_app_server_protocol::CollabAgentStatus::Interrupted
+                    | codex_app_server_protocol::CollabAgentStatus::Completed
+                    | codex_app_server_protocol::CollabAgentStatus::Errored
+                    | codex_app_server_protocol::CollabAgentStatus::Shutdown
+                    | codex_app_server_protocol::CollabAgentStatus::NotFound => {
+                        self.agent_navigation.mark_stopped(thread_id);
+                    }
+                }
+            }
+            self.refresh_status_line();
         }
     }
 
@@ -1339,7 +1387,11 @@ impl App {
                 .enqueue_thread_notification(thread_id, notification)
                 .await;
         }
-        if matches!(notification, ServerNotification::SubAgentTerminal(_)) {
+        if let ServerNotification::SubAgentTerminal(terminal) = &notification {
+            if let Ok(child_thread_id) = ThreadId::from_string(&terminal.agent_thread_id) {
+                self.agent_navigation.mark_stopped(child_thread_id);
+                self.refresh_status_line();
+            }
             return Ok(());
         }
         self.pending_primary_events
