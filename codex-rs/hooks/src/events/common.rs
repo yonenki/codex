@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::engine::ConfiguredHandler;
+use crate::engine::HandlerSourcePath;
 use crate::engine::dispatcher;
 use crate::output_spill::AdditionalContext;
 
@@ -75,6 +76,7 @@ pub(crate) fn serialization_failure_hook_events(
 ) -> Vec<HookCompletedEvent> {
     handlers
         .into_iter()
+        .filter(|handler| matches!(handler.source_path, HandlerSourcePath::Local(_)))
         .map(|handler| {
             let mut run = dispatcher::running_summary(&handler);
             run.status = HookRunStatus::Failed;
@@ -131,7 +133,7 @@ pub(crate) fn matcher_pattern_for_event(
         | HookEventName::SubagentStop
         | HookEventName::PreCompact
         | HookEventName::PostCompact => matcher,
-        HookEventName::UserPromptSubmit | HookEventName::Stop => None,
+        HookEventName::UserPromptSubmit | HookEventName::Stop | HookEventName::Interrupt => None,
     }
 }
 
@@ -276,6 +278,10 @@ mod tests {
         );
         assert_eq!(
             matcher_pattern_for_event(HookEventName::Stop, Some("^done$")),
+            None
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::Interrupt, Some("^interrupted$")),
             None
         );
     }

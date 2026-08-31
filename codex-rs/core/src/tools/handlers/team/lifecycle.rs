@@ -30,7 +30,10 @@ impl ToolExecutor<ToolInvocation> for TeamLifecycleToolHandler {
         lifecycle_spec(self.capability)
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         let capability = self.capability;
         Box::pin(async move {
             run_authorized_team_tool(invocation, capability, |invocation, authority| {

@@ -28,7 +28,7 @@ use crate::protocol::v2::WebSearchItem;
 use crate::protocol::v2::web_search_action_from_core;
 use codex_extension_items::image_generation::ImageGenerationItem;
 use codex_protocol::items::parse_hook_prompt_message;
-use codex_protocol::models::MessagePhase;
+use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::AgentStatus;
@@ -331,11 +331,7 @@ impl ThreadHistoryBuilder {
     pub fn handle_event(&mut self, event: &EventMsg) {
         match event {
             EventMsg::UserMessage(payload) => self.handle_user_message(payload),
-            EventMsg::AgentMessage(payload) => self.handle_agent_message(
-                payload.message.clone(),
-                payload.phase.clone(),
-                payload.memory_citation.clone().map(Into::into),
-            ),
+            EventMsg::AgentMessage(payload) => self.handle_agent_message(payload),
             EventMsg::AgentReasoning(payload) => self.handle_agent_reasoning(payload),
             EventMsg::AgentReasoningRawContent(payload) => {
                 self.handle_agent_reasoning_raw_content(payload)
@@ -407,6 +403,7 @@ impl ThreadHistoryBuilder {
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::RealtimeItem(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::SessionMeta(_) => {}
         }
@@ -493,22 +490,18 @@ impl ThreadHistoryBuilder {
         });
     }
 
-    fn handle_agent_message(
-        &mut self,
-        text: String,
-        phase: Option<MessagePhase>,
-        memory_citation: Option<crate::protocol::v2::MemoryCitation>,
-    ) {
-        if text.is_empty() {
+    fn handle_agent_message(&mut self, payload: &AgentMessageEvent) {
+        if payload.message.is_empty() {
             return;
         }
 
         let id = self.next_item_id();
         self.push_item_in_current_turn(ThreadItem::AgentMessage {
             id,
-            text,
-            phase,
-            memory_citation,
+            text: payload.message.clone(),
+            phase: payload.phase.clone(),
+            memory_citation: payload.memory_citation.clone().map(Into::into),
+            delivery: payload.delivery,
         });
     }
 
@@ -613,6 +606,7 @@ impl ThreadHistoryBuilder {
         let should_upsert = match item {
             codex_protocol::items::TurnItem::Plan(plan) => !plan.text.is_empty(),
             codex_protocol::items::TurnItem::HookPrompt(_)
+            | codex_protocol::items::TurnItem::FunctionCallOutput(_)
             | codex_protocol::items::TurnItem::CommandExecution(_)
             | codex_protocol::items::TurnItem::DynamicToolCall(_)
             | codex_protocol::items::TurnItem::CollabAgentToolCall(_)
@@ -868,6 +862,7 @@ impl ThreadHistoryBuilder {
             transparent_background: None,
             failure: None,
             saved_path: None,
+            imagegen_request_id: None,
         });
         self.upsert_item_in_current_turn(item);
     }
@@ -881,6 +876,7 @@ impl ThreadHistoryBuilder {
             transparent_background: payload.transparent_background,
             failure: payload.failure.clone(),
             saved_path: payload.saved_path.clone(),
+            imagegen_request_id: None,
         });
         self.upsert_item_in_current_turn(item);
     }
@@ -1201,6 +1197,7 @@ impl ThreadHistoryBuilder {
         let changed_turn = if let Some(turn) = self.current_turn.as_mut() {
             turn.status = TurnStatus::Failed;
             turn.error = Some(V2TurnError {
+                misalignment: payload.misalignment.clone().map(Into::into),
                 message: payload.message.clone(),
                 codex_error_info: payload.codex_error_info.clone().map(Into::into),
                 additional_details: None,
@@ -1259,6 +1256,7 @@ impl ThreadHistoryBuilder {
 
     fn handle_turn_complete(&mut self, payload: &TurnCompleteEvent) {
         let terminal_error = payload.error.as_ref().map(|error| V2TurnError {
+            misalignment: error.misalignment.clone().map(Into::into),
             message: error.message.clone(),
             codex_error_info: error.codex_error_info.clone().map(Into::into),
             additional_details: None,
@@ -1632,6 +1630,7 @@ impl From<&PendingTurn> for Turn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::v2::AgentMessageDelivery;
     use crate::protocol::v2::CommandExecutionSource;
     use codex_extension_items::ExtensionItem as CoreExtensionItem;
     use codex_extension_items::sleep::SleepItem as CoreSleepItem;
@@ -1642,6 +1641,7 @@ mod tests {
     use codex_protocol::items::EnteredReviewModeItem as CoreEnteredReviewModeItem;
     use codex_protocol::items::ExitedReviewModeItem as CoreExitedReviewModeItem;
     use codex_protocol::items::HookPromptFragment as CoreHookPromptFragment;
+    use codex_protocol::items::SubAgentActivityItem as CoreSubAgentActivityItem;
     use codex_protocol::items::TurnItem as CoreTurnItem;
     use codex_protocol::items::UserMessageItem as CoreUserMessageItem;
     use codex_protocol::items::build_hook_prompt_message;
@@ -1650,7 +1650,6 @@ mod tests {
     use codex_protocol::models::MessagePhase as CoreMessagePhase;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
     use codex_protocol::parse_command::ParsedCommand;
-    use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::AgentReasoningEvent;
     use codex_protocol::protocol::AgentReasoningRawContentEvent;
     use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
@@ -1666,6 +1665,7 @@ mod tests {
     use codex_protocol::protocol::McpToolCallEndEvent;
     use codex_protocol::protocol::PatchApplyBeginEvent;
     use codex_protocol::protocol::ReviewTarget;
+    use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
@@ -1697,6 +1697,7 @@ mod tests {
                 message: "Hi there".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
             EventMsg::AgentReasoning(AgentReasoningEvent {
                 text: "thinking".into(),
@@ -1716,6 +1717,7 @@ mod tests {
                 message: "Reply two".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
         ];
 
@@ -1754,6 +1756,7 @@ mod tests {
                 text: "Hi there".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }
         );
         assert_eq!(
@@ -1787,6 +1790,7 @@ mod tests {
                 text: "Reply two".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }
         );
     }
@@ -2088,6 +2092,7 @@ mod tests {
                         transparent_background: Some(true),
                         failure: None,
                         saved_path: Some(saved_path.clone()),
+                        imagegen_request_id: None,
                     },
                 )),
                 started_at_ms: Some(0),
@@ -2120,6 +2125,7 @@ mod tests {
                 transparent_background: Some(true),
                 failure: None,
                 saved_path: Some(saved_path),
+                imagegen_request_id: None,
             })]
         );
     }
@@ -2334,11 +2340,12 @@ mod tests {
     }
 
     #[test]
-    fn preserves_agent_message_phase_in_history() {
+    fn preserves_agent_message_phase_and_delivery_in_history() {
         let events = vec![EventMsg::AgentMessage(AgentMessageEvent {
             message: "Final reply".into(),
             phase: Some(CoreMessagePhase::FinalAnswer),
             memory_citation: None,
+            delivery: Some(AgentMessageDelivery::Async),
         })];
 
         let items = events
@@ -2352,8 +2359,9 @@ mod tests {
             ThreadItem::AgentMessage {
                 id: "item-1".into(),
                 text: "Final reply".into(),
-                phase: Some(MessagePhase::FinalAnswer),
+                phase: Some(CoreMessagePhase::FinalAnswer),
                 memory_citation: None,
+                delivery: Some(AgentMessageDelivery::Async),
             }
         );
     }
@@ -2435,6 +2443,7 @@ mod tests {
                             },
                         ),
                         saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
+                        imagegen_request_id: None,
                     }),
                 ],
             }
@@ -2462,6 +2471,7 @@ mod tests {
                 message: "interlude".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
             EventMsg::AgentReasoning(AgentReasoningEvent {
                 text: "second summary".into(),
@@ -2510,6 +2520,7 @@ mod tests {
                 message: "Working...".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some("turn-1".into()),
@@ -2530,6 +2541,7 @@ mod tests {
                 message: "Second attempt complete.".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
         ];
 
@@ -2561,6 +2573,7 @@ mod tests {
                 text: "Working...".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }
         );
 
@@ -2585,6 +2598,7 @@ mod tests {
                 text: "Second attempt complete.".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }
         );
     }
@@ -2604,6 +2618,7 @@ mod tests {
                 message: "A1".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 client_id: None,
@@ -2617,6 +2632,7 @@ mod tests {
                 message: "A2".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
             EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
             EventMsg::UserMessage(UserMessageEvent {
@@ -2631,6 +2647,7 @@ mod tests {
                 message: "A3".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
         ];
 
@@ -2661,6 +2678,7 @@ mod tests {
                     text: "A1".into(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
                 },
             ]
         );
@@ -2680,6 +2698,7 @@ mod tests {
                     text: "A3".into(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
                 },
             ]
         );
@@ -2700,6 +2719,7 @@ mod tests {
                 message: "A1".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 client_id: None,
@@ -2713,6 +2733,7 @@ mod tests {
                 message: "A2".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
             EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 99 }),
         ];
@@ -3745,6 +3766,7 @@ mod tests {
                 message: "still in b".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-b".into(),
@@ -3806,6 +3828,7 @@ mod tests {
                 started_at: Some(10),
                 last_agent_message: None,
                 error: Some(ErrorEvent {
+                    misalignment: None,
                     message: "Selected model is at capacity. Please try a different model.".into(),
                     codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
                 }),
@@ -3836,6 +3859,7 @@ mod tests {
                     }],
                     status: TurnStatus::Failed,
                     error: Some(TurnError {
+                        misalignment: None,
                         message: "Selected model is at capacity. Please try a different model."
                             .into(),
                         codex_error_info: Some(
@@ -3921,6 +3945,7 @@ mod tests {
                 message: "still in b".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
         ];
 
@@ -3949,6 +3974,7 @@ mod tests {
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
                 replacement_history: None,
+                mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
@@ -4183,8 +4209,10 @@ mod tests {
                 message: "done".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }),
             EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: "rollback failed".into(),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
             }),
@@ -4228,6 +4256,7 @@ mod tests {
                 time_to_first_token_ms: None,
             }),
             EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: "request-level failure".into(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
             }),
@@ -4280,6 +4309,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: "stream failure".into(),
                 codex_error_info: Some(CodexErrorInfo::ResponseStreamDisconnected {
                     http_status_code: Some(502),
@@ -4307,6 +4337,7 @@ mod tests {
         assert_eq!(
             turns[0].error,
             Some(TurnError {
+                misalignment: None,
                 message: "stream failure".into(),
                 codex_error_info: Some(
                     crate::protocol::v2::CodexErrorInfo::ResponseStreamDisconnected {
@@ -4341,6 +4372,7 @@ mod tests {
                 started_at: Some(10),
                 last_agent_message: None,
                 error: Some(ErrorEvent {
+                    misalignment: None,
                     message: "Selected model is at capacity. Please try a different model.".into(),
                     codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
                 }),
@@ -4370,6 +4402,7 @@ mod tests {
                 }],
                 status: TurnStatus::Failed,
                 error: Some(TurnError {
+                    misalignment: None,
                     message: "Selected model is at capacity. Please try a different model.".into(),
                     codex_error_info: Some(crate::protocol::v2::CodexErrorInfo::ServerOverloaded),
                     additional_details: None,
@@ -4467,6 +4500,61 @@ mod tests {
         assert_eq!(
             builder.active_turn_snapshot().expect("active turn").items,
             vec![expected_item]
+        );
+    }
+
+    #[test]
+    fn completed_sub_agent_activity_updates_completed_parent_turn() {
+        let child_thread_id = ThreadId::new();
+        let child_path = codex_protocol::AgentPath::root()
+            .join("worker")
+            .expect("worker path");
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                started_at: None,
+                last_agent_message: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn-a".into(),
+                item: CoreTurnItem::SubAgentActivity(CoreSubAgentActivityItem {
+                    id: "child-turn-completed".into(),
+                    kind: CoreSubAgentActivityKind::Completed,
+                    agent_thread_id: child_thread_id,
+                    agent_path: child_path,
+                    harness: None,
+                    model: None,
+                }),
+                started_at_ms: None,
+                completed_at_ms: 0,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![ThreadItem::SubAgentActivity {
+                id: "child-turn-completed".into(),
+                kind: crate::protocol::v2::SubAgentActivityKind::Completed,
+                agent_thread_id: child_thread_id.to_string(),
+                agent_path: "/root/worker".into(),
+                harness: None,
+                model: None,
+            }]
         );
     }
 

@@ -50,7 +50,10 @@ impl ToolExecutor<ToolInvocation> for TeamAgentToolHandler {
         agent_spec(self.capability)
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         let capability = self.capability;
         Box::pin(async move {
             run_authorized_team_tool(invocation, capability, |invocation, authority| {
@@ -153,16 +156,9 @@ async fn handle_team_spawn(
         message.clone(),
     ));
     let turn = invocation.turn.as_ref();
-    let mut config = build_agent_spawn_config(
-        &invocation.session.get_base_instructions().await,
-        turn,
-        invocation.step_context.environments.primary(),
-    )?;
-    apply_spawn_agent_runtime_overrides(
-        &mut config,
-        turn,
-        invocation.step_context.environments.primary(),
-    )?;
+    let mut config =
+        build_agent_spawn_config(&invocation.session.get_base_instructions().await, turn)?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
     let acp = acp_role_settings(&config, &role)
         .await
         .map_err(FunctionCallError::RespondToModel)?;
@@ -341,8 +337,12 @@ async fn handle_team_message(
                 },
                 invocation.session.thread_id,
             ),
-            trigger_turn.then(|| invocation.turn.sub_id.clone()),
-            invocation.turn.turn_metadata_state.root_turn_id(),
+            crate::TurnStartOptions {
+                parent_turn_id: trigger_turn.then(|| invocation.turn.sub_id.clone()),
+                root_turn_id: invocation.turn.turn_metadata_state.root_turn_id(),
+                cyber_access_program: invocation.turn.cyber_access_program,
+                ..Default::default()
+            },
         )
         .await
         .map_err(collab_spawn_error)?;

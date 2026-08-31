@@ -607,7 +607,7 @@ impl TeamToolResult {
 }
 
 impl ToolOutput for TeamToolResult {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         tool_output_json_text(self, "team")
     }
 

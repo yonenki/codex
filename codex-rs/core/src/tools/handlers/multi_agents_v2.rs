@@ -41,6 +41,7 @@ pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
 mod acp_agents;
+mod analytics;
 mod followup_task;
 mod interrupt_agent;
 mod list_agents;

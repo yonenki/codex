@@ -416,6 +416,7 @@ mod job {
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::RealtimeItem(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => None,
@@ -727,6 +728,8 @@ mod tests {
             RolloutItem::ResponseItem(skill_message.into()),
             RolloutItem::SecurityRiskScore(SecurityRiskScore {
                 scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
+                call_id: None,
+                action: None,
                 sampled_at: None,
             }),
             RolloutItem::ResponseItem(subagent_message.clone().into()),
@@ -758,7 +761,9 @@ mod tests {
             job::serialize_filtered_rollout_response_items(&[RolloutItem::ResponseItem(
                 ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id: "call_123".to_string(),
+                    call_id: Some("call_123".to_string()),
+                    name: None,
+                    namespace: None,
                     output: codex_protocol::models::FunctionCallOutputPayload {
                         body: codex_protocol::models::FunctionCallOutputBody::Text(
                             r#"{"token":"sk-abcdefghijklmnopqrstuvwxyz123456"}"#.to_string(),

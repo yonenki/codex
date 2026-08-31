@@ -80,7 +80,9 @@ def verify_eol(eol: str) -> None:
         data = path.read_bytes()
         if eol == "crlf":
             if data.replace(b"\r\n", b"").find(b"\n") != -1:
-                raise SystemExit(f"error: {path} still contains bare LF after CRLF conversion")
+                raise SystemExit(
+                    f"error: {path} still contains bare LF after CRLF conversion"
+                )
         elif b"\r" in data:
             raise SystemExit(f"error: {path} still contains CR after LF conversion")
 
@@ -88,22 +90,32 @@ def verify_eol(eol: str) -> None:
 def print_sentinel() -> None:
     digest = hashlib.sha384(SENTINEL_FILE.read_bytes()).hexdigest()
     matches = [name for name, known in SENTINEL_SHA384.items() if digest == known]
-    label = f"matches official {matches[0]} build" if matches else "matches NO known official build"
+    label = (
+        f"matches official {matches[0]} build"
+        if matches
+        else "matches NO known official build"
+    )
     print(f"[migration-eol] 0001_threads.sql sha384={digest} ({label})")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--with-code-mode-host", action="store_true")
     parser.add_argument("--eol", choices=["crlf", "lf"], default=None)
     args = parser.parse_args()
 
     target_eol = args.eol or ("crlf" if os.name == "nt" else "lf")
-    packages = ["codex-cli"] + (["codex-code-mode-host"] if args.with_code_mode_host else [])
+    packages = ["codex-cli"] + (
+        ["codex-code-mode-host"] if args.with_code_mode_host else []
+    )
 
     changed = normalize_eol(target_eol)
     verify_eol(target_eol)
-    print(f"[migration-eol] normalized {changed} file(s) to {target_eol.upper()} for this build")
+    print(
+        f"[migration-eol] normalized {changed} file(s) to {target_eol.upper()} for this build"
+    )
     print_sentinel()
 
     command = ["cargo", "build", "--release"]

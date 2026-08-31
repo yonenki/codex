@@ -304,6 +304,7 @@ impl ThreadMetadataSync {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
+                | RolloutItem::RealtimeItem(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::WorldState(_) => {}
             }
@@ -581,6 +582,7 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "compacted".to_string(),
             replacement_history: None,
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,

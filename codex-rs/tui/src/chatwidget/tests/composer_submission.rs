@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
+use crate::history_cell::ThreadRecapLoadingCell;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -8,6 +9,196 @@ use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
+
+fn paste_hidden_shell_payload(chat: &mut ChatWidget) -> String {
+    let payload = format!("!echo {}", "x".repeat(1000));
+    chat.handle_paste(payload.clone());
+    assert_eq!(
+        chat.bottom_pane.composer_text(),
+        format!("[Pasted Content {} chars]", payload.len())
+    );
+    payload
+}
+
+fn assert_hidden_shell_payload_is_literal(op: Result<Op, TryRecvError>, payload: String) {
+    match op {
+        Ok(Op::UserTurn { items, .. }) => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: payload,
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected hidden shell payload as literal input, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn user_submission_does_not_commit_recap_loading_to_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.show_recap_loading();
+    while rx.try_recv().is_ok() {}
+
+    chat.submit_user_message(UserMessage::from("Continue with the task"));
+
+    let mut saw_user_message = false;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            assert!(!cell.as_any().is::<ThreadRecapLoadingCell>());
+            saw_user_message |= cell.as_any().is::<UserHistoryCell>();
+        }
+    }
+    assert!(saw_user_message);
+}
+
+#[tokio::test]
+async fn hidden_shell_paste_submits_literal_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    let payload = paste_hidden_shell_payload(&mut chat);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+}
+
+#[tokio::test]
+async fn hidden_shell_paste_recalled_from_history_submits_literal_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    let payload = paste_hidden_shell_payload(&mut chat);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload.clone());
+    handle_turn_started(&mut chat, "turn-1");
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Up));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+}
+
+#[tokio::test]
+async fn hidden_shell_paste_queued_during_turn_submits_literal_prompt() {
+    for key in [KeyCode::Tab, KeyCode::Enter] {
+        let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.thread_id = Some(ThreadId::new());
+        handle_turn_started(&mut chat, "turn-1");
+        let payload = paste_hidden_shell_payload(&mut chat);
+
+        chat.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
+        if key == KeyCode::Tab {
+            assert_chatwidget_snapshot!(
+                "hidden_shell_paste_queued_preview",
+                normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 80))
+            );
+        }
+        handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+
+        assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+    }
+}
+
+#[tokio::test]
+async fn hidden_shell_paste_restored_by_queue_edit_submits_literal_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.chat_keymap.edit_queued_message = vec![crate::key_hint::alt(KeyCode::Up)];
+    handle_turn_started(&mut chat, "turn-1");
+    let payload = paste_hidden_shell_payload(&mut chat);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Tab));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+
+    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+}
+
+#[tokio::test]
+async fn hidden_shell_paste_restored_by_interrupt_submits_literal_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn-1");
+    let payload = paste_hidden_shell_payload(&mut chat);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Tab));
+    chat.on_interrupted_turn(TurnAbortReason::Interrupted);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+}
+
+#[tokio::test]
+async fn hidden_shell_paste_restored_after_image_rejection_submits_literal_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    let current_model = chat.current_model().to_string();
+    let mut models = chat.model_catalog.try_list_models().expect("model catalog");
+    models
+        .iter_mut()
+        .find(|model| model.model == current_model)
+        .expect("current model")
+        .input_modalities
+        .retain(|modality| *modality != InputModality::Image);
+    chat.model_catalog = Arc::new(ModelCatalog::new(models));
+    chat.set_remote_image_urls(vec!["https://example.com/image.png".to_string()]);
+    let payload = paste_hidden_shell_payload(&mut chat);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    chat.set_remote_image_urls(Vec::new());
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+}
+
+#[tokio::test]
+async fn hidden_shell_paste_restored_after_unavailable_model_submits_literal_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    let model = chat.current_model().to_string();
+    chat.set_model("");
+    let payload = paste_hidden_shell_payload(&mut chat);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    chat.set_model(&model);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+}
+
+#[tokio::test]
+async fn rejected_hidden_shell_paste_preserves_colliding_draft_paste() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    let model = chat.current_model().to_string();
+    handle_turn_started(&mut chat, "turn-1");
+    let payload = paste_hidden_shell_payload(&mut chat);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Tab));
+    let draft_payload = format!("draft {}", "y".repeat(1000));
+    chat.handle_paste(draft_payload.clone());
+    chat.set_model("");
+
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+    chat.set_model(&model);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), format!("{payload}\n{draft_payload}"));
+}
+
+#[tokio::test]
+async fn hidden_shell_paste_queued_before_session_submits_literal_prompt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_queue_submissions_until_session_configured(/*queue*/ true);
+    let payload = paste_hidden_shell_payload(&mut chat);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    chat.thread_id = Some(ThreadId::new());
+    chat.maybe_send_next_queued_input();
+
+    assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
+}
 
 #[tokio::test]
 async fn parent_owned_thread_blocks_all_direct_input_entry_points() {
@@ -49,7 +240,7 @@ async fn parent_owned_thread_blocks_all_direct_input_entry_points() {
         "/side inspect this",
         "/archive",
         "/rename",
-        "/agent parent",
+        "/subagents parent",
         "/diff now",
         "!echo blocked",
         " !echo blocked",
@@ -715,6 +906,7 @@ async fn submission_prefers_selected_duplicate_skill_path() {
             path: repo_skill_path,
             scope: crate::test_support::skill_scope_repo(),
             enabled: true,
+            plugin_id: None,
         },
         SkillMetadata {
             name: "figma".to_string(),
@@ -725,6 +917,7 @@ async fn submission_prefers_selected_duplicate_skill_path() {
             path: user_skill_path.clone(),
             scope: crate::test_support::skill_scope_user(),
             enabled: true,
+            plugin_id: None,
         },
     ]));
 
@@ -1677,92 +1870,6 @@ async fn alt_up_edits_most_recent_queued_message() {
 }
 
 #[tokio::test]
-async fn vim_normal_history_up_edits_queued_message_without_duplicating_it() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.thread_id = Some(ThreadId::new());
-    chat.toggle_vim_mode_and_notify();
-    chat.bottom_pane.set_task_running(/*running*/ true);
-    chat.bottom_pane
-        .set_composer_text("first queued message".to_string(), Vec::new(), Vec::new());
-    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-
-    for expected in ["first queued message", "first queued message edited"] {
-        chat.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-
-        assert_eq!(chat.bottom_pane.composer_text(), expected);
-        assert!(chat.input_queue.queued_user_messages.is_empty());
-        assert!(
-            chat.input_queue
-                .queued_user_message_history_records
-                .is_empty()
-        );
-
-        chat.bottom_pane
-            .set_composer_text(format!("{expected} edited"), Vec::new(), Vec::new());
-        chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
-        assert_eq!(
-            chat.input_queue.queued_user_message_history_records.len(),
-            1
-        );
-    }
-
-    assert_eq!(
-        chat.queued_user_message_texts(),
-        vec!["first queued message edited edited".to_string()]
-    );
-}
-
-#[tokio::test]
-async fn vim_normal_queued_message_edit_uses_remapped_history_up() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let mut keymap = crate::keymap::RuntimeKeymap::defaults();
-    keymap.vim_normal.move_up = vec![crate::key_hint::plain(KeyCode::F(2))];
-    chat.bottom_pane.set_keymap_bindings(&keymap);
-    chat.toggle_vim_mode_and_notify();
-    chat.bottom_pane.set_task_running(/*running*/ true);
-    chat.input_queue
-        .queued_user_messages
-        .push_back(UserMessage::from("queued message").into());
-    chat.input_queue
-        .queued_user_message_history_records
-        .push_back(UserMessageHistoryRecord::UserMessageText);
-    chat.refresh_pending_input_preview();
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-
-    assert!(chat.bottom_pane.composer_is_empty());
-    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-
-    assert_eq!(chat.bottom_pane.composer_text(), "queued message");
-    assert!(chat.input_queue.queued_user_messages.is_empty());
-    assert!(
-        chat.input_queue
-            .queued_user_message_history_records
-            .is_empty()
-    );
-
-    let width = 80;
-    let height = chat.desired_height(width);
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
-        .expect("create terminal");
-    terminal
-        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
-        .expect("render restored queued message");
-    insta::assert_snapshot!(
-        normalized_backend_snapshot(terminal.backend())
-            .lines()
-            .filter(|line| line.contains("queued message"))
-            .map(|line| line.trim_matches('"').trim())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        @"› queued message"
-    );
-}
-
-#[tokio::test]
 async fn unbound_queued_message_edit_does_not_fall_back_to_alt_up() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.chat_keymap.edit_queued_message = Vec::new();
@@ -2076,6 +2183,104 @@ fn user_message_display_from_inputs_hides_prompt_context() {
             Vec::new(),
         )
     );
+}
+
+#[test]
+fn task_and_plugin_mentions_with_same_name_keep_prompt_order() {
+    let task = "[@same](thread://task-123)";
+    let items = [
+        UserInput::Text {
+            text: format!("{task} @same"),
+            text_elements: [0..task.len(), task.len() + 1..task.len() + 6]
+                .into_iter()
+                .map(|range| TextElement::new(range.into(), Some("@same".to_string())).into())
+                .collect(),
+        },
+        UserInput::Mention {
+            name: "same".to_string(),
+            path: "plugin://same@test".to_string(),
+        },
+    ];
+
+    assert_eq!(
+        mention_bindings_from_user_inputs(&items, "@same @same"),
+        ["thread://task-123", "plugin://same@test"].map(|path| MentionBinding {
+            sigil: '@',
+            mention: "same".to_string(),
+            path: path.to_string(),
+        })
+    );
+
+    let split_items = [
+        UserInput::Text {
+            text: format!("Task {task} "),
+            text_elements: vec![
+                TextElement::new((5..5 + task.len()).into(), Some("@same".to_string())).into(),
+            ],
+        },
+        UserInput::Text {
+            text: "@same".to_string(),
+            text_elements: vec![TextElement::new((0..5).into(), Some("@same".to_string())).into()],
+        },
+        items[1].clone(),
+    ];
+    assert_eq!(
+        mention_bindings_from_user_inputs(&split_items, "Task @same @same"),
+        mention_bindings_from_user_inputs(&items, "@same @same")
+    );
+}
+
+#[tokio::test]
+async fn task_mention_submission_and_transcript_preserve_the_visible_title() {
+    for enabled in [false, true] {
+        let (mut chat, mut events, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.thread_id = Some(ThreadId::new());
+        chat.set_task_mentions_enabled(enabled);
+        let title = "Review database migration";
+        chat.submit_user_message(UserMessage {
+            text: format!("Inspect @{title}"),
+            local_images: Vec::new(),
+            remote_image_urls: Vec::new(),
+            text_elements: vec![TextElement::new(
+                ("Inspect ".len().."Inspect @".len() + title.len()).into(),
+                Some(format!("@{title}")),
+            )],
+            mention_bindings: vec![MentionBinding {
+                sigil: '@',
+                mention: title.to_string(),
+                path: "thread://task-123".to_string(),
+            }],
+        });
+
+        let Op::UserTurn { items, .. } = next_submit_op(&mut ops) else {
+            panic!("expected user turn");
+        };
+        if !enabled {
+            assert!(matches!(items.as_slice(), [UserInput::Text { text, .. }]
+                if text == "Inspect @Review database migration"));
+            continue;
+        }
+        assert!(matches!(items.as_slice(), [UserInput::Text { text, .. }]
+            if text.contains("MUST call `read_thread`")
+                && text.contains("\"threadId\":\"task-123\"")
+                && text.ends_with("Inspect [@Review database migration](thread://task-123)")));
+        assert_eq!(
+            mention_bindings_from_user_inputs(&items, &format!("Inspect @{title}")),
+            vec![MentionBinding {
+                sigil: '@',
+                mention: title.to_string(),
+                path: "thread://task-123".to_string(),
+            }]
+        );
+        complete_user_message_for_inputs(&mut chat, "user-task-reference", items);
+        let rendered = drain_insert_history(&mut events)
+            .into_iter()
+            .flatten()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_chatwidget_snapshot!("task_mention_transcript", rendered);
+    }
 }
 
 #[tokio::test]

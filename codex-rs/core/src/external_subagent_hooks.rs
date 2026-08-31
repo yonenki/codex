@@ -42,7 +42,7 @@ pub(crate) async fn run_external_subagent_start_hook(
         #[allow(deprecated)]
         cwd: turn.cwd.clone(),
         transcript_path: session.hook_transcript_path().await,
-        model: turn.model_info.slug.clone(),
+        model: turn.model_info().slug.clone(),
         permission_mode: hook_permission_mode(turn),
         target: StartHookTarget::SubagentStart {
             turn_id: turn.sub_id.clone(),
@@ -72,8 +72,9 @@ pub(crate) async fn run_external_subagent_stop_hook(
         #[allow(deprecated)]
         cwd: turn.cwd.clone(),
         transcript_path: session.hook_transcript_path().await,
-        model: turn.model_info.slug.clone(),
+        model: turn.model_info().slug.clone(),
         permission_mode: hook_permission_mode(turn),
+        request_metadata: None,
         stop_hook_active: false,
         last_assistant_message: None,
         target: StopHookTarget::SubagentStop {

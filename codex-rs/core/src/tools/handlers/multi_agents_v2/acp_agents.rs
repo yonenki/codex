@@ -307,7 +307,10 @@ impl ToolExecutor<ToolInvocation> for SpawnHandler {
         spawn_spec()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { spawn(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -334,7 +337,10 @@ impl ToolExecutor<ToolInvocation> for MessageHandler {
         )
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             deliver(invocation, DeliveryMode::QueueOnly)
                 .await
@@ -365,7 +371,10 @@ impl ToolExecutor<ToolInvocation> for FollowupHandler {
         )
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             deliver(invocation, DeliveryMode::TriggerTurn)
                 .await
@@ -406,16 +415,9 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
     reject_unbound_raw_spawn_when_teams_open(&session, &caller_thread_id, "acp.spawn").await?;
     let message = message_content(args.message)?;
     let explicit_backend = explicit_backend(args.harness, args.model, args.effort)?;
-    let mut config = build_agent_spawn_config(
-        &session.get_base_instructions().await,
-        turn.as_ref(),
-        step_context.environments.primary(),
-    )?;
-    apply_spawn_agent_runtime_overrides(
-        &mut config,
-        turn.as_ref(),
-        step_context.environments.primary(),
-    )?;
+    let mut config =
+        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
     let role_name = args
         .agent_type
         .as_deref()

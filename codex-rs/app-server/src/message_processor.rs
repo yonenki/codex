@@ -8,6 +8,7 @@ use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
+use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
@@ -32,6 +33,8 @@ use crate::request_processors::FsRequestProcessor;
 use crate::request_processors::GitRequestProcessor;
 use crate::request_processors::InitializeRequestProcessor;
 use crate::request_processors::MarketplaceRequestProcessor;
+use crate::request_processors::McpEventStreamReady;
+use crate::request_processors::McpEventStreams;
 use crate::request_processors::McpRequestProcessor;
 use crate::request_processors::PluginRequestProcessor;
 use crate::request_processors::ProcessExecRequestProcessor;
@@ -52,6 +55,7 @@ use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
+use crate::turn_cost_worker::TurnCostWorker;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ClientNotification;
@@ -66,7 +70,6 @@ use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
-use codex_chatgpt::workspace_settings;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
@@ -132,6 +135,7 @@ fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSO
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     models_refresh_worker: ModelsRefreshWorker,
+    turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: AccountRequestProcessor,
     apps_processor: AppsRequestProcessor,
@@ -162,6 +166,7 @@ pub(crate) struct MessageProcessor {
 #[derive(Debug)]
 pub(crate) struct ConnectionSessionState {
     pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
+    pub(crate) mcp_event_streams: McpEventStreams,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
@@ -185,6 +190,7 @@ impl ConnectionSessionState {
     pub(crate) fn new() -> Self {
         Self {
             rpc_gate: Arc::new(ConnectionRpcGate::new()),
+            mcp_event_streams: McpEventStreams::default(),
             initialized: OnceLock::new(),
         }
     }
@@ -359,6 +365,8 @@ impl MessageProcessor {
         let models_manager = thread_manager.get_models_manager();
         let models_refresh_worker =
             crate::models_refresh_worker::spawn(&models_manager, config.http_client_factory());
+        let turn_cost_worker =
+            TurnCostWorker::spawn(Arc::clone(&config), Arc::clone(&auth_manager));
         thread_manager
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
@@ -372,8 +380,6 @@ impl MessageProcessor {
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
-        let workspace_settings_cache =
-            Arc::new(workspace_settings::WorkspaceSettingsCache::default());
         let app_list_shutdown_token = CancellationToken::new();
         let request_serialization_queues = RequestSerializationQueues::default();
         let config_processor = ConfigRequestProcessor::new(
@@ -402,17 +408,14 @@ impl MessageProcessor {
             Arc::clone(&thread_manager),
             outgoing.clone(),
             config_manager.clone(),
-            Arc::clone(&workspace_settings_cache),
             app_list_shutdown_token,
         );
         let catalog_processor = CatalogRequestProcessor::new(
             outgoing.clone(),
             Arc::clone(&skills_watcher),
-            auth_manager.clone(),
             Arc::clone(&thread_manager),
             Arc::clone(&config),
             config_manager.clone(),
-            Arc::clone(&workspace_settings_cache),
         );
         let command_exec_processor = CommandExecRequestProcessor::new(
             arg0_paths.clone(),
@@ -449,6 +452,7 @@ impl MessageProcessor {
         let mcp_processor = McpRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
+            thread_state_manager.clone(),
             outgoing.clone(),
             config_manager.clone(),
         );
@@ -458,7 +462,6 @@ impl MessageProcessor {
             outgoing.clone(),
             analytics_events_client.clone(),
             config_manager.clone(),
-            workspace_settings_cache,
             on_effective_plugins_changed,
         );
         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
@@ -498,10 +501,11 @@ impl MessageProcessor {
             state_db.clone(),
             log_db,
             Arc::clone(&skills_watcher),
+            turn_cost_worker.as_ref().map(TurnCostWorker::handle),
             config_warnings,
         );
         let turn_processor = TurnRequestProcessor::new(
-            auth_manager.clone(),
+            auth_manager,
             Arc::clone(&thread_manager),
             outgoing.clone(),
             analytics_events_client.clone(),
@@ -513,6 +517,7 @@ impl MessageProcessor {
             thread_watch_manager,
             thread_list_state_permit,
             Arc::clone(&skills_watcher),
+            turn_cost_worker.as_ref().map(TurnCostWorker::handle),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
             // Keep plugin startup warmups aligned at app-server startup.
@@ -522,7 +527,6 @@ impl MessageProcessor {
                 .plugins_manager()
                 .maybe_start_plugin_startup_tasks_for_config(
                     &config.plugins_config_input(),
-                    auth_manager,
                     Some(on_effective_plugins_changed),
                 );
         }
@@ -553,6 +557,7 @@ impl MessageProcessor {
         Self {
             outgoing,
             models_refresh_worker,
+            turn_cost_worker,
             skills_watcher,
             account_processor,
             apps_processor,
@@ -762,6 +767,9 @@ impl MessageProcessor {
 
     pub(crate) async fn drain_background_tasks(&self) {
         self.models_refresh_worker.shutdown();
+        if let Some(worker) = &self.turn_cost_worker {
+            worker.shutdown();
+        }
         self.thread_processor.drain_background_tasks().await;
     }
 
@@ -782,6 +790,8 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         session_state: &ConnectionSessionState,
     ) {
+        session_state.rpc_gate.close().await;
+        session_state.mcp_event_streams.clear().await;
         if timeout(
             CONNECTION_RPC_DRAIN_TIMEOUT,
             session_state.rpc_gate.shutdown(),
@@ -813,14 +823,12 @@ impl MessageProcessor {
 
     /// Handle a standalone JSON-RPC response originating from the peer.
     pub(crate) async fn process_response(&self, response: JSONRPCResponse) {
-        tracing::info!("<- response: {:?}", response);
         let JSONRPCResponse { id, result, .. } = response;
         self.outgoing.notify_client_response(id, result).await
     }
 
     /// Handle an error object received from the peer.
     pub(crate) async fn process_error(&self, err: JSONRPCError) {
-        tracing::error!("<- error: {:?}", err);
         self.outgoing.notify_client_error(err.id, err.error).await;
     }
 
@@ -892,10 +900,16 @@ impl MessageProcessor {
             &codex_request,
         );
 
+        let event_stream_ready = match &codex_request {
+            ClientRequest::McpServerEventStreamStart { params, .. } => Some(
+                session
+                    .mcp_event_streams
+                    .start(connection_id, params.clone(), self.mcp_processor.clone())
+                    .await?,
+            ),
+            _ => None,
+        };
         let serialization_scope = codex_request.serialization_scope();
-        let app_server_client_name = session.app_server_client_name().map(str::to_string);
-        let client_version = session.client_version().map(str::to_string);
-        let client_mcp_extensions = session.client_mcp_extensions();
         let error_request_id = connection_request_id.clone();
         let rpc_gate = Arc::clone(&session.rpc_gate);
         let processor = Arc::clone(self);
@@ -909,9 +923,8 @@ impl MessageProcessor {
                         connection_request_id,
                         codex_request,
                         request_context,
-                        app_server_client_name,
-                        client_version,
-                        client_mcp_extensions,
+                        session,
+                        event_stream_ready,
                     )
                     .await;
                 if let Err(error) = result {
@@ -939,16 +952,17 @@ impl MessageProcessor {
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
         request_context: RequestContext,
-        app_server_client_name: Option<String>,
-        client_version: Option<String>,
-        client_mcp_extensions: ClientMcpExtensions,
+        session: Arc<ConnectionSessionState>,
+        event_stream_ready: Option<McpEventStreamReady>,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
+        let app_server_client_name = session.app_server_client_name().map(str::to_string);
+        let client_version = session.client_version().map(str::to_string);
+        let client_mcp_extensions = session.client_mcp_extensions();
         let request_id = ConnectionRequestId {
             connection_id,
             request_id: codex_request.id().clone(),
         };
-
         let result: Result<Option<ClientResponsePayload>, JSONRPCErrorError> = match codex_request {
             ClientRequest::Initialize { .. } => {
                 panic!("Initialize should be handled before initialized request dispatch");
@@ -1112,9 +1126,15 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::ThreadUnsubscribe { params, .. } => {
-                self.thread_processor
+                let thread_id = params.thread_id.clone();
+                let response = self
+                    .thread_processor
                     .thread_unsubscribe(&request_id, params)
-                    .await
+                    .await?;
+                if let Ok(thread_id) = ThreadId::from_string(&thread_id) {
+                    session.mcp_event_streams.stop_thread(thread_id).await;
+                }
+                Ok(response)
             }
             ClientRequest::ThreadResume { params, .. } => {
                 self.thread_processor
@@ -1309,7 +1329,7 @@ impl MessageProcessor {
                 self.thread_processor.thread_loaded_list(params).await
             }
             ClientRequest::ThreadRead { params, .. } => {
-                self.thread_processor.thread_read(params).await
+                self.thread_processor.thread_read(&request_id, params).await
             }
             ClientRequest::ThreadTurnsList { params, .. } => {
                 self.thread_processor.thread_turns_list(params).await
@@ -1428,10 +1448,17 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::ThreadInjectItems { params, .. } => {
-                self.turn_processor.thread_inject_items(params).await
+                self.turn_processor
+                    .thread_inject_items(&request_id, params)
+                    .await
             }
             ClientRequest::TurnSteer { params, .. } => {
                 self.turn_processor.turn_steer(&request_id, params).await
+            }
+            ClientRequest::TurnSettingsUpdate { params, .. } => {
+                self.turn_processor
+                    .turn_settings_update(&request_id, params)
+                    .await
             }
             ClientRequest::TurnInterrupt { params, .. } => {
                 self.turn_processor
@@ -1463,6 +1490,9 @@ impl MessageProcessor {
                     .thread_realtime_stop(&request_id, params)
                     .await
             }
+            ClientRequest::ThreadTimelineList { params, .. } => {
+                self.thread_processor.thread_timeline_list(params).await
+            }
             ClientRequest::ThreadRealtimeListVoices { params: _, .. } => {
                 self.turn_processor.thread_realtime_list_voices().await
             }
@@ -1485,6 +1515,27 @@ impl MessageProcessor {
                     .mcp_resource_read(&request_id, params)
                     .await
             }
+            ClientRequest::McpServerEventStreamStart { params, .. } => {
+                let ready = event_stream_ready.ok_or_else(|| {
+                    internal_error("MCP event subscription was not reserved before startup")
+                })?;
+                session
+                    .mcp_event_streams
+                    .wait_for_activation(&params.subscription_id, ready)
+                    .await?;
+                Ok(Some(
+                    codex_app_server_protocol::McpServerEventStreamStartResponse {}.into(),
+                ))
+            }
+            ClientRequest::McpServerEventStreamStop { params, .. } => {
+                session
+                    .mcp_event_streams
+                    .stop(&params.subscription_id)
+                    .await;
+                Ok(Some(
+                    codex_app_server_protocol::McpServerEventStreamStopResponse {}.into(),
+                ))
+            }
             ClientRequest::McpServerToolCall { params, .. } => {
                 self.mcp_processor
                     .mcp_server_tool_call(&request_id, params)
@@ -1499,6 +1550,12 @@ impl MessageProcessor {
                 self.account_processor
                     .login_account(request_id.clone(), params)
                     .await
+            }
+            ClientRequest::BedrockDiscover { params, .. } => {
+                self.account_processor.bedrock_discover(params).await
+            }
+            ClientRequest::BedrockSetup { params, .. } => {
+                self.account_processor.bedrock_setup(params).await
             }
             ClientRequest::LogoutAccount { .. } => {
                 self.account_processor
