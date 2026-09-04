@@ -25,6 +25,7 @@ use crate::thread_manager::ThreadManagerState;
 use crate::thread_manager::default_thread_id_generator;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use crate::turn_timing::now_unix_timestamp_ms;
+use arc_swap::ArcSwapOption;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
@@ -76,6 +77,7 @@ mod execution;
 mod external;
 mod legacy;
 mod residency;
+mod service_tier;
 mod spawn;
 mod terminal_notification;
 mod user_authorization;
@@ -128,8 +130,7 @@ struct ExternalBackendRoute {
 /// which keeps the registry scoped to that root thread rather than the entire `ThreadManager`.
 #[derive(Clone)]
 pub(crate) struct AgentControl {
-    /// ID shared by the whole agent control session. This means every sub-agents from a common
-    /// root share the same session ID.
+    /// session_id is equal to the root thread's ID.
     session_id: SessionId,
     /// Weak handle back to the global thread registry/state.
     /// This is `Weak` to avoid reference cycles and shadow persistence of the form
@@ -148,6 +149,8 @@ pub(crate) struct AgentControl {
     team: Arc<codex_team_runtime::TeamControl>,
     #[cfg(test)]
     attach_to_start_test: Arc<attach_to_start::AttachToStartTestControl>,
+    /// The user-selected root routing tier, shared by the entire agent tree.
+    root_service_tier: Arc<ArcSwapOption<String>>,
 }
 
 impl Default for AgentControl {
@@ -213,6 +216,7 @@ impl AgentControl {
             team,
             #[cfg(test)]
             attach_to_start_test: Arc::default(),
+            root_service_tier: Arc::new(ArcSwapOption::from(None)),
         };
         if let Some(rollout_budget) = rollout_budget {
             control.rollout_budget.configure(rollout_budget);
