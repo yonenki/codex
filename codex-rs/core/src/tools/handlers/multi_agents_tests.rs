@@ -4791,6 +4791,7 @@ fn build_registry_router(
         session,
         step_context.turn.as_ref(),
         step_context.turn.model_info(),
+        None,
         &step_context.environments,
         &step_context.mcp,
         false,
@@ -5928,7 +5929,7 @@ async fn registry_cancellation_terminalizes_handler_owned_team_tool_after_semant
         .expect("cancelled registry dispatch should finish")
         .expect("registry task should join")
         .expect("cancellation returns a model-visible abort response");
-    let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+    let ResponseItem::FunctionCallOutput { output, .. } = response.item else {
         panic!("cancelled Team tool should return function output");
     };
     assert!(
@@ -6527,6 +6528,7 @@ async fn tool_plan_hides_team_tools_in_v1_and_exposes_team_tools_in_v2() {
         &v1_session,
         &v1_turn,
         v1_turn.model_info(),
+        None,
         &v1_step_context.environments,
         &v1_step_context.mcp,
         false,
@@ -6568,6 +6570,7 @@ async fn tool_plan_hides_team_tools_in_v1_and_exposes_team_tools_in_v2() {
         &v2_session,
         &v2_turn,
         v2_turn.model_info(),
+        None,
         &v2_step_context.environments,
         &v2_step_context.mcp,
         false,
