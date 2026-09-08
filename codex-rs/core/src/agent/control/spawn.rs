@@ -17,7 +17,7 @@ use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::world_state::PersistentModeState;
 use crate::exec_env::create_env;
-use crate::exec_env::inject_session_id_env;
+use crate::exec_env::inject_session_env;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
 use codex_context_fragments::set_annotated_content;
@@ -344,7 +344,7 @@ impl AgentControl {
         agent_metadata.metadata = metadata;
         let agent_id = self.generate_thread_id();
         let mut env = create_env(&config.permissions.shell_environment_policy, Some(agent_id));
-        inject_session_id_env(&mut env, self.session_id());
+        inject_session_env(&mut env, self.session_id());
         let host_command =
             Self::env_value(&env, "CODEX_ACP_HARNESS_HOST_COMMAND").ok_or_else(|| {
                 CodexErr::InvalidRequest(
