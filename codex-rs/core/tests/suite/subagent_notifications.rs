@@ -2999,7 +2999,7 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     let completion_request = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            !body_contains(req, TURN_1_PROMPT)
+            request_has_input_type(req, "agent_message")
                 && body_contains(req, "Message Type: FINAL_ANSWER")
                 && body_contains(req, "acp done")
         },
@@ -3191,9 +3191,7 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     let followup_completion_request = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            !body_contains(req, followup_prompt)
-                && !body_contains(req, followup_call_id)
-                && body_contains(req, "acp follow-up done")
+            request_has_input_type(req, "agent_message") && body_contains(req, "acp follow-up done")
         },
         sse(vec![
             ev_response_created("resp-parent-acp-8"),
