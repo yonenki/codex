@@ -6,34 +6,71 @@
 use super::*;
 
 impl ChatWidget {
+    /// Flush prior activity before live or replayed assistant text.
+    pub(super) fn prepare_assistant_message(&mut self) {
+        self.flush_unified_exec_wait_streak();
+        self.flush_active_cell();
+    }
+
     /// Replay a subset of initial events into the UI to seed the transcript when
     /// resuming an existing session. This approximates the live event flow and
     /// is intentionally conservative: only safe-to-replay items are rendered to
     /// avoid triggering side effects. Event ids are passed as `None` to
     /// distinguish replayed events from live ones.
     pub(crate) fn replay_thread_turns(&mut self, turns: Vec<Turn>, replay_kind: ReplayKind) {
+        if matches!(replay_kind, ReplayKind::ThreadSnapshot) && !turns.is_empty() {
+            self.warning_display_state.startup_complete = true;
+        }
+        let latest_turn_id = turns.last().map(|turn| turn.id.clone());
         let hidden_nested_review_turns = std::iter::once(/*value*/ false)
             .chain(turns.windows(/*size*/ 2).map(|turns| {
                 crate::app_backtrack::is_hidden_nested_review_turn(&turns[0], &turns[1])
             }))
             .collect::<Vec<_>>();
         for (turn, hidden_nested_review_turn) in turns.into_iter().zip(hidden_nested_review_turns) {
+            // Defer completed metadata-only turns until their page loads. Active
+            // turns must restore their lifecycle even before any items are available.
+            if turn.status == TurnStatus::Completed
+                && turn.items_view == codex_app_server_protocol::TurnItemsView::NotLoaded
+                && turn.items.is_empty()
+            {
+                continue;
+            }
             let Turn {
                 id: turn_id,
                 items_view: _,
                 items,
                 status,
-                error,
+                mut error,
                 started_at,
                 completed_at,
                 duration_ms,
             } = turn;
+            let delegated = items.iter().any(|item| {
+                matches!(item, ThreadItem::UserMessage { content, .. }
+                    if realtime::realtime_delegation_input(content).is_some())
+            });
             if matches!(status, TurnStatus::InProgress) {
+                if delegated {
+                    self.remember_realtime_delegated_reasoning_turn(&turn_id);
+                }
+                self.warning_display_state.startup_complete = true;
                 self.turn_lifecycle.last_turn_id = Some(turn_id.clone());
                 self.last_non_retry_error = None;
                 self.on_task_started();
             }
+            let mut replaying_delegation = false;
             for item in items {
+                if matches!(&item, ThreadItem::UserMessage { content, .. }
+                    if realtime::realtime_delegation_input(content).is_some())
+                {
+                    replaying_delegation = true;
+                }
+                // Voice can steer a typed turn already in progress. Its earlier
+                // commentary and reasoning still belong to the typed request.
+                if replaying_delegation && realtime::is_private_realtime_agent_item(&item) {
+                    continue;
+                }
                 if hidden_nested_review_turn && matches!(item, ThreadItem::UserMessage { .. }) {
                     continue;
                 }
@@ -44,6 +81,20 @@ impl ChatWidget {
             } else {
                 status
             };
+            // A resolved historical precaution must not clear the restored draft or input queue.
+            if Some(&turn_id) != latest_turn_id.as_ref()
+                && error.as_ref().is_some_and(|error| {
+                    error.codex_error_info
+                        == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation)
+                })
+            {
+                error = None;
+            }
+            if hidden_nested_review_turn {
+                self.turn_lifecycle
+                    .rendered_completion_turn_ids
+                    .insert(turn_id.clone());
+            }
             if matches!(
                 status,
                 TurnStatus::Completed | TurnStatus::Interrupted | TurnStatus::Failed
@@ -86,8 +137,15 @@ impl ChatWidget {
         let from_replay = render_source.is_replay();
         let replay_kind = render_source.replay_kind();
         match item {
-            ThreadItem::UserMessage { content, .. } => {
-                self.on_committed_user_message(&content, from_replay);
+            ThreadItem::UserMessage {
+                content, client_id, ..
+            } => {
+                self.on_committed_user_message(
+                    &content,
+                    client_id.as_deref(),
+                    from_replay,
+                    &turn_id,
+                );
             }
             ThreadItem::AgentMessage {
                 id,
@@ -98,6 +156,20 @@ impl ChatWidget {
                 questions,
                 ..
             } => {
+                if self.complete_realtime_delegated_agent_item(
+                    &turn_id,
+                    &ThreadItem::AgentMessage {
+                        id: id.clone(),
+                        text: text.clone(),
+                        phase: phase.clone(),
+                        memory_citation: memory_citation.clone(),
+                        delivery,
+                        questions: questions.clone(),
+                    },
+                    from_replay,
+                ) {
+                    return;
+                }
                 self.on_agent_message_item_completed(
                     AgentMessageItem {
                         id,
@@ -198,8 +270,8 @@ impl ChatWidget {
             ThreadItem::ExitedReviewMode { .. } => {
                 self.exit_review_mode_after_item();
             }
-            ThreadItem::ContextCompaction { .. } => {
-                self.add_info_message("Context compacted".to_string(), /*hint*/ None);
+            ThreadItem::ContextCompaction { id } => {
+                self.on_context_compaction_completed(&id, from_replay);
             }
             ThreadItem::FunctionCallOutput {
                 name,

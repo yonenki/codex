@@ -1,8 +1,7 @@
-use std::collections::VecDeque;
-
 use codex_extension_api::ConversationHistorySnapshot;
 use codex_extension_api::ResponseItem;
 pub(crate) use codex_features::GuardianV2TranscriptSource as TranscriptSource;
+use codex_guardian_context::ContextSection;
 use codex_guardian_context::ContextTarget;
 use codex_guardian_context::ConversationTranscriptConfig;
 use codex_guardian_context::ConversationTranscriptEntry;
@@ -11,16 +10,17 @@ use codex_guardian_context::ConversationTranscriptOptions;
 use codex_guardian_context::GuardianRootMessage;
 #[cfg(test)]
 use codex_guardian_context::MANUAL_APPROVAL_DEVELOPER_PREFIX;
+use codex_guardian_context::PlannedAction;
+use codex_guardian_context::PreviousReviews;
 use codex_guardian_context::SectionError;
 use codex_guardian_context::SectionHistory;
 use codex_guardian_context::SectionInput;
 use codex_guardian_context::TranscriptEntryLimits;
+use codex_guardian_context::TranscriptImageInput;
 use codex_guardian_context::TranscriptRetentionConfig;
+use codex_guardian_context::TrustedTool;
 use codex_guardian_context::default_registry;
 pub(crate) use codex_guardian_context::truncate_text as truncate_entry;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::ImageDetail;
 use codex_protocol::protocol::TruncationPolicy;
 
 use self::window::TranscriptWindow;
@@ -33,8 +33,6 @@ pub(crate) const MAX_TOOL_ENTRY_TOKENS: usize = 1_000;
 pub(crate) const MAX_MESSAGE_TRANSCRIPT_TOKENS: usize = 10_000;
 pub(crate) const MAX_TOOL_TRANSCRIPT_TOKENS: usize = 10_000;
 pub(crate) const MAX_RECENT_NON_USER_ENTRIES: usize = 40;
-const MAX_TRANSCRIPT_IMAGES: usize = 4;
-const MAX_TRANSCRIPT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TranscriptEntryKind {
     User,
@@ -51,15 +49,22 @@ struct TranscriptEntry {
     retained_bytes: usize,
 }
 
-pub(crate) struct RenderedContext {
-    pub(crate) authorization: Vec<String>,
-    pub(crate) entries: Vec<String>,
-    pub(crate) truncations: Vec<TruncationObservation>,
+/// Host snapshot and evidence borrowed for a single section collection.
+pub(crate) struct ContextInput<'a> {
+    pub(crate) target: ContextTarget,
+    pub(crate) history: &'a dyn ConversationHistorySnapshot,
+    pub(crate) root_conversation: &'a [GuardianRootMessage],
+    pub(crate) trusted_user_answers: &'a [String],
+    pub(crate) planned_action: Option<&'a PlannedAction>,
+    pub(crate) previous_reviews: Option<&'a PreviousReviews>,
+    pub(crate) trusted_tool: Option<&'a TrustedTool>,
+    pub(crate) trusted_skill_paths: &'a [String],
+    pub(crate) images: Option<TranscriptImageInput<'a>>,
 }
 
-pub(crate) struct RenderedImages {
-    pub(crate) images: Vec<ContentItem>,
-    pub(crate) omitted_bytes: usize,
+pub(crate) struct RenderedContext {
+    pub(crate) sections: Vec<ContextSection<String>>,
+    pub(crate) truncations: Vec<TruncationObservation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,91 +93,21 @@ impl Default for TranscriptConfig {
 }
 
 impl TranscriptConfig {
-    pub(crate) fn images<'a>(
-        &self,
-        items: impl IntoIterator<Item = &'a ResponseItem>,
-        node_repl_images: impl IntoIterator<Item = ContentItem>,
-    ) -> RenderedImages {
-        if !self.include_images {
-            return RenderedImages {
-                images: Vec::new(),
-                omitted_bytes: 0,
-            };
-        }
-
-        let mut images = VecDeque::new();
-        let mut image_bytes = 0usize;
-        let mut omitted_bytes = 0usize;
-        let mut include_image = |image_url: &str, detail: Option<ImageDetail>| {
-            if image_url.len() > MAX_TRANSCRIPT_IMAGE_BYTES {
-                omitted_bytes = omitted_bytes.saturating_add(image_url.len());
-                return;
-            }
-            while images.len() >= MAX_TRANSCRIPT_IMAGES
-                || image_bytes + image_url.len() > MAX_TRANSCRIPT_IMAGE_BYTES
-            {
-                let Some(ContentItem::InputImage { image_url, .. }) = images.pop_front() else {
-                    break;
-                };
-                image_bytes -= image_url.len();
-                omitted_bytes = omitted_bytes.saturating_add(image_url.len());
-            }
-            image_bytes += image_url.len();
-            images.push_back(ContentItem::InputImage {
-                image_url: image_url.to_owned(),
-                detail,
-            });
-        };
-
-        for item in items {
-            match item {
-                ResponseItem::Message { role, content, .. }
-                    if matches!(role.as_str(), "user" | "assistant") =>
-                {
-                    for item in content {
-                        if let ContentItem::InputImage { image_url, detail } = item {
-                            include_image(image_url, *detail);
-                        }
-                    }
-                }
-                ResponseItem::FunctionCallOutput { output, .. }
-                | ResponseItem::CustomToolCallOutput { output, .. }
-                    if self.sources.contains(&TranscriptSource::ToolOutputs) =>
-                {
-                    if let Some(content) = output.content_items() {
-                        for item in content {
-                            if let FunctionCallOutputContentItem::InputImage { image_url, detail } =
-                                item
-                            {
-                                include_image(image_url, *detail);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if self.sources.contains(&TranscriptSource::ToolOutputs) {
-            for image in node_repl_images {
-                if let ContentItem::InputImage { image_url, detail } = image {
-                    include_image(&image_url, detail);
-                }
-            }
-        }
-
-        RenderedImages {
-            images: images.into_iter().collect(),
-            omitted_bytes,
-        }
-    }
-
     pub(crate) fn build_context(
         &self,
-        target: ContextTarget,
-        history: &dyn ConversationHistorySnapshot,
-        root_conversation: &[GuardianRootMessage],
-        trusted_user_answers: &[String],
+        input: ContextInput<'_>,
     ) -> Result<RenderedContext, SectionError> {
+        let ContextInput {
+            target,
+            history,
+            root_conversation,
+            trusted_user_answers,
+            planned_action,
+            previous_reviews,
+            trusted_tool,
+            trusted_skill_paths,
+            images,
+        } = input;
         let history = SnapshotHistory(history);
         let retention = TranscriptRetentionConfig {
             max_message_transcript_tokens: self.max_message_transcript_tokens,
@@ -191,22 +126,65 @@ impl TranscriptConfig {
                 node_repl_output_tokens: self.max_tool_entry_tokens,
             },
         };
-        let context = default_registry().compose(&SectionInput {
+        let context = default_registry().collect(&SectionInput {
             target,
             history: &history,
             transcript: &transcript,
             root_conversation,
             trusted_user_answers,
+            planned_action,
+            permissions: None,
+            previous_reviews,
+            trusted_tool,
+            trusted_skill_paths,
+            images,
+            node_repl: None,
         })?;
-        let mut rendered = Self::render(context.transcript, &retention);
-        rendered.authorization = context.authorization;
-        Ok(rendered)
+        let mut truncations = Vec::new();
+        let sections = context
+            .into_iter()
+            .map(|section| match section {
+                ContextSection::ConversationTranscript { items } => {
+                    let (items, observations) = Self::render(items, &retention);
+                    truncations.extend(observations);
+                    ContextSection::ConversationTranscript { items }
+                }
+                ContextSection::RootConversation { items } => {
+                    ContextSection::RootConversation { items }
+                }
+                ContextSection::TrustedUserAnswers { items } => {
+                    ContextSection::TrustedUserAnswers { items }
+                }
+                ContextSection::RetainedUserInstructions { items } => {
+                    ContextSection::RetainedUserInstructions { items }
+                }
+                ContextSection::PermissionContext { items } => {
+                    ContextSection::PermissionContext { items }
+                }
+                ContextSection::NodeReplEvidence(evidence) => {
+                    ContextSection::NodeReplEvidence(evidence)
+                }
+                ContextSection::TranscriptImages(images) => {
+                    ContextSection::TranscriptImages(images)
+                }
+                ContextSection::TrustedSkills(skills) => ContextSection::TrustedSkills(skills),
+                ContextSection::TrustedTool(tool) => ContextSection::TrustedTool(tool),
+                ContextSection::PreviousReviews(reviews) => {
+                    ContextSection::PreviousReviews(reviews)
+                }
+                ContextSection::PlannedAction(action) => ContextSection::PlannedAction(action),
+            })
+            .collect::<Vec<_>>();
+        Ok(RenderedContext {
+            sections,
+            truncations,
+        })
     }
 
     fn render(
         transcript_entries: impl IntoIterator<Item = ConversationTranscriptEntry>,
         retention: &TranscriptRetentionConfig,
-    ) -> RenderedContext {
+    ) -> (Vec<String>, Vec<TruncationObservation>) {
         let mut entries = Vec::new();
 
         for entry in transcript_entries {
@@ -300,17 +278,17 @@ impl TranscriptConfig {
             })
             .collect();
 
-        RenderedContext {
-            authorization: Vec::new(),
-            entries,
-            truncations,
-        }
+        (entries, truncations)
     }
 }
 
 struct SnapshotHistory<'a>(&'a dyn ConversationHistorySnapshot);
 
 impl SectionHistory for SnapshotHistory<'_> {
+    fn retained_context(&self) -> Option<&codex_history::RetainedContext> {
+        self.0.retained_context()
+    }
+
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
         self.0.review_items()
     }

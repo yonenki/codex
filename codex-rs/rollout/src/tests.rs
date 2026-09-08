@@ -84,7 +84,7 @@ fn rollout_line_decoder_preserves_canonical_json_compatibility() -> Result<()> {
 
     for encoded in cases {
         let value = serde_json::from_str::<serde_json::Value>(encoded)?;
-        let decoded = crate::decode_rollout_line(value.clone())?;
+        let decoded = crate::parse_rollout_line(encoded)?;
         let mut expected = value;
         if expected["type"] != "response_item" {
             expected
@@ -744,11 +744,13 @@ async fn test_list_conversations_latest_first() {
     let expected = ThreadsPage {
         items: vec![
             ThreadItem {
+                originator: Some("test_originator".to_string()),
                 path: p1,
                 thread_id: Some(thread_id_from_uuid(u3)),
                 first_user_message: Some("Hello from user".to_string()),
                 preview: Some("Hello from user".to_string()),
                 project_id: None,
+                daybreak_enabled: None,
                 section: None,
                 cwd: Some(Path::new(".").to_path_buf()),
                 git_branch: None,
@@ -768,11 +770,13 @@ async fn test_list_conversations_latest_first() {
                 updated_at: updated_times.first().cloned().flatten(),
             },
             ThreadItem {
+                originator: Some("test_originator".to_string()),
                 path: p2,
                 thread_id: Some(thread_id_from_uuid(u2)),
                 first_user_message: Some("Hello from user".to_string()),
                 preview: Some("Hello from user".to_string()),
                 project_id: None,
+                daybreak_enabled: None,
                 section: None,
                 cwd: Some(Path::new(".").to_path_buf()),
                 git_branch: None,
@@ -792,11 +796,13 @@ async fn test_list_conversations_latest_first() {
                 updated_at: updated_times.get(1).cloned().flatten(),
             },
             ThreadItem {
+                originator: Some("test_originator".to_string()),
                 path: p3,
                 thread_id: Some(thread_id_from_uuid(u1)),
                 first_user_message: Some("Hello from user".to_string()),
                 preview: Some("Hello from user".to_string()),
                 project_id: None,
+                daybreak_enabled: None,
                 section: None,
                 cwd: Some(Path::new(".").to_path_buf()),
                 git_branch: None,
@@ -909,11 +915,13 @@ async fn test_pagination_cursor() {
     let expected_page1 = ThreadsPage {
         items: vec![
             ThreadItem {
+                originator: Some("test_originator".to_string()),
                 path: p5,
                 thread_id: Some(thread_id_from_uuid(u5)),
                 first_user_message: Some("Hello from user".to_string()),
                 preview: Some("Hello from user".to_string()),
                 project_id: None,
+                daybreak_enabled: None,
                 section: None,
                 cwd: Some(Path::new(".").to_path_buf()),
                 git_branch: None,
@@ -933,11 +941,13 @@ async fn test_pagination_cursor() {
                 updated_at: updated_page1.first().cloned().flatten(),
             },
             ThreadItem {
+                originator: Some("test_originator".to_string()),
                 path: p4,
                 thread_id: Some(thread_id_from_uuid(u4)),
                 first_user_message: Some("Hello from user".to_string()),
                 preview: Some("Hello from user".to_string()),
                 project_id: None,
+                daybreak_enabled: None,
                 section: None,
                 cwd: Some(Path::new(".").to_path_buf()),
                 git_branch: None,
@@ -993,11 +1003,13 @@ async fn test_pagination_cursor() {
     let expected_page2 = ThreadsPage {
         items: vec![
             ThreadItem {
+                originator: Some("test_originator".to_string()),
                 path: p3,
                 thread_id: Some(thread_id_from_uuid(u3)),
                 first_user_message: Some("Hello from user".to_string()),
                 preview: Some("Hello from user".to_string()),
                 project_id: None,
+                daybreak_enabled: None,
                 section: None,
                 cwd: Some(Path::new(".").to_path_buf()),
                 git_branch: None,
@@ -1017,11 +1029,13 @@ async fn test_pagination_cursor() {
                 updated_at: updated_page2.first().cloned().flatten(),
             },
             ThreadItem {
+                originator: Some("test_originator".to_string()),
                 path: p2,
                 thread_id: Some(thread_id_from_uuid(u2)),
                 first_user_message: Some("Hello from user".to_string()),
                 preview: Some("Hello from user".to_string()),
                 project_id: None,
+                daybreak_enabled: None,
                 section: None,
                 cwd: Some(Path::new(".").to_path_buf()),
                 git_branch: None,
@@ -1069,11 +1083,13 @@ async fn test_pagination_cursor() {
         page3.items.iter().map(|i| i.updated_at.clone()).collect();
     let expected_page3 = ThreadsPage {
         items: vec![ThreadItem {
+            originator: Some("test_originator".to_string()),
             path: p1,
             thread_id: Some(thread_id_from_uuid(u1)),
             first_user_message: Some("Hello from user".to_string()),
             preview: Some("Hello from user".to_string()),
             project_id: None,
+            daybreak_enabled: None,
             section: None,
             cwd: Some(Path::new(".").to_path_buf()),
             git_branch: None,
@@ -1246,11 +1262,13 @@ async fn test_get_thread_contents() {
         .join(format!("rollout-2025-04-01T10-30-00-{uuid}.jsonl"));
     let expected_page = ThreadsPage {
         items: vec![ThreadItem {
+            originator: Some("test_originator".to_string()),
             path: expected_path,
             thread_id: Some(thread_id_from_uuid(uuid)),
             first_user_message: Some("Hello from user".to_string()),
             preview: Some("Hello from user".to_string()),
             project_id: None,
+            daybreak_enabled: None,
             section: None,
             cwd: Some(Path::new(".").to_path_buf()),
             git_branch: None,
@@ -1651,11 +1669,13 @@ async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties() {
     let expected_page1 = ThreadsPage {
         items: vec![
             ThreadItem {
+                originator: Some("test_originator".to_string()),
                 path: p3,
                 thread_id: Some(thread_id_from_uuid(u3)),
                 first_user_message: Some("Hello from user".to_string()),
                 preview: Some("Hello from user".to_string()),
                 project_id: None,
+                daybreak_enabled: None,
                 section: None,
                 cwd: Some(Path::new(".").to_path_buf()),
                 git_branch: None,
@@ -1675,11 +1695,13 @@ async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties() {
                 updated_at: updated_page1.first().cloned().flatten(),
             },
             ThreadItem {
+                originator: Some("test_originator".to_string()),
                 path: p2,
                 thread_id: Some(thread_id_from_uuid(u2)),
                 first_user_message: Some("Hello from user".to_string()),
                 preview: Some("Hello from user".to_string()),
                 project_id: None,
+                daybreak_enabled: None,
                 section: None,
                 cwd: Some(Path::new(".").to_path_buf()),
                 git_branch: None,

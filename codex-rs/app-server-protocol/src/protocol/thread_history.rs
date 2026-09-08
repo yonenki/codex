@@ -401,6 +401,7 @@ impl ThreadHistoryBuilder {
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::SessionMeta(_) => {}
         }
@@ -3342,6 +3343,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                review_reason: None,
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 plugin_id: Some("sample@openai-curated".into()),
@@ -3363,6 +3365,7 @@ mod tests {
                 .expect("guardian action"),
             }),
             EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                review_reason: None,
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 plugin_id: Some("sample@openai-curated".into()),
@@ -3434,6 +3437,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                review_reason: None,
                 id: "review-guardian-execve".into(),
                 target_item_id: Some("guardian-execve".into()),
                 plugin_id: Some("sample@openai-curated".into()),
@@ -4092,6 +4096,7 @@ mod tests {
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
                 replacement_history: None,
+                retained_context: None,
                 guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: None,
