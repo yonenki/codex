@@ -30,6 +30,9 @@ use std::future::Future;
 
 mod agents;
 mod lifecycle;
+mod output;
+use output::ViewDetail;
+use output::progress;
 
 pub(crate) use agents::TeamAgentToolHandler;
 pub(crate) use lifecycle::TeamLifecycleToolHandler;
@@ -181,17 +184,20 @@ mod tests {
     }
 
     impl codex_team_runtime::TeamStore for FailFailedLifecycleStore {
-        async fn persist_event(
+        async fn persist_events(
             &self,
             state: &codex_team_runtime::TeamSessionState,
-            event: &codex_team_runtime::TeamEvent,
+            events: &[codex_team_runtime::TeamEvent],
         ) -> codex_team_runtime::TeamRuntimeResult<()> {
-            if event.kind == codex_team_runtime::TeamEventKind::ToolOperationFailed {
+            if events
+                .iter()
+                .any(|event| event.kind == codex_team_runtime::TeamEventKind::ToolOperationFailed)
+            {
                 return Err(codex_team_runtime::TeamRuntimeError::Store(
                     "terminal trace unavailable".to_string(),
                 ));
             }
-            self.inner.persist_event(state, event).await
+            self.inner.persist_events(state, events).await
         }
 
         async fn load_teams(
@@ -303,7 +309,7 @@ completion = "Closed."
         assert!(start
             .into_iter()
             .all(|capability| team_authority_class(capability) == TeamAuthorityClass::StartTeam));
-        assert_eq!(scoped.len(), 15);
+        assert_eq!(scoped.len(), 16);
         assert!(
             scoped
                 .into_iter()
@@ -589,7 +595,22 @@ impl TeamToolResult {
     fn view(view: TeamView) -> Self {
         let trace_team_session_id = Some(view.team_session_id.clone());
         Self {
-            value: serde_json::to_value(view).unwrap_or(JsonValue::Null),
+            value: progress(&view, ViewDetail::Summary),
+            trace_team_session_id,
+        }
+    }
+
+    fn guide(view: TeamView) -> Self {
+        Self {
+            value: progress(&view, ViewDetail::Guide),
+            trace_team_session_id: Some(view.team_session_id),
+        }
+    }
+
+    fn detailed(view: TeamView) -> Self {
+        let trace_team_session_id = Some(view.team_session_id.clone());
+        Self {
+            value: serde_json::to_value(view).expect("Team view is JSON serializable"),
             trace_team_session_id,
         }
     }

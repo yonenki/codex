@@ -306,12 +306,16 @@ pub fn create_list_agents_tool() -> ToolSpec {
             "Task-path prefix filter without a trailing slash. Omit to list all live agents."
                 .to_string(),
         )),
-    )]);
+    ),
+    ("detail".to_string(), JsonSchema::string(Some("summary (default) returns lifecycle states; full includes final reports and errors. Use path_prefix to retrieve one agent's details.".to_string()))),
+    ("offset".to_string(), JsonSchema::number(Some("Pagination offset. Defaults to 0.".to_string()))),
+    ("limit".to_string(), JsonSchema::number(Some("Page size. Defaults to 20, maximum 100.".to_string()))),
+    ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "list_agents".to_string(),
         description:
-            "List live agents in the current root thread tree. Optionally filter by task-path prefix."
+            "List agent lifecycle states without repeating completed reports. Paginated; request full detail for a specific task-path prefix when needed."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -471,17 +475,22 @@ fn list_agents_output_schema() -> Value {
                             "description": "Canonical task name for the agent when available, otherwise the agent id."
                         },
                         "agent_status": {
-                            "description": "Last known status of the agent.",
-                            "allOf": [agent_status_output_schema()]
+                            "description": "Lifecycle state, or full status when detail=full.",
+                            "anyOf": [
+                                {"type": "string", "enum": ["pending_init", "running", "interrupted", "completed", "errored", "shutdown", "not_found"]},
+                                agent_status_output_schema()
+                            ]
                         }
                     },
                     "required": ["agent_name", "agent_status"],
                     "additionalProperties": false
                 },
-                "description": "Live agents visible in the current root thread tree."
-            }
+                "description": "Page of agents visible in the current root thread tree."
+            },
+            "total": {"type": "integer"},
+            "next_offset": {"type": ["integer", "null"]}
         },
-        "required": ["agents"],
+        "required": ["agents", "total", "next_offset"],
         "additionalProperties": false
     })
 }

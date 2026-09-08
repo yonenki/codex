@@ -21,6 +21,7 @@ pub use contract::TEAM_EVENTS_MAX_BATCH;
 pub use contract::TeamEventEnvelope;
 pub use contract::TeamEventsBatch;
 pub use contract::team_events_path;
+pub use control::AdvanceTeamCommand;
 pub use control::BindAttemptHandle;
 pub use control::BindAttemptOutcome;
 pub use control::EndTeamCommand;
@@ -56,6 +57,8 @@ pub use store::MemoryTeamStore;
 pub use store::SqliteTeamStore;
 pub use store::TeamStore;
 
+#[cfg(test)]
+mod advance_tests;
 #[cfg(test)]
 mod control_tests;
 #[cfg(test)]

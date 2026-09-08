@@ -34,6 +34,10 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 
+#[path = "control_advance.rs"]
+mod advance;
+pub use advance::AdvanceTeamCommand;
+
 pub struct TeamControl {
     catalog: Mutex<TeamGraphCatalog>,
     store: Arc<dyn StoreHandle>,
@@ -72,6 +76,11 @@ struct SurfaceSnapshot {
 }
 
 trait StoreHandle: Send + Sync {
+    fn persist_events(
+        &self,
+        state: TeamSessionState,
+        events: Vec<TeamEvent>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TeamRuntimeResult<()>> + Send + '_>>;
     fn persist_event(
         &self,
         state: TeamSessionState,
@@ -103,6 +112,14 @@ trait StoreHandle: Send + Sync {
 }
 
 impl<T: TeamStore + 'static> StoreHandle for T {
+    fn persist_events(
+        &self,
+        state: TeamSessionState,
+        events: Vec<TeamEvent>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TeamRuntimeResult<()>> + Send + '_>>
+    {
+        Box::pin(async move { TeamStore::persist_events(self, &state, &events).await })
+    }
     fn persist_event(
         &self,
         state: TeamSessionState,
@@ -533,12 +550,12 @@ impl TeamControl {
             command.team_session_id,
             command.expected_revision,
             |state| {
-                if let Some(run) = state.current_node_run.as_ref() {
-                    if run.completed_at.is_none() {
-                        return Err(TeamRuntimeError::ActiveNodeRunExists(
-                            state.team_session_id.clone(),
-                        ));
-                    }
+                if let Some(run) = state.current_node_run.as_ref()
+                    && run.completed_at.is_none()
+                {
+                    return Err(TeamRuntimeError::ActiveNodeRunExists(
+                        state.team_session_id.clone(),
+                    ));
                 }
                 let node_id = match command.node_id {
                     Some(id) => id.parse().map_err(TeamRuntimeError::invalid)?,
@@ -1176,13 +1193,11 @@ impl TeamControl {
             .binding_for_checked(agent_thread_id)
             .await?
             .filter(|binding| binding.team_session_id == *team_session_id);
-        if kind != crate::event::TeamEventKind::ToolCoverageUnreported {
-            if binding.is_some() {
-                self.tool_reporting_agents
-                    .lock()
-                    .await
-                    .insert(agent_thread_id.to_string());
-            }
+        if kind != crate::event::TeamEventKind::ToolCoverageUnreported && binding.is_some() {
+            self.tool_reporting_agents
+                .lock()
+                .await
+                .insert(agent_thread_id.to_string());
         }
         self.mutate_without_cas(team_session_id.clone(), |state| {
             Ok(TeamEvent {
@@ -1667,7 +1682,15 @@ fn next_actions(
             tool: ToolCapability::StartTeamNode,
             reason: "Start the current node run before spawning agents.".to_string(),
         });
-        recommended.push(possible[0].clone());
+        possible.push(NextAction {
+            tool: ToolCapability::AdvanceTeam,
+            reason: "Record a completed result and advance atomically.".to_string(),
+        });
+        recommended.push(if guide.role.is_some() {
+            possible[0].clone()
+        } else {
+            possible[1].clone()
+        });
         return (possible, recommended);
     }
     if guide.role.is_some() {
@@ -1685,6 +1708,11 @@ fn next_actions(
         reason: "Record the structured node result.".to_string(),
     });
     possible.push(NextAction {
+        tool: ToolCapability::AdvanceTeam,
+        reason: "Record the verdict and evidence and start the declared successor atomically."
+            .to_string(),
+    });
+    possible.push(NextAction {
         tool: ToolCapability::GetTeamNext,
         reason: "Inspect possible and recommended transitions.".to_string(),
     });
@@ -1692,15 +1720,19 @@ fn next_actions(
         tool: ToolCapability::TransitionTeam,
         reason: "Advance to a declared successor node.".to_string(),
     });
-    if state.last_result.is_some() {
+    if state
+        .current_node_run
+        .as_ref()
+        .is_some_and(|run| run.completed_at.is_some())
+    {
         recommended.push(NextAction {
             tool: ToolCapability::TransitionTeam,
             reason: "A node result is recorded.".to_string(),
         });
     } else {
         recommended.push(NextAction {
-            tool: ToolCapability::RecordTeamResult,
-            reason: "The current node has no recorded result.".to_string(),
+            tool: ToolCapability::AdvanceTeam,
+            reason: "After work finishes, record the current node verdict and advance.".to_string(),
         });
     }
     (possible, recommended)

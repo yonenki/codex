@@ -2,6 +2,7 @@ use super::*;
 use crate::session::session::Session;
 use codex_team_graph::discover_team_graphs;
 use codex_team_graph::load_known_roles;
+use codex_team_runtime::AdvanceTeamCommand;
 use codex_team_runtime::EndTeamCommand;
 use codex_team_runtime::EvidenceCommand;
 use codex_team_runtime::RecordResultCommand;
@@ -133,7 +134,7 @@ async fn handle_lifecycle(
                 team.list_teams().await
             };
             return Ok(TeamToolResult::json(serde_json::json!({
-                "teams": teams,
+                "teams": teams.iter().map(|view| progress(view, ViewDetail::Summary)).collect::<Vec<_>>(),
                 "revision": 0,
                 "possible_next": [{"tool": "get_team_status", "reason": "Inspect one team_session_id."}],
                 "recommended_next": [{"tool": "get_team_status", "reason": "Inspect one team_session_id."}],
@@ -197,9 +198,9 @@ async fn handle_lifecycle(
             .await
             .map_err(map_team_error)?
         }
-        ToolCapability::RecordTeamResult => {
+        ToolCapability::RecordTeamResult | ToolCapability::AdvanceTeam => {
             let team_session_id = authorized_team_session_id.expect("Team session authority");
-            team.record_result(RecordResultCommand {
+            let completion = RecordResultCommand {
                 team_session_id,
                 result: args.result.ok_or_else(|| {
                     FunctionCallError::RespondToModel("result is required".into())
@@ -209,9 +210,24 @@ async fn handle_lifecycle(
                 qa: args.qa,
                 findings: args.findings,
                 expected_revision: revision(args.expected_revision)?,
-            })
-            .await
-            .map_err(map_team_error)?
+            };
+            if capability == ToolCapability::AdvanceTeam {
+                let team = invocation.session.services.agent_control.team_handle();
+                let command = AdvanceTeamCommand {
+                    completion,
+                    deviation_reason: args.deviation_reason,
+                };
+                // Once admitted, settle the transaction and in-memory state even
+                // if the caller disconnects or cancels during the durable commit.
+                tokio::spawn(async move { team.advance_team(command).await })
+                    .await
+                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+                    .map_err(map_team_error)?
+            } else {
+                team.record_result(completion)
+                    .await
+                    .map_err(map_team_error)?
+            }
         }
         ToolCapability::TransitionTeam => {
             let team_session_id = authorized_team_session_id.expect("Team session authority");
@@ -267,7 +283,14 @@ async fn handle_lifecycle(
             ));
         }
     };
-    Ok(TeamToolResult::view(view))
+    Ok(match capability {
+        ToolCapability::GetTeamStatus => TeamToolResult::detailed(view),
+        ToolCapability::StartTeam
+        | ToolCapability::GetTeamNext
+        | ToolCapability::TransitionTeam
+        | ToolCapability::AdvanceTeam => TeamToolResult::guide(view),
+        _ => TeamToolResult::view(view),
+    })
 }
 
 fn revision(value: Option<u64>) -> Result<StateRevision, FunctionCallError> {
@@ -348,14 +371,22 @@ fn lifecycle_spec(capability: ToolCapability) -> ToolSpec {
             ]),
             vec!["team_session_id".into(), "expected_revision".into()],
         ),
-        ToolCapability::RecordTeamResult => object_spec(
+        ToolCapability::RecordTeamResult | ToolCapability::AdvanceTeam => object_spec(
             capability.as_str(),
-            "Record a structured node result and optional evidence identity.",
+            if capability == ToolCapability::AdvanceTeam {
+                "Atomically record the caller's verdict and evidence, select its declared transition, and start the next nonterminal node. Starts the current node if needed. Requires no active agents or external wait. Does not infer approval. Prefer over separate start/result/transition calls."
+            } else {
+                "Record a structured node result and optional evidence identity."
+            },
             BTreeMap::from([
                 team_session,
                 revision,
                 ("result".into(), string_prop("Structured result name.")),
                 ("evidence_id".into(), string_prop("Optional evidence id.")),
+                (
+                    "deviation_reason".into(),
+                    string_prop("Required for a non-recommended transition in advance_team."),
+                ),
                 (
                     "candidate_sha".into(),
                     string_prop("Optional candidate SHA."),

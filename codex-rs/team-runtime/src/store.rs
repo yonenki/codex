@@ -46,6 +46,15 @@ pub trait TeamStore: Send + Sync {
         &self,
         state: &TeamSessionState,
         event: &TeamEvent,
+    ) -> impl std::future::Future<Output = TeamRuntimeResult<()>> + Send {
+        self.persist_events(state, std::slice::from_ref(event))
+    }
+
+    /// Atomically persist the ordered events, outbox entries, and resulting snapshot.
+    fn persist_events(
+        &self,
+        state: &TeamSessionState,
+        events: &[TeamEvent],
     ) -> impl std::future::Future<Output = TeamRuntimeResult<()>> + Send;
 
     fn load_teams(
@@ -90,17 +99,17 @@ struct MemoryInner {
 }
 
 impl TeamStore for MemoryTeamStore {
-    async fn persist_event(
+    async fn persist_events(
         &self,
         state: &TeamSessionState,
-        event: &TeamEvent,
+        events: &[TeamEvent],
     ) -> TeamRuntimeResult<()> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.events.push(event.clone());
-        inner.outbox.push(event.clone());
+        inner.events.extend_from_slice(events);
+        inner.outbox.extend_from_slice(events);
         inner
             .snapshots
             .insert(state.team_session_id.to_string(), state.clone());
@@ -239,12 +248,12 @@ impl LazySqliteTeamStore {
 }
 
 impl TeamStore for LazySqliteTeamStore {
-    async fn persist_event(
+    async fn persist_events(
         &self,
         state: &TeamSessionState,
-        event: &TeamEvent,
+        events: &[TeamEvent],
     ) -> TeamRuntimeResult<()> {
-        self.store().await?.persist_event(state, event).await
+        self.store().await?.persist_events(state, events).await
     }
 
     async fn load_teams(&self) -> TeamRuntimeResult<Vec<TeamSessionState>> {
@@ -276,13 +285,11 @@ impl TeamStore for LazySqliteTeamStore {
 }
 
 impl TeamStore for SqliteTeamStore {
-    async fn persist_event(
+    async fn persist_events(
         &self,
         state: &TeamSessionState,
-        event: &TeamEvent,
+        events: &[TeamEvent],
     ) -> TeamRuntimeResult<()> {
-        let event_json =
-            serde_json::to_string(event).map_err(|err| TeamRuntimeError::Store(err.to_string()))?;
         let state_json =
             serde_json::to_string(state).map_err(|err| TeamRuntimeError::Store(err.to_string()))?;
         let mut tx = self
@@ -290,7 +297,10 @@ impl TeamStore for SqliteTeamStore {
             .begin()
             .await
             .map_err(|err| TeamRuntimeError::Store(err.to_string()))?;
-        sqlx::query(
+        for event in events {
+            let event_json = serde_json::to_string(event)
+                .map_err(|err| TeamRuntimeError::Store(err.to_string()))?;
+            sqlx::query(
             "INSERT INTO team_events (event_id, team_session_id, sequence, payload) VALUES (?, ?, ?, ?)",
         )
         .bind(event.event_id.as_str())
@@ -300,7 +310,7 @@ impl TeamStore for SqliteTeamStore {
         .execute(&mut *tx)
         .await
         .map_err(|err| TeamRuntimeError::Store(err.to_string()))?;
-        sqlx::query(
+            sqlx::query(
             "INSERT INTO team_outbox (event_id, team_session_id, sequence, payload, sent) VALUES (?, ?, ?, ?, 0)",
         )
         .bind(event.event_id.as_str())
@@ -310,6 +320,7 @@ impl TeamStore for SqliteTeamStore {
         .execute(&mut *tx)
         .await
         .map_err(|err| TeamRuntimeError::Store(err.to_string()))?;
+        }
         sqlx::query(
             "INSERT INTO team_snapshots (team_session_id, payload) VALUES (?, ?)
              ON CONFLICT(team_session_id) DO UPDATE SET payload = excluded.payload",

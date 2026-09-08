@@ -218,7 +218,7 @@ async fn handle_team_spawn(
             "task_name": String::from(new_agent_path),
             "agent_thread_id": spawned.thread_id.to_string(),
             "backend": "native",
-            "view": view,
+            "view": progress(&view, ViewDetail::Summary),
         })));
     }
 
@@ -278,7 +278,7 @@ async fn handle_team_spawn(
         "backend": "acp",
         "harness": harness,
         "model": model,
-        "view": view,
+        "view": progress(&view, ViewDetail::Summary),
     })))
 }
 
@@ -374,7 +374,7 @@ async fn handle_team_wait(
             .await
             .map_err(map_team_error)?;
         return Ok(TeamToolResult::json(serde_json::json!({
-            "view": view,
+            "view": progress(&view, ViewDetail::Summary),
             "resolved": true,
         })));
     }
@@ -406,7 +406,7 @@ async fn handle_team_wait(
             .await
             .map_err(map_team_error)?;
         return Ok(TeamToolResult::json(serde_json::json!({
-            "view": view,
+            "view": progress(&view, ViewDetail::Summary),
             "target": target,
             "status": status,
             "timed_out": timed_out,
@@ -421,7 +421,7 @@ async fn handle_team_wait(
         .await
         .map_err(map_team_error)?;
     Ok(TeamToolResult::json(serde_json::json!({
-        "view": view,
+        "view": progress(&view, ViewDetail::Summary),
         "waiting": view.waiting_reason,
     })))
 }
