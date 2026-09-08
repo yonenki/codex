@@ -78,6 +78,7 @@ pub enum ToolCapability {
     GetTeamStatus,
     StartTeamNode,
     RecordTeamResult,
+    AdvanceTeam,
     GetTeamNext,
     TransitionTeam,
     EndTeam,
@@ -93,7 +94,7 @@ pub enum ToolCapability {
 }
 
 impl ToolCapability {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::ListTeamGraphs,
         Self::GetTeamGraph,
         Self::ListTeams,
@@ -101,6 +102,7 @@ impl ToolCapability {
         Self::GetTeamStatus,
         Self::StartTeamNode,
         Self::RecordTeamResult,
+        Self::AdvanceTeam,
         Self::GetTeamNext,
         Self::TransitionTeam,
         Self::EndTeam,
@@ -124,6 +126,7 @@ impl ToolCapability {
             Self::GetTeamStatus => "get_team_status",
             Self::StartTeamNode => "start_team_node",
             Self::RecordTeamResult => "record_team_result",
+            Self::AdvanceTeam => "advance_team",
             Self::GetTeamNext => "get_team_next",
             Self::TransitionTeam => "transition_team",
             Self::EndTeam => "end_team",
@@ -156,6 +159,7 @@ impl ToolCapability {
                 | Self::GetTeamStatus
                 | Self::StartTeamNode
                 | Self::RecordTeamResult
+                | Self::AdvanceTeam
                 | Self::GetTeamNext
                 | Self::TransitionTeam
                 | Self::EndTeam

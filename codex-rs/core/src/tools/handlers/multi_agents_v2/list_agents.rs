@@ -1,6 +1,5 @@
 use super::analytics::ToolCallAnalytics;
 use super::*;
-use crate::agent::control::ListedAgent;
 use crate::tools::handlers::multi_agents_spec::create_list_agents_tool;
 use codex_tools::ToolSpec;
 
@@ -52,7 +51,37 @@ impl Handler {
             .await
             .map_err(collab_spawn_error)?;
 
-        Ok(boxed_tool_output(ListAgentsResult { agents }))
+        let total = agents.len();
+        let limit = args.limit.unwrap_or(20).clamp(1, 100);
+        let entries: Vec<_> = agents
+            .into_iter()
+            .skip(args.offset)
+            .take(limit)
+            .map(|agent| {
+                let agent_status = match args.detail {
+                    Detail::Full => ListedStatus::Full(agent.agent_status),
+                    Detail::Summary => ListedStatus::Summary(match agent.agent_status {
+                        AgentStatus::PendingInit => Lifecycle::PendingInit,
+                        AgentStatus::Running => Lifecycle::Running,
+                        AgentStatus::Interrupted => Lifecycle::Interrupted,
+                        AgentStatus::Completed(_) => Lifecycle::Completed,
+                        AgentStatus::Errored(_) => Lifecycle::Errored,
+                        AgentStatus::Shutdown => Lifecycle::Shutdown,
+                        AgentStatus::NotFound => Lifecycle::NotFound,
+                    }),
+                };
+                AgentEntry {
+                    agent_name: agent.agent_name,
+                    agent_status,
+                }
+            })
+            .collect();
+        let end = args.offset.saturating_add(entries.len());
+        Ok(boxed_tool_output(ListAgentsResult {
+            agents: entries,
+            total,
+            next_offset: (end < total).then_some(end),
+        }))
     }
 }
 
@@ -70,11 +99,51 @@ impl CoreToolRuntime for Handler {
 #[serde(deny_unknown_fields)]
 struct ListAgentsArgs {
     path_prefix: Option<String>,
+    #[serde(default)]
+    detail: Detail,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Detail {
+    #[default]
+    Summary,
+    Full,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Lifecycle {
+    PendingInit,
+    Running,
+    Interrupted,
+    Completed,
+    Errored,
+    Shutdown,
+    NotFound,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ListedStatus {
+    Summary(Lifecycle),
+    Full(AgentStatus),
+}
+
+#[derive(Debug, Serialize)]
+struct AgentEntry {
+    agent_name: String,
+    agent_status: ListedStatus,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ListAgentsResult {
-    agents: Vec<ListedAgent>,
+    agents: Vec<AgentEntry>,
+    total: usize,
+    next_offset: Option<usize>,
 }
 
 impl ToolOutput for ListAgentsResult {

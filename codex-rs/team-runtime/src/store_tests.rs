@@ -414,7 +414,7 @@ async fn flush_outbox_chunks_pending_across_teams_and_stops_on_failed_chunk() {
     let all_batches = sink.batches();
     assert_eq!(all_batches.len(), 2);
     assert!(all_batches[1].len() <= crate::TEAM_EVENTS_MAX_BATCH);
-    assert!(all_batches[1].len() > 0);
+    assert!(!all_batches[1].is_empty());
     assert_team_sequences_ordered(&all_batches[1]);
     assert!(
         store

@@ -118,9 +118,11 @@ def main() -> int:
     )
     print_sentinel()
 
-    command = ["cargo", "build", "--release"]
+    command = ["cargo", "build", "--release", "--bin", "codex"]
     for package in packages:
         command += ["-p", package]
+    if args.with_code_mode_host:
+        command += ["--bin", "codex-code-mode-host"]
     print(f"[migration-eol] running: {' '.join(command)}")
     try:
         result = subprocess.run(command, cwd=REPO_ROOT / "codex-rs")

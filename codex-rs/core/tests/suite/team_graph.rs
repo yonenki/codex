@@ -148,3 +148,120 @@ async fn function_output_from_requests(
     }
     None
 }
+
+/// A caller verdict advances only to the declared QA node, with compact results
+/// and a separately retrievable full guide. No approval is inferred by the tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advance_team_records_evidence_and_returns_compact_qa_guide() -> Result<()> {
+    use core_test_support::responses::ev_assistant_message;
+    use wiremock::Mock;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+
+    let server = start_mock_server().await;
+    Mock::given(method("POST")).respond_with(|request: &wiremock::Request| {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let output = |id: &str| {
+            body["input"].as_array().unwrap().iter().find(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == id
+            }).map(|item| serde_json::from_str::<serde_json::Value>(item["output"].as_str().unwrap()).unwrap())
+        };
+        let event = if output("detail-call").is_some() {
+            ev_assistant_message("done", "Ready for independent QA.")
+        } else if let Some(progress) = output("advance-call") {
+            ev_function_call_with_namespace("detail-call", "team", "get_team_status", &json!({
+                "team_session_id": progress["team_session_id"],
+            }).to_string())
+        } else if let Some(start) = output("start-call") {
+            ev_function_call_with_namespace("advance-call", "team", "advance_team", &json!({
+                "team_session_id": start["team_session_id"],
+                "expected_revision": start["revision"],
+                "result": "candidate_ready", "candidate_sha": "candidate-sha", "evidence_id": "compile-smoke",
+            }).to_string())
+        } else {
+            ev_function_call_with_namespace("start-call", "team", "start_team", &json!({"graph_name": "compact"}).to_string())
+        };
+        ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+            .set_body_string(sse(vec![ev_response_created("response"), event, ev_completed("response")]))
+    }).mount(&server).await;
+    let mut builder = test_codex()
+        .with_model("gpt-5.6-sol")
+        .with_workspace_setup(|cwd, _| {
+            let cwd = cwd.to_path_buf();
+            async move {
+                std::fs::create_dir_all(cwd.join(".codex/teams"))?;
+                std::fs::write(
+                    cwd.join(".codex/teams/compact.toml"),
+                    r#"
+schema_version = 1
+name = "compact"
+version = "1"
+description = "Parent implementation with a QA gate."
+start = "work"
+terminals = ["done"]
+[[nodes]]
+id = "work"
+purpose = "Implement."
+prompt = "Implement the approved task."
+completion = "Candidate is compiled."
+available_tools = ["advance_team"]
+recommended_tools = ["advance_team"]
+[[nodes.transitions]]
+on = "candidate_ready"
+to = "qa"
+recommended = true
+guide = "Verify the candidate."
+[[nodes]]
+id = "qa"
+purpose = "Verify."
+prompt = "Verify the candidate independently."
+completion = "Acceptance evidence is complete."
+available_tools = ["advance_team"]
+recommended_tools = ["advance_team"]
+[[nodes.transitions]]
+on = "passed"
+to = "done"
+recommended = true
+guide = "Finish after QA."
+[[nodes]]
+id = "done"
+purpose = "Done."
+prompt = "Stop."
+completion = "Closed."
+"#,
+                )?;
+                Ok(())
+            }
+        })
+        .with_config(|config| {
+            config.features.enable(Feature::Collab).unwrap();
+            config.features.enable(Feature::MultiAgentV2).unwrap();
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    test.submit_turn("record the compiled candidate and advance to QA")
+        .await?;
+    let compact = function_output_from_requests(&server, "advance-call")
+        .await
+        .unwrap();
+    let detailed = function_output_from_requests(&server, "detail-call")
+        .await
+        .unwrap();
+    let progress: serde_json::Value = serde_json::from_str(&compact)?;
+    let full: serde_json::Value = serde_json::from_str(&detailed)?;
+    assert_eq!(progress["current_node"]["node_id"], "qa");
+    assert_eq!(
+        progress["current_node"]["prompt"],
+        "Verify the candidate independently."
+    );
+    assert_eq!(progress["candidate_sha"], "candidate-sha");
+    assert_eq!(progress["lifecycle"], "running");
+    assert_eq!(progress["revision"], full["revision"]);
+    assert_eq!(progress["candidate_sha"], full["candidate_sha"]);
+    assert!(
+        compact.len() < detailed.len(),
+        "compact={} full={}",
+        compact.len(),
+        detailed.len()
+    );
+    Ok(())
+}

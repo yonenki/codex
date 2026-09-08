@@ -36,6 +36,7 @@ async fn subagent_mcp_startup_settles_while_cached_servers_remain_deferred() {
     app.activate_thread_channel(subagent_thread_id).await;
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
+            delegated_turns: Vec::new(),
             session: Some(test_thread_session(
                 subagent_thread_id,
                 test_path_buf("/tmp/subagent"),
@@ -86,9 +87,9 @@ async fn subagent_mcp_startup_settles_while_cached_servers_remain_deferred() {
     }
 
     insta::assert_snapshot!(visible_startup_states.join("\n"), @r"
-    eager: • Booting MCP server: eager
     eager: idle
-    deferred: • Booting MCP server: deferred
+    eager: idle
+    deferred: idle
     deferred: idle
     ");
 }

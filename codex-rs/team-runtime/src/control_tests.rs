@@ -1111,17 +1111,17 @@ impl PersistGateStore {
 }
 
 impl crate::TeamStore for PersistGateStore {
-    async fn persist_event(
+    async fn persist_events(
         &self,
         state: &crate::TeamSessionState,
-        event: &crate::TeamEvent,
+        events: &[crate::TeamEvent],
     ) -> crate::TeamRuntimeResult<()> {
         if self.fail_events.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(TeamRuntimeError::Store(
                 "forced attach persist failure".to_string(),
             ));
         }
-        crate::TeamStore::persist_event(&self.inner, state, event).await
+        crate::TeamStore::persist_events(&self.inner, state, events).await
     }
 
     async fn load_teams(&self) -> crate::TeamRuntimeResult<Vec<crate::TeamSessionState>> {
