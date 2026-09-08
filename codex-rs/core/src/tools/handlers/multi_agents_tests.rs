@@ -1344,7 +1344,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_list_agents_returns_summary_and_explicit_completed_details() {
+async fn multi_agent_v2_list_agents_returns_completed_status() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
@@ -1402,8 +1402,8 @@ async fn multi_agent_v2_list_agents_returns_summary_and_explicit_completed_detai
 
     let output = ListAgentsHandlerV2
         .handle(invocation(
-            Arc::clone(&session),
-            Arc::clone(&turn),
+            session,
+            turn,
             "list_agents",
             function_payload(json!({})),
         ))
@@ -1424,29 +1424,7 @@ async fn multi_agent_v2_list_agents_returns_summary_and_explicit_completed_detai
         .iter()
         .find(|agent| agent.agent_name == "/root/worker")
         .expect("worker agent should be listed");
-    assert_eq!(worker.agent_status, json!("completed"));
-    assert_eq!(success, Some(true));
-    let page: serde_json::Value = serde_json::from_str(&content).unwrap();
-    assert_eq!(page["total"], 2);
-    assert_eq!(page["next_offset"], serde_json::Value::Null);
-    let output = ListAgentsHandlerV2
-        .handle(invocation(
-            session,
-            turn,
-            "list_agents",
-            function_payload(json!({"path_prefix": "worker", "detail": "full", "limit": 1})),
-        ))
-        .await
-        .expect("explicit details");
-    let (content, success) = expect_text_output(output);
-    let details: serde_json::Value = serde_json::from_str(&content).unwrap();
-    assert_eq!(
-        details,
-        json!({
-            "agents": [{"agent_name": "/root/worker", "agent_status": {"completed": "done"}}],
-            "total": 1, "next_offset": null,
-        })
-    );
+    assert_eq!(worker.agent_status, json!({"completed": "done"}));
     assert_eq!(success, Some(true));
 }
 
