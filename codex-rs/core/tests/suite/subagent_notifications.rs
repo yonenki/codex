@@ -2958,8 +2958,61 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
     Ok(())
 }
 
+#[test_case(0; "without Teams")]
+#[test_case(1; "with an unrelated persisted Team")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
+async fn acp_external_agent_completion_reaches_parent_mailbox(
+    open_team_count: usize,
+) -> Result<()> {
+    let home = std::sync::Arc::new(tempfile::tempdir()?);
+    let teams = codex_team_runtime::TeamControl::for_codex_home(
+        home.path(),
+        codex_team_runtime::RecordingSink::default(),
+    );
+    let graph =
+        codex_team_graph::TeamGraph::try_from(toml::from_str::<codex_team_graph::TeamGraphToml>(
+            r#"
+schema_version = 1
+name = "unrelated"
+version = "1"
+description = "Team owned by another conversation."
+start = "work"
+terminals = ["completed"]
+[[nodes]]
+id = "work"
+purpose = "Work."
+prompt = "Work."
+completion = "Done."
+available_tools = ["record_team_result", "transition_team"]
+[[nodes.transitions]]
+on = "done"
+to = "completed"
+recommended = true
+guide = "Done."
+[[nodes]]
+id = "completed"
+purpose = "Finished."
+prompt = "Stop."
+completion = "Closed."
+"#,
+        )?)
+        .map_err(anyhow::Error::msg)?;
+    teams
+        .replace_catalog(codex_team_graph::TeamGraphCatalog::new([graph]))
+        .await;
+    for _ in 0..open_team_count {
+        teams
+            .start_team(codex_team_runtime::StartTeamCommand {
+                graph_name: "unrelated".into(),
+                task_ref: None,
+                worktree: None,
+                branch: None,
+            })
+            .await?;
+    }
+    assert_eq!(teams.open_team_count(), open_team_count);
+    drop(teams);
+
     let fixture_dir = tempfile::tempdir()?;
     let fixture_executable = super::install_acp_fixture(fixture_dir.path())?
         .to_string_lossy()
@@ -3011,6 +3064,7 @@ async fn acp_external_agent_completion_reaches_parent_mailbox() -> Result<()> {
     )
     .await;
     let test = test_codex()
+        .with_home(home)
         .with_model("koffing")
         .with_pre_build_hook(|home| {
             write_subagent_lifecycle_hooks(

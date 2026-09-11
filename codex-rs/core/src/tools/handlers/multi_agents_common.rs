@@ -306,26 +306,6 @@ pub(crate) async fn reject_team_bound_raw_collaboration_v1(
     Err(FunctionCallError::RespondToModel(message))
 }
 
-/// 未所属 root が open Team ありのまま legacy v1 raw spawn すると帰属を推測できない。
-pub(crate) async fn reject_unbound_raw_spawn_when_teams_open_v1(
-    session: &Session,
-    caller_thread_id: &str,
-) -> Result<(), FunctionCallError> {
-    let team = session.services.agent_control.team();
-    if team
-        .binding_for_checked(caller_thread_id)
-        .await
-        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
-        .is_none()
-        && team.open_team_count() > 0
-    {
-        return Err(FunctionCallError::RespondToModel(
-            "open Team sessions require delegating to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id. multi_agent_v1.spawn_agent cannot infer Team identity.".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RawCollaborationOp {
     Spawn,
@@ -385,27 +365,6 @@ pub(crate) async fn reject_team_bound_raw_collaboration(
         op.raw_tool(),
     );
     Err(FunctionCallError::RespondToModel(message))
-}
-
-/// 未所属 root が open Team ありのまま raw spawn すると帰属を推測できない。
-pub(crate) async fn reject_unbound_raw_spawn_when_teams_open(
-    session: &Session,
-    caller_thread_id: &str,
-    spawn_tool: &str,
-) -> Result<(), FunctionCallError> {
-    let team = session.services.agent_control.team();
-    if team
-        .binding_for_checked(caller_thread_id)
-        .await
-        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
-        .is_none()
-        && team.open_team_count() > 0
-    {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "open Team sessions require team.spawn_agent(team_session_id, ...). {spawn_tool} cannot infer Team identity."
-        )));
-    }
-    Ok(())
 }
 
 pub(crate) fn thread_spawn_source(

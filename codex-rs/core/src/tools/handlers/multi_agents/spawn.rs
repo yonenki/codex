@@ -67,7 +67,6 @@ async fn handle_spawn_agent(
     let caller_thread_id = session.thread_id.to_string();
     reject_team_bound_raw_collaboration_v1(&session, &caller_thread_id, &[], V1RawOp::Spawn)
         .await?;
-    reject_unbound_raw_spawn_when_teams_open_v1(&session, &caller_thread_id).await?;
     let prompt = render_input_preview(&input_items);
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);

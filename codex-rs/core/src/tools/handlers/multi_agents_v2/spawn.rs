@@ -122,12 +122,6 @@ async fn handle_spawn_agent(
         RawCollaborationOp::Spawn,
     )
     .await?;
-    reject_unbound_raw_spawn_when_teams_open(
-        &session,
-        &caller_thread_id,
-        "collaboration.spawn_agent",
-    )
-    .await?;
     let fork_mode = args.fork_mode()?;
     let message = message_content(args.message)?;
     let role_name = args

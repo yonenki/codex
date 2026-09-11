@@ -412,7 +412,6 @@ async fn spawn(invocation: ToolInvocation) -> Result<FunctionToolOutput, Functio
         RawCollaborationOp::Spawn,
     )
     .await?;
-    reject_unbound_raw_spawn_when_teams_open(&session, &caller_thread_id, "acp.spawn").await?;
     let message = message_content(args.message)?;
     let explicit_backend = explicit_backend(args.harness, args.model, args.effort)?;
     let mut config =

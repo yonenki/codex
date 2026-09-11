@@ -2929,7 +2929,7 @@ async fn resume_agent_rejects_when_depth_limit_exceeded() {
 
 #[tokio::test]
 async fn wait_agent_rejects_non_positive_timeout() {
-    let (session, turn) = make_session_and_context().await;
+    let (session, turn, _manager) = prepare_v1_session().await;
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
@@ -5067,24 +5067,23 @@ fn expect_model_err(
 }
 
 #[tokio::test]
-async fn raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
+async fn raw_spawn_allows_unbound_caller_with_open_team_and_rejects_bound_caller() {
     let (session, turn, _manager) = prepare_v2_session().await;
     let team_session_id = start_sample_team(&session).await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
-    let open_team = expect_model_err(
-        SpawnAgentHandlerV2::default()
-            .handle(invocation(
-                Arc::clone(&session),
-                Arc::clone(&turn),
-                "spawn_agent",
-                function_payload(json!({"task_name": "worker", "message": "do work"})),
-            ))
-            .await,
-        "unbound root with open Team",
-    );
-    assert_v2_team_tool_guidance(open_team, "team.spawn_agent");
+    let output = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({"task_name": "worker", "message": "do work"})),
+        ))
+        .await
+        .expect("unbound caller can spawn with an unrelated open Team");
+    let (_, success) = expect_text_output(output);
+    assert_eq!(success, Some(true));
 
     let pending = session
         .services
@@ -5119,9 +5118,6 @@ async fn raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
 async fn raw_collaboration_allows_unbound_caller_and_target() {
     let (session, _turn, _manager) = prepare_v2_session().await;
     let caller = session.thread_id.to_string();
-    reject_unbound_raw_spawn_when_teams_open(&session, &caller, "collaboration.spawn_agent")
-        .await
-        .expect("no open Team");
     reject_team_bound_raw_collaboration(&session, &caller, &[], RawCollaborationOp::Spawn)
         .await
         .expect("unbound spawn");
@@ -6295,24 +6291,23 @@ async fn raw_wait_rejects_bound_caller_and_multi_target_atomically() {
 }
 
 #[tokio::test]
-async fn v1_raw_spawn_rejects_team_bound_caller_and_keeps_open_team_guard() {
+async fn v1_raw_spawn_allows_unbound_caller_with_open_team_and_rejects_bound_caller() {
     let (session, turn, _manager) = prepare_v1_session().await;
     let team_session_id = start_sample_team(&session).await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
-    let open_team = expect_model_err(
-        SpawnAgentHandler::default()
-            .handle(invocation(
-                Arc::clone(&session),
-                Arc::clone(&turn),
-                "spawn_agent",
-                function_payload(json!({"message": "do work"})),
-            ))
-            .await,
-        "unbound root with open Team",
-    );
-    assert_v1_team_delegation_guidance(open_team, "multi_agent_v1.spawn_agent", false);
+    let output = SpawnAgentHandler::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({"message": "do work"})),
+        ))
+        .await
+        .expect("unbound caller can spawn with an unrelated open Team");
+    let (_, success) = expect_text_output(output);
+    assert_eq!(success, Some(true));
 
     let pending = session
         .services
@@ -6493,9 +6488,6 @@ async fn v1_wait_rejects_bound_caller_and_bound_target() {
 async fn v1_raw_ops_keep_unknown_target_and_allow_unbound_success_path() {
     let (session, turn, _manager) = prepare_v1_session().await;
     let caller = session.thread_id.to_string();
-    reject_unbound_raw_spawn_when_teams_open_v1(&session, &caller)
-        .await
-        .expect("no open Team");
     reject_team_bound_raw_collaboration_v1(&session, &caller, &[], V1RawOp::Spawn)
         .await
         .expect("unbound spawn");
@@ -7229,7 +7221,7 @@ async fn v1_multi_wait_partially_unknown_is_atomic_without_team_guidance() {
 }
 
 #[tokio::test]
-async fn v1_spawn_guidance_uses_caller_team_id_when_bound_and_open_team_when_unbound() {
+async fn v1_spawn_guidance_uses_caller_team_id_when_bound() {
     // 1. Bound caller spawn -> uses caller's team_session_id
     let (bound_session, bound_turn, _manager) = prepare_v1_session().await;
     let team_a = start_sample_team(&bound_session).await;
@@ -7263,30 +7255,4 @@ async fn v1_spawn_guidance_uses_caller_team_id_when_bound_and_open_team_when_unb
     assert!(msg.contains("multi_agent_v1.spawn_agent"));
     assert!(msg.contains("unbound root coordinator"));
     assert!(msg.contains("multi_agent_v2"));
-
-    // 2. Unbound caller with open Team -> uses open team guard
-    let (unbound_session, unbound_turn, _manager) = prepare_v1_session().await;
-    let _open_team = start_sample_team(&unbound_session).await;
-    let open_spawn = expect_model_err(
-        SpawnAgentHandler::default()
-            .handle(invocation(
-                Arc::new(unbound_session),
-                Arc::new(unbound_turn),
-                "spawn_agent",
-                function_payload(json!({"message": "do work"})),
-            ))
-            .await,
-        "unbound spawn with open team",
-    );
-    let FunctionCallError::RespondToModel(msg) = open_spawn else {
-        panic!("expected model err");
-    };
-    assert!(
-        msg.contains("open Team sessions require delegating to an unbound root coordinator using multi_agent_v2 Team tools with explicit team_session_id"),
-        "open team spawn must give open team delegation guidance: {msg}"
-    );
-    assert!(
-        msg.contains("multi_agent_v1.spawn_agent cannot infer Team identity"),
-        "open team spawn must note that v1 spawn cannot infer Team identity: {msg}"
-    );
 }
